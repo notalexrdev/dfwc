@@ -61,13 +61,15 @@
 
 enum { CurNormal, CurMove, CurResize };
 /* scene layers, bottom to top */
-enum { LyrBg, LyrBottom, LyrClients, LyrTop, LyrOverlay, NumLayers };
+enum { LyrBg, LyrBottom, LyrClients, LyrTop, LyrFullscreen, LyrOverlay, NumLayers };
 
 typedef struct {
 	struct wl_list link; /* in clients, most recently focused first */
 	struct wlr_xdg_toplevel *toplevel;
 	struct wlr_scene_tree *scene;
 	struct wlr_xdg_toplevel_decoration_v1 *deco;
+	struct wlr_box prev; /* geometry to restore after maximize/fullscreen */
+	int maximized, fullscreen;
 	struct wl_listener map, unmap, commit, destroy;
 	struct wl_listener request_move, request_resize, request_maximize, request_fullscreen;
 	struct wl_listener deco_mode, deco_destroy;
@@ -132,6 +134,12 @@ static struct wl_list mons;
 static struct wl_list keyboards;
 static struct wl_list pointers; /* libinput pointers, for touchpad settings */
 static LayerSurface *exclusive; /* layer surface holding the keyboard, e.g. wmenu */
+static int cycling; /* focus is walking the stack; the order commits when Mod is released */
+static struct {
+	struct wl_event_source *timer;
+	uint32_t mods, keycode;
+	xkb_keysym_t sym;
+} rep; /* bind being repeated while its key is held */
 static struct wl_event_source *sigsrc[2];
 
 /* zwlr_layer_shell_v1_layer -> scene layer */
@@ -199,6 +207,36 @@ outputbox(struct wlr_box *box)
 	*box = m ? m->usable : (struct wlr_box){ 0 };
 }
 
+static struct wlr_box
+clientbox(Client *c)
+{
+	struct wlr_box *geo = &c->toplevel->base->geometry;
+
+	return (struct wlr_box){ c->scene->node.x + geo->x, c->scene->node.y + geo->y,
+		geo->width, geo->height };
+}
+
+static void
+resizeclient(Client *c, struct wlr_box b)
+{
+	/* shortcut: moves the window before the client has resized, so the
+	 * left/top edges jitter while resizing from them; wait for the commit */
+	struct wlr_box *geo = &c->toplevel->base->geometry;
+
+	wlr_scene_node_set_position(&c->scene->node, b.x - geo->x, b.y - geo->y);
+	wlr_xdg_toplevel_set_size(c->toplevel, MAX(b.width, 1), MAX(b.height, 1));
+}
+
+static Monitor *
+monof(Client *c)
+{
+	struct wlr_box b = clientbox(c);
+	struct wlr_output *o = wlr_output_layout_output_at(output_layout,
+		b.x + b.width / 2.0, b.y + b.height / 2.0);
+
+	return o ? o->data : selmon();
+}
+
 static void
 kbfocus(struct wlr_surface *surface)
 {
@@ -222,8 +260,10 @@ focusclient(Client *c, int raise)
 		return;
 	if (old && (prev = wlr_xdg_toplevel_try_from_wlr_surface(old)))
 		wlr_xdg_toplevel_set_activated(prev, false);
-	wl_list_remove(&c->link);
-	wl_list_insert(&clients, &c->link);
+	if (!cycling) {
+		wl_list_remove(&c->link);
+		wl_list_insert(&clients, &c->link);
+	}
 	wlr_xdg_toplevel_set_activated(c->toplevel, true);
 	kbfocus(c->toplevel->base->surface);
 }
@@ -242,13 +282,16 @@ focustop(void)
 static void
 grab(Client *c, int mode, uint32_t edges)
 {
-	struct wlr_box *geo = &c->toplevel->base->geometry;
-
+	if (c->fullscreen)
+		return;
+	if (c->maximized) { /* moving a maximized window keeps its size */
+		c->maximized = 0;
+		wlr_xdg_toplevel_set_maximized(c->toplevel, false);
+	}
 	grabc = c;
 	cursor_mode = mode;
 	grabedges = edges;
-	grabgeo = (struct wlr_box){ c->scene->node.x + geo->x, c->scene->node.y + geo->y,
-		geo->width, geo->height };
+	grabgeo = clientbox(c);
 	grabx = cursor->x - (edges & WLR_EDGE_RIGHT ? grabgeo.x + grabgeo.width : grabgeo.x);
 	graby = cursor->y - (edges & WLR_EDGE_BOTTOM ? grabgeo.y + grabgeo.height : grabgeo.y);
 }
@@ -258,6 +301,86 @@ ungrab(void)
 {
 	cursor_mode = CurNormal;
 	grabc = NULL;
+}
+
+void
+focusstack(int dir)
+{
+	Client *c = selclient();
+	struct wl_list *l;
+
+	if (!c)
+		return;
+	/* walk most recently focused first, like alt-tab */
+	l = dir > 0 ? c->link.next : c->link.prev;
+	if (l == &clients)
+		l = dir > 0 ? l->next : l->prev;
+	cycling = 1;
+	focusclient(wl_container_of(l, c, link), 1);
+}
+
+void
+moveresize(int dx, int dy, int dw, int dh)
+{
+	Client *c = selclient();
+	struct wlr_box b;
+
+	if (!c || c->fullscreen)
+		return;
+	if (c->maximized) {
+		c->maximized = 0;
+		wlr_xdg_toplevel_set_maximized(c->toplevel, false);
+	}
+	b = clientbox(c);
+	resizeclient(c, (struct wlr_box){ b.x + dx, b.y + dy, b.width + dw, b.height + dh });
+}
+
+static void
+setmaximized(Client *c, int on)
+{
+	Monitor *m = monof(c);
+
+	if (on != c->maximized && !c->fullscreen && m) {
+		if (on)
+			c->prev = clientbox(c);
+		resizeclient(c, on ? m->usable : c->prev);
+		c->maximized = on;
+	}
+	wlr_xdg_toplevel_set_maximized(c->toplevel, c->maximized);
+}
+
+static void
+setfullscreen(Client *c, int on)
+{
+	Monitor *m = monof(c);
+
+	if (on != c->fullscreen && m) {
+		if (on && !c->maximized)
+			c->prev = clientbox(c);
+		/* above bars, below overlays like lock screens */
+		wlr_scene_node_reparent(&c->scene->node, layers[on ? LyrFullscreen : LyrClients]);
+		resizeclient(c, on ? m->area : c->maximized ? m->usable : c->prev);
+		c->fullscreen = on;
+	}
+	wlr_xdg_toplevel_set_fullscreen(c->toplevel, c->fullscreen);
+}
+
+void
+togglemaximize(void)
+{
+	Client *c = selclient();
+
+	if (c)
+		setmaximized(c, !c->maximized);
+}
+
+void
+togglefullscreen(void)
+{
+	Client *c = selclient();
+
+	if (c)
+		setfullscreen(c, !c->fullscreen);
 }
 
 void
@@ -326,25 +449,57 @@ keypress(struct wl_listener *listener, void *data)
 	uint32_t mods = wlr_keyboard_get_modifiers(kb->wlr) & MODMASK;
 	xkb_keycode_t code = event->keycode + 8;
 	const xkb_keysym_t *syms;
-	int n;
+	int n, handled;
 
 	if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+		wl_event_source_timer_update(rep.timer, 0); /* a new key ends any repeat */
 		/* level 0 so "Mod+Shift+c" matches c, not C, on every layout */
 		n = xkb_keymap_key_get_syms_by_level(kb->wlr->keymap, code,
 			xkb_state_key_get_layout(kb->wlr->xkb_state, code), 0, &syms);
-		for (int i = 0; i < n; i++)
-			if (safetykey(mods, syms[i]) || config_key(mods, syms[i]))
+		for (int i = 0; i < n; i++) {
+			if (safetykey(mods, syms[i]))
 				return;
+			if (!(handled = config_key(mods, syms[i])))
+				continue;
+			if (handled == BindRepeat && kb->wlr->repeat_info.rate > 0) {
+				rep.mods = mods;
+				rep.sym = syms[i];
+				rep.keycode = event->keycode;
+				wl_event_source_timer_update(rep.timer, kb->wlr->repeat_info.delay);
+			}
+			return;
+		}
+	} else if (event->keycode == rep.keycode) {
+		wl_event_source_timer_update(rep.timer, 0);
 	}
 	wlr_seat_set_keyboard(seat, kb->wlr);
 	wlr_seat_keyboard_notify_key(seat, event->time_msec, event->keycode, event->state);
+}
+
+static int
+repeatkey(void *data)
+{
+	struct wlr_keyboard *kb = wlr_seat_get_keyboard(seat);
+
+	if (kb && kb->repeat_info.rate > 0 && config_key(rep.mods, rep.sym))
+		wl_event_source_timer_update(rep.timer, 1000 / kb->repeat_info.rate);
+	return 0;
 }
 
 static void
 keymods(struct wl_listener *listener, void *data)
 {
 	Keyboard *kb = wl_container_of(listener, kb, modifiers);
+	Client *c;
 
+	if (cycling && !(wlr_keyboard_get_modifiers(kb->wlr) & modkey)) {
+		/* Mod released: the window cycled to becomes the most recent */
+		cycling = 0;
+		if ((c = selclient())) {
+			wl_list_remove(&c->link);
+			wl_list_insert(&clients, &c->link);
+		}
+	}
 	wlr_seat_set_keyboard(seat, kb->wlr);
 	wlr_seat_keyboard_notify_modifiers(seat, &kb->wlr->modifiers);
 }
@@ -474,9 +629,6 @@ motionnotify(uint32_t time)
 		return;
 	}
 	if (cursor_mode == CurResize) {
-		/* shortcut: moves the window before the client has resized, so the
-		 * left/top edges jitter; wait for the client's commit to fix that */
-		geo = &grabc->toplevel->base->geometry;
 		l = grabgeo.x, r = grabgeo.x + grabgeo.width;
 		t = grabgeo.y, b = grabgeo.y + grabgeo.height;
 		ex = cursor->x - grabx, ey = cursor->y - graby;
@@ -488,8 +640,7 @@ motionnotify(uint32_t time)
 			t = MIN(ey, b - 1);
 		else if (grabedges & WLR_EDGE_BOTTOM)
 			b = MAX(ey, t + 1);
-		wlr_scene_node_set_position(&grabc->scene->node, l - geo->x, t - geo->y);
-		wlr_xdg_toplevel_set_size(grabc->toplevel, r - l, b - t);
+		resizeclient(grabc, (struct wlr_box){ l, t, r - l, b - t });
 		return;
 	}
 
@@ -653,6 +804,7 @@ arrangelayers(Monitor *m)
 {
 	struct wlr_box usable = m->area;
 	LayerSurface *l;
+	Client *c;
 
 	/* exclusive zones (bars) first, so the rest fits in what they leave */
 	for (int excl = 1; excl >= 0; excl--)
@@ -661,6 +813,9 @@ arrangelayers(Monitor *m)
 				if (l->wlr->initialized && (l->wlr->current.exclusive_zone > 0) == excl)
 					wlr_scene_layer_surface_v1_configure(l->scene, &m->area, &usable);
 	m->usable = usable;
+	wl_list_for_each(c, &clients, link)
+		if (monof(c) == m && (c->maximized || c->fullscreen))
+			resizeclient(c, c->fullscreen ? m->area : m->usable);
 }
 
 static void
@@ -740,6 +895,10 @@ mapnotify(struct wl_listener *listener, void *data)
 			MIN(MAX(around.y + (around.height - h) / 2, area.y), area.y + area.height - h) - geo->y);
 	}
 	focusclient(c, 1);
+	if (c->toplevel->requested.fullscreen)
+		setfullscreen(c, 1);
+	else if (c->toplevel->requested.maximized)
+		setmaximized(c, 1);
 }
 
 static void
@@ -748,6 +907,9 @@ unmapnotify(struct wl_listener *listener, void *data)
 	Client *c = wl_container_of(listener, c, unmap);
 	int focused = selclient() == c;
 
+	/* an app that hides and shows its window starts over as a plain one */
+	c->maximized = c->fullscreen = 0;
+	wlr_scene_node_reparent(&c->scene->node, layers[LyrClients]);
 	if (c == grabc)
 		ungrab();
 	wl_list_remove(&c->link);
@@ -791,8 +953,10 @@ requestmaximize(struct wl_listener *listener, void *data)
 {
 	Client *c = wl_container_of(listener, c, request_maximize);
 
-	/* xdg-shell requires a reply even when the request is ignored */
-	if (c->toplevel->base->initialized)
+	/* before mapping mapnotify applies it; xdg-shell still wants a reply */
+	if (c->toplevel->base->surface->mapped)
+		setmaximized(c, c->toplevel->requested.maximized);
+	else if (c->toplevel->base->initialized)
 		wlr_xdg_surface_schedule_configure(c->toplevel->base);
 }
 
@@ -801,7 +965,9 @@ requestfullscreen(struct wl_listener *listener, void *data)
 {
 	Client *c = wl_container_of(listener, c, request_fullscreen);
 
-	if (c->toplevel->base->initialized)
+	if (c->toplevel->base->surface->mapped)
+		setfullscreen(c, c->toplevel->requested.fullscreen);
+	else if (c->toplevel->base->initialized)
 		wlr_xdg_surface_schedule_configure(c->toplevel->base);
 }
 
@@ -1121,6 +1287,7 @@ setup(void)
 	loop = wl_display_get_event_loop(dpy);
 	sigsrc[0] = wl_event_loop_add_signal(loop, SIGINT, quitsignal, NULL);
 	sigsrc[1] = wl_event_loop_add_signal(loop, SIGTERM, quitsignal, NULL);
+	rep.timer = wl_event_loop_add_timer(loop, repeatkey, NULL);
 
 	if (!(backend = wlr_backend_autocreate(loop, &session)))
 		die("couldn't create backend");
@@ -1222,6 +1389,7 @@ cleanup(void)
 	config_finish();
 	for (size_t i = 0; i < LENGTH(sigsrc); i++)
 		wl_event_source_remove(sigsrc[i]);
+	wl_event_source_remove(rep.timer);
 	for (size_t i = 0; i < LENGTH(listeners); i++)
 		wl_list_remove(&listeners[i]->link);
 	wlr_scene_node_destroy(&scene->tree.node);

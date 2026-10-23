@@ -25,6 +25,7 @@ typedef struct {
 	uint32_t mods;
 	xkb_keysym_t sym;
 	int fn; /* registry ref */
+	bool repeat;
 } Bind;
 
 typedef struct {
@@ -122,6 +123,12 @@ l_bind(lua_State *L)
 	Bind b, *binds;
 
 	luaL_checktype(L, 2, LUA_TFUNCTION);
+	b.repeat = false;
+	if (!lua_isnoneornil(L, 3)) { /* options: { repeats = true } ("repeat" is a Lua keyword) */
+		luaL_checktype(L, 3, LUA_TTABLE);
+		b.repeat = lua_getfield(L, 3, "repeats") != LUA_TNIL && lua_toboolean(L, -1);
+		lua_pop(L, 1);
+	}
 	if (!parsekeys(keys, &b.mods, &b.sym))
 		return luaL_error(L, "bad key \"%s\"", keys);
 	if (!(binds = realloc(c->binds, (c->nbinds + 1) * sizeof(*binds))))
@@ -257,6 +264,43 @@ l_autostart(lua_State *L)
 }
 
 static int
+l_focus(lua_State *L)
+{
+	static const char *const dirs[] = { "next", "prev", NULL };
+
+	focusstack(luaL_checkoption(L, 1, NULL, dirs) ? -1 : 1);
+	return 0;
+}
+
+static int
+l_move(lua_State *L)
+{
+	moveresize(luaL_checkinteger(L, 1), luaL_checkinteger(L, 2), 0, 0);
+	return 0;
+}
+
+static int
+l_resize(lua_State *L)
+{
+	moveresize(0, 0, luaL_checkinteger(L, 1), luaL_checkinteger(L, 2));
+	return 0;
+}
+
+static int
+l_maximize(lua_State *L)
+{
+	togglemaximize();
+	return 0;
+}
+
+static int
+l_fullscreen(lua_State *L)
+{
+	togglefullscreen();
+	return 0;
+}
+
+static int
 l_spawn(lua_State *L)
 {
 	spawn(luaL_checkstring(L, 1));
@@ -287,11 +331,16 @@ l_reload(lua_State *L)
 static const luaL_Reg api[] = {
 	{ "autostart", l_autostart },
 	{ "bind", l_bind },
-	{ "set", l_set },
-	{ "spawn", l_spawn },
 	{ "close", l_close },
+	{ "focus", l_focus },
+	{ "fullscreen", l_fullscreen },
+	{ "maximize", l_maximize },
+	{ "move", l_move },
 	{ "quit", l_quit },
 	{ "reload", l_reload },
+	{ "resize", l_resize },
+	{ "set", l_set },
+	{ "spawn", l_spawn },
 	{ NULL, NULL },
 };
 
@@ -346,7 +395,7 @@ loadconfig(const char *file)
 	return 1;
 }
 
-bool
+int
 config_key(uint32_t mods, xkb_keysym_t sym)
 {
 	/* newest bind wins, so later binds override earlier ones */
@@ -359,9 +408,9 @@ config_key(uint32_t mods, xkb_keysym_t sym)
 			wlr_log(WLR_ERROR, "config: %s", lua_tostring(cur.L, -1));
 			lua_pop(cur.L, 1);
 		}
-		return true;
+		return b->repeat ? BindRepeat : BindDone;
 	}
-	return false;
+	return BindNone;
 }
 
 static void

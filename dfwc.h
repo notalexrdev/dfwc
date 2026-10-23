@@ -20,16 +20,22 @@ typedef struct {
 	uint32_t modkey;     /* 0: Super, or Alt when nested */
 } Settings;
 
+enum { BindNone, BindDone, BindRepeat }; /* config_key() results */
+
 /* dfwc.c */
 extern uint32_t modkey;
 void applysettings(void);
+void focusstack(int dir);
 void killclient(void);
+void moveresize(int dx, int dy, int dw, int dh);
 void quit(void);
 void spawn(const char *cmd);
+void togglefullscreen(void);
+void togglemaximize(void);
 
 /* lua.c */
 extern Settings settings;
 void config_init(struct wl_event_loop *loop);
-bool config_key(uint32_t mods, xkb_keysym_t sym);
+int config_key(uint32_t mods, xkb_keysym_t sym);
 void config_reload(void);
 void config_finish(void);
