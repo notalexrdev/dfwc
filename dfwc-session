@@ -1,0 +1,8 @@
+#!/bin/sh
+# starts dfwc from the login screen or a TTY; extra arguments go to dfwc (-d for debug)
+export XDG_CURRENT_DESKTOP=dfwc XDG_SESSION_DESKTOP=dfwc XDG_SESSION_TYPE=wayland
+state="${XDG_STATE_HOME:-$HOME/.local/state}/dfwc"
+mkdir -p "$state"
+[ -f "$state/log" ] && mv -f "$state/log" "$state/log.old"
+# portals (screen sharing, file pickers) find the session through dbus/systemd
+exec dfwc -s 'dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE' "$@" >"$state/log" 2>&1

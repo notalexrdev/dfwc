@@ -7,3 +7,5 @@ dfwc.bind("Mod+p",            function() dfwc.spawn("wmenu-run") end)
 dfwc.bind("Mod+Shift+c",      dfwc.close)
 dfwc.bind("Mod+Shift+q",      dfwc.quit)
 dfwc.bind("Mod+Control+r",    dfwc.reload)
+
+-- More actions and settings: see README.md.

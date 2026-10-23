@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=dfwc
+Comment=dynamic floating wayland compositor
+Exec=PREFIX/bin/dfwc-session
+Type=Application
+DesktopNames=dfwc

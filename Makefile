@@ -26,11 +26,17 @@ check: dfwc
 	WLR_BACKENDS=headless timeout 3 ./dfwc -s foot; test $$? = 124
 
 install: all
-	mkdir -p $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/share/dfwc
-	cp -f dfwc $(DESTDIR)$(PREFIX)/bin
+	mkdir -p $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/share/dfwc \
+		$(DESTDIR)$(PREFIX)/share/xdg-desktop-portal $(DESTDIR)$(SESSIONDIR)
+	cp -f dfwc dfwc-session $(DESTDIR)$(PREFIX)/bin
 	cp -f init.lua $(DESTDIR)$(PREFIX)/share/dfwc/init.lua
+	cp -f dfwc-portals.conf $(DESTDIR)$(PREFIX)/share/xdg-desktop-portal
+	sed 's|PREFIX|$(PREFIX)|' dfwc.desktop > $(DESTDIR)$(SESSIONDIR)/dfwc.desktop
 
 uninstall:
-	rm -f $(DESTDIR)$(PREFIX)/bin/dfwc $(DESTDIR)$(PREFIX)/share/dfwc/init.lua
+	rm -f $(DESTDIR)$(PREFIX)/bin/dfwc $(DESTDIR)$(PREFIX)/bin/dfwc-session \
+		$(DESTDIR)$(PREFIX)/share/dfwc/init.lua \
+		$(DESTDIR)$(PREFIX)/share/xdg-desktop-portal/dfwc-portals.conf \
+		$(DESTDIR)$(SESSIONDIR)/dfwc.desktop
 
 .PHONY: all clean check install uninstall
