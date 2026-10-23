@@ -9,13 +9,17 @@ OBJ = $(SRC:.c=.o)
 all: dfwc
 
 $(OBJ): dfwc.h config.mk
+dfwc.o: wlr-layer-shell-unstable-v1-protocol.h
 lua.o: init.lua
+
+wlr-layer-shell-unstable-v1-protocol.h: protocols/wlr-layer-shell-unstable-v1.xml
+	`pkg-config --variable=wayland_scanner wayland-scanner` server-header $< $@
 
 dfwc: $(OBJ)
 	$(CC) -o $@ $(OBJ) $(LDFLAGS) $(LDLIBS)
 
 clean:
-	rm -f dfwc $(OBJ)
+	rm -f dfwc $(OBJ) *-protocol.h
 
 # Smoke test: serve a client headless for 3s without crashing (timeout exits 124).
 check: dfwc

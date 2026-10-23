@@ -1,2 +1,3 @@
 dfwc
 *.o
+*-protocol.h
