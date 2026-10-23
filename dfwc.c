@@ -9,12 +9,15 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <scenefx/render/fx_renderer/fx_renderer.h>
+#include <libinput.h>
 #include <scenefx/types/wlr_scene.h>
 #include <wlr/backend.h>
+#include <wlr/backend/libinput.h>
 #include <wlr/backend/session.h>
 #include <wlr/render/allocator.h>
 #include <wlr/types/wlr_compositor.h>
@@ -71,9 +74,16 @@ typedef struct {
 } Client;
 
 typedef struct {
+	struct wl_list link;
 	struct wlr_keyboard *wlr;
 	struct wl_listener modifiers, key, destroy;
 } Keyboard;
+
+typedef struct {
+	struct wl_list link;
+	struct libinput_device *dev;
+	struct wl_listener destroy;
+} Pointer;
 
 typedef struct {
 	struct wl_list link;
@@ -97,6 +107,7 @@ typedef struct {
 } Popup;
 
 uint32_t modkey;
+static int nested; /* running in a window inside another desktop */
 
 static struct wl_display *dpy;
 static struct wlr_backend *backend;
@@ -105,6 +116,7 @@ static struct wlr_renderer *drw;
 static struct wlr_allocator *alloc;
 static struct wlr_scene *scene;
 static struct wlr_scene_tree *layers[NumLayers];
+static struct wlr_scene_rect *bg;
 static struct wlr_output_layout *output_layout;
 static struct wlr_scene_output_layout *scene_layout;
 static struct wlr_xdg_shell *xdg_shell;
@@ -117,6 +129,8 @@ static struct wlr_xcursor_manager *cursor_mgr;
 static struct wlr_seat *seat;
 static struct wl_list clients;
 static struct wl_list mons;
+static struct wl_list keyboards;
+static struct wl_list pointers; /* libinput pointers, for touchpad settings */
 static LayerSurface *exclusive; /* layer surface holding the keyboard, e.g. wmenu */
 static struct wl_event_source *sigsrc[2];
 
@@ -343,37 +357,94 @@ destroykeyboard(struct wl_listener *listener, void *data)
 	wl_list_remove(&kb->modifiers.link);
 	wl_list_remove(&kb->key.link);
 	wl_list_remove(&kb->destroy.link);
+	wl_list_remove(&kb->link);
 	free(kb);
+}
+
+static struct xkb_keymap *
+keymap(void)
+{
+	/* empty settings fall back to XKB_DEFAULT_*, a bad layout to us */
+	struct xkb_rule_names names = {
+		.layout = *settings.xkb_layout ? settings.xkb_layout : NULL,
+		.variant = *settings.xkb_variant ? settings.xkb_variant : NULL,
+		.options = *settings.xkb_options ? settings.xkb_options : NULL,
+		.model = *settings.xkb_model ? settings.xkb_model : NULL,
+	};
+	struct xkb_context *ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+	struct xkb_keymap *km = xkb_keymap_new_from_names(ctx, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
+
+	if (!km) {
+		wlr_log(WLR_ERROR, "invalid keyboard layout, falling back to us");
+		km = xkb_keymap_new_from_names(ctx, &(struct xkb_rule_names){ .layout = "us" },
+			XKB_KEYMAP_COMPILE_NO_FLAGS);
+	}
+	xkb_context_unref(ctx);
+	return km;
 }
 
 static void
 createkeyboard(struct wlr_keyboard *wlr)
 {
 	Keyboard *kb = calloc(1, sizeof(*kb));
-	struct xkb_context *ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-	/* NULL names: layout comes from XKB_DEFAULT_* */
-	struct xkb_keymap *keymap = xkb_keymap_new_from_names(ctx, NULL, XKB_KEYMAP_COMPILE_NO_FLAGS);
+	struct xkb_keymap *km = keymap();
 
-	if (!keymap) {
-		wlr_log(WLR_ERROR, "invalid XKB_DEFAULT_* layout, falling back to us");
-		keymap = xkb_keymap_new_from_names(ctx, &(struct xkb_rule_names){ .layout = "us" },
-			XKB_KEYMAP_COMPILE_NO_FLAGS);
-	}
-	if (!kb || !keymap) {
+	if (!kb || !km) {
 		wlr_log(WLR_ERROR, "couldn't set up keyboard %s", wlr->base.name);
 		free(kb);
-		goto out;
+		xkb_keymap_unref(km);
+		return;
 	}
 	kb->wlr = wlr;
-	wlr_keyboard_set_keymap(wlr, keymap);
-	wlr_keyboard_set_repeat_info(wlr, 25, 600);
+	wlr_keyboard_set_keymap(wlr, km);
+	xkb_keymap_unref(km);
+	wlr_keyboard_set_repeat_info(wlr, settings.repeat_rate, settings.repeat_delay);
 	LISTEN(&wlr->events.modifiers, &kb->modifiers, keymods);
 	LISTEN(&wlr->events.key, &kb->key, keypress);
 	LISTEN(&wlr->base.events.destroy, &kb->destroy, destroykeyboard);
+	wl_list_insert(&keyboards, &kb->link);
 	wlr_seat_set_keyboard(seat, wlr);
-out:
-	xkb_keymap_unref(keymap);
-	xkb_context_unref(ctx);
+}
+
+static void
+configpointer(struct libinput_device *dev)
+{
+	/* only touchpads: they're the devices that can tap */
+	if (!libinput_device_config_tap_get_finger_count(dev))
+		return;
+	libinput_device_config_tap_set_enabled(dev, settings.touchpad_tap
+		? LIBINPUT_CONFIG_TAP_ENABLED : LIBINPUT_CONFIG_TAP_DISABLED);
+	if (libinput_device_config_scroll_has_natural_scroll(dev))
+		libinput_device_config_scroll_set_natural_scroll_enabled(dev, settings.touchpad_natural_scroll);
+	if (libinput_device_config_dwt_is_available(dev))
+		libinput_device_config_dwt_set_enabled(dev, settings.touchpad_dwt
+			? LIBINPUT_CONFIG_DWT_ENABLED : LIBINPUT_CONFIG_DWT_DISABLED);
+	if (libinput_device_config_accel_is_available(dev))
+		libinput_device_config_accel_set_speed(dev, settings.touchpad_speed);
+}
+
+static void
+destroypointer(struct wl_listener *listener, void *data)
+{
+	Pointer *p = wl_container_of(listener, p, destroy);
+
+	wl_list_remove(&p->destroy.link);
+	wl_list_remove(&p->link);
+	free(p);
+}
+
+static void
+createpointer(struct wlr_input_device *dev)
+{
+	Pointer *p;
+
+	wlr_cursor_attach_input_device(cursor, dev);
+	if (!wlr_input_device_is_libinput(dev) || !(p = calloc(1, sizeof(*p))))
+		return;
+	p->dev = wlr_libinput_get_device_handle(dev);
+	configpointer(p->dev);
+	LISTEN(&dev->events.destroy, &p->destroy, destroypointer);
+	wl_list_insert(&pointers, &p->link);
 }
 
 static void
@@ -384,7 +455,7 @@ inputdevice(struct wl_listener *listener, void *data)
 	if (dev->type == WLR_INPUT_DEVICE_KEYBOARD)
 		createkeyboard(wlr_keyboard_from_input_device(dev));
 	else if (dev->type == WLR_INPUT_DEVICE_POINTER)
-		wlr_cursor_attach_input_device(cursor, dev);
+		createpointer(dev);
 }
 
 static void
@@ -595,8 +666,12 @@ arrangelayers(Monitor *m)
 static void
 updatemons(struct wl_listener *listener, void *data)
 {
+	struct wlr_box box;
 	Monitor *m;
 
+	wlr_output_layout_get_box(output_layout, NULL, &box);
+	wlr_scene_node_set_position(&bg->node, box.x, box.y);
+	wlr_scene_rect_set_size(bg, box.width, box.height);
 	wl_list_for_each(m, &mons, link) {
 		wlr_output_layout_get_box(output_layout, m->wlr, &m->area);
 		arrangelayers(m);
@@ -624,6 +699,7 @@ createmon(struct wl_listener *listener, void *data)
 	wlr_output_state_set_enabled(&state, true);
 	if ((mode = wlr_output_preferred_mode(wlr)))
 		wlr_output_state_set_mode(&state, mode);
+	wlr_output_state_set_scale(&state, settings.scale);
 	wlr_output_commit_state(wlr, &state);
 	wlr_output_state_finish(&state);
 
@@ -955,6 +1031,60 @@ createlayer(struct wl_listener *listener, void *data)
 	LISTEN(&ls->events.destroy, &l->destroy, destroylayer);
 }
 
+void
+applysettings(void)
+{
+	static Settings prev = { .cursor_size = -1 }; /* -1 forces the first cursor setup */
+	const Settings *s = &settings;
+	struct wlr_output_state state;
+	struct xkb_keymap *km;
+	Keyboard *kb;
+	Pointer *p;
+	Monitor *m;
+	char size[16];
+
+	modkey = s->modkey ? s->modkey : nested ? WLR_MODIFIER_ALT : WLR_MODIFIER_LOGO;
+
+	/* a new keymap resets held modifiers, so only swap it when it changed */
+	km = strcmp(s->xkb_layout, prev.xkb_layout) || strcmp(s->xkb_variant, prev.xkb_variant)
+		|| strcmp(s->xkb_options, prev.xkb_options) || strcmp(s->xkb_model, prev.xkb_model)
+		? keymap() : NULL;
+	wl_list_for_each(kb, &keyboards, link) {
+		if (km)
+			wlr_keyboard_set_keymap(kb->wlr, km);
+		wlr_keyboard_set_repeat_info(kb->wlr, s->repeat_rate, s->repeat_delay);
+	}
+	xkb_keymap_unref(km);
+
+	wl_list_for_each(p, &pointers, link)
+		configpointer(p->dev);
+
+	if (strcmp(s->cursor_theme, prev.cursor_theme) || s->cursor_size != prev.cursor_size) {
+		/* exported so clients draw the same cursor */
+		if (*s->cursor_theme)
+			setenv("XCURSOR_THEME", s->cursor_theme, 1);
+		snprintf(size, sizeof(size), "%d", s->cursor_size);
+		setenv("XCURSOR_SIZE", size, 1);
+		if (cursor_mgr)
+			wlr_xcursor_manager_destroy(cursor_mgr);
+		cursor_mgr = wlr_xcursor_manager_create(getenv("XCURSOR_THEME"), s->cursor_size);
+		wlr_cursor_set_xcursor(cursor, cursor_mgr, "default");
+	}
+
+	wlr_scene_rect_set_color(bg, (float[4]){ s->background[0] * s->background[3],
+		s->background[1] * s->background[3], s->background[2] * s->background[3], s->background[3] });
+
+	wl_list_for_each(m, &mons, link) {
+		if (m->wlr->scale == (float)s->scale)
+			continue;
+		wlr_output_state_init(&state);
+		wlr_output_state_set_scale(&state, s->scale);
+		wlr_output_commit_state(m->wlr, &state);
+		wlr_output_state_finish(&state);
+	}
+	prev = *s;
+}
+
 /* setup */
 
 static struct wl_listener new_output = { .notify = createmon };
@@ -1000,6 +1130,7 @@ setup(void)
 		die("couldn't create allocator");
 
 	scene = wlr_scene_create();
+	bg = wlr_scene_rect_create(&scene->tree, 0, 0, (float[4]){ 0 });
 	for (size_t i = 0; i < LENGTH(layers); i++)
 		layers[i] = wlr_scene_tree_create(&scene->tree);
 	/* dmabuf feedback lets fullscreen apps skip compositing (direct scanout) */
@@ -1042,8 +1173,6 @@ setup(void)
 
 	cursor = wlr_cursor_create();
 	wlr_cursor_attach_output_layout(cursor, output_layout);
-	cursor_mgr = wlr_xcursor_manager_create(getenv("XCURSOR_THEME"),
-		getenv("XCURSOR_SIZE") ? atoi(getenv("XCURSOR_SIZE")) : 24);
 	wl_signal_add(&cursor->events.motion, &cursor_motion);
 	wl_signal_add(&cursor->events.motion_absolute, &cursor_motion_absolute);
 	wl_signal_add(&cursor->events.button, &cursor_button);
@@ -1052,6 +1181,8 @@ setup(void)
 	cursor_shape_mgr = wlr_cursor_shape_manager_v1_create(dpy, 1);
 	wl_signal_add(&cursor_shape_mgr->events.request_set_shape, &request_shape);
 
+	wl_list_init(&keyboards);
+	wl_list_init(&pointers);
 	wl_signal_add(&backend->events.new_input, &new_input);
 	seat = wlr_seat_create(dpy, "seat0");
 	wl_signal_add(&seat->events.request_set_cursor, &request_cursor);
@@ -1124,8 +1255,8 @@ main(int argc, char *argv[])
 	if (optind < argc)
 		goto usage;
 	wlr_log_init(loglevel, NULL);
-	/* nested inside another desktop, which keeps Super for itself */
-	modkey = getenv("WAYLAND_DISPLAY") || getenv("DISPLAY") ? WLR_MODIFIER_ALT : WLR_MODIFIER_LOGO;
+	/* the outer desktop keeps Super for itself, so nested dfwc uses Alt */
+	nested = getenv("WAYLAND_DISPLAY") || getenv("DISPLAY");
 	setup();
 	run(startup);
 	cleanup();

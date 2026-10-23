@@ -5,6 +5,7 @@
  * replaces a working one.
  */
 #include <limits.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,7 +31,51 @@ typedef struct {
 	lua_State *L;
 	Bind *binds;
 	size_t nbinds;
+	char **autostart;
+	size_t nautostart;
+	Settings settings;
 } Config;
+
+enum { Str, Int, Num, Bool, Color, Mod };
+
+#define FIELD(N, T, MIN, MAX) { #N, T, offsetof(Settings, N), sizeof(((Settings *)0)->N), MIN, MAX }
+static const struct {
+	const char *name;
+	int type;
+	size_t off, size;
+	double min, max;
+} fields[] = {
+	FIELD(xkb_layout, Str, 0, 0),
+	FIELD(xkb_variant, Str, 0, 0),
+	FIELD(xkb_options, Str, 0, 0),
+	FIELD(xkb_model, Str, 0, 0),
+	FIELD(repeat_rate, Int, 0, 1000),
+	FIELD(repeat_delay, Int, 0, 10000),
+	FIELD(touchpad_tap, Bool, 0, 0),
+	FIELD(touchpad_natural_scroll, Bool, 0, 0),
+	FIELD(touchpad_dwt, Bool, 0, 0),
+	FIELD(touchpad_speed, Num, -1, 1),
+	FIELD(cursor_theme, Str, 0, 0),
+	FIELD(cursor_size, Int, 8, 256),
+	FIELD(background, Color, 0, 0),
+	FIELD(scale, Num, 0.25, 8),
+	FIELD(modkey, Mod, 0, 0),
+};
+
+static const Settings defaults = {
+	.repeat_rate = 25, .repeat_delay = 600,
+	.touchpad_tap = true, .touchpad_dwt = true,
+	.cursor_size = 24,
+	.background = { 0x22 / 255.0f, 0x22 / 255.0f, 0x22 / 255.0f, 1 },
+	.scale = 1,
+};
+
+static const struct { const char *name; uint32_t mask; } modnames[] = {
+	{ "Mod", MODKEY_BIT }, { "Super", WLR_MODIFIER_LOGO }, { "Shift", WLR_MODIFIER_SHIFT },
+	{ "Control", WLR_MODIFIER_CTRL }, { "Ctrl", WLR_MODIFIER_CTRL }, { "Alt", WLR_MODIFIER_ALT },
+};
+
+Settings settings;
 
 static const char defconfig[] = {
 #embed "init.lua"
@@ -42,14 +87,12 @@ static struct wl_event_loop *evloop;
 static struct wl_event_source *pending; /* scheduled reload */
 static struct wl_event_source *watcher;
 static int watchfd = -1;
+static char **started; /* autostart commands already run this session */
+static size_t nstarted;
 
 static int
 parsekeys(const char *keys, uint32_t *mods, xkb_keysym_t *sym)
 {
-	static const struct { const char *name; uint32_t mask; } modnames[] = {
-		{ "Mod", MODKEY_BIT }, { "Super", WLR_MODIFIER_LOGO }, { "Shift", WLR_MODIFIER_SHIFT },
-		{ "Control", WLR_MODIFIER_CTRL }, { "Ctrl", WLR_MODIFIER_CTRL }, { "Alt", WLR_MODIFIER_ALT },
-	};
 	char buf[256], *tok, *next, *save;
 	size_t i;
 
@@ -91,6 +134,129 @@ l_bind(lua_State *L)
 }
 
 static int
+parsecolor(const char *s, float c[4])
+{
+	size_t n = strlen(s);
+	unsigned long v;
+
+	if (s[0] != '#' || (n != 7 && n != 9) || strspn(s + 1, "0123456789abcdefABCDEF") != n - 1)
+		return 0;
+	v = strtoul(s + 1, NULL, 16);
+	if (n == 7)
+		v = v << 8 | 0xff;
+	for (int i = 0; i < 4; i++)
+		c[i] = (v >> (24 - 8 * i) & 0xff) / 255.0f;
+	return 1;
+}
+
+static int
+l_set(lua_State *L)
+{
+	/* settings made by a running callback apply right away */
+	Settings *s = L == load.L ? &load.settings : &settings, tmp = *s;
+	const char *key, *str;
+	size_t i, len;
+	lua_Integer n;
+	double d;
+	int ok;
+	void *p;
+
+	luaL_checktype(L, 1, LUA_TTABLE);
+	lua_pushnil(L);
+	while (lua_next(L, 1)) {
+		key = lua_type(L, -2) == LUA_TSTRING ? lua_tostring(L, -2) : "";
+		for (i = 0; i < LENGTH(fields) && strcmp(key, fields[i].name); i++);
+		if (i == LENGTH(fields))
+			return luaL_error(L, "unknown setting \"%s\"", key);
+		p = (char *)&tmp + fields[i].off;
+		ok = 1;
+		switch (fields[i].type) {
+		case Str:
+			if ((ok = lua_type(L, -1) == LUA_TSTRING)) {
+				str = lua_tolstring(L, -1, &len);
+				if (len >= fields[i].size)
+					return luaL_error(L, "%s: too long", key);
+				memcpy(p, str, len + 1);
+			}
+			break;
+		case Int:
+			n = lua_tointegerx(L, -1, &ok);
+			ok = ok && n >= fields[i].min && n <= fields[i].max;
+			if (ok)
+				*(int *)p = n;
+			break;
+		case Num:
+			d = lua_tonumberx(L, -1, &ok);
+			ok = ok && d >= fields[i].min && d <= fields[i].max;
+			if (ok)
+				*(double *)p = d;
+			break;
+		case Bool:
+			if ((ok = lua_isboolean(L, -1)))
+				*(bool *)p = lua_toboolean(L, -1);
+			break;
+		case Color:
+			ok = lua_type(L, -1) == LUA_TSTRING && parsecolor(lua_tostring(L, -1), p);
+			break;
+		case Mod:
+			str = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : "";
+			*(uint32_t *)p = 0;
+			if (strcmp(str, "auto")) {
+				for (len = 1; len < LENGTH(modnames) && strcasecmp(str, modnames[len].name); len++);
+				if ((ok = len < LENGTH(modnames)))
+					*(uint32_t *)p = modnames[len].mask;
+			}
+			break;
+		}
+		if (!ok)
+			return luaL_error(L, "%s: bad value", key);
+		lua_pop(L, 1);
+	}
+	*s = tmp;
+	if (s == &settings)
+		applysettings();
+	return 0;
+}
+
+static void
+autostart(const char *cmd)
+{
+	/* each command runs once per session, so saving init.lua never restarts
+	 * an app but a newly added autostart line starts right away */
+	char **ran;
+	size_t i;
+
+	for (i = 0; i < nstarted && strcmp(started[i], cmd); i++);
+	if (i < nstarted || !(ran = realloc(started, (nstarted + 1) * sizeof(*ran))))
+		return;
+	started = ran;
+	if ((started[nstarted] = strdup(cmd))) {
+		nstarted++;
+		spawn(cmd);
+	}
+}
+
+static int
+l_autostart(lua_State *L)
+{
+	const char *cmd = luaL_checkstring(L, 1);
+	char **cmds, *dup;
+
+	if (L != load.L) {
+		autostart(cmd);
+		return 0;
+	}
+	/* while loading, wait until the whole file loaded fine */
+	if (!(cmds = realloc(load.autostart, (load.nautostart + 1) * sizeof(*cmds))))
+		return luaL_error(L, "out of memory");
+	load.autostart = cmds;
+	if (!(dup = strdup(cmd)))
+		return luaL_error(L, "out of memory");
+	load.autostart[load.nautostart++] = dup;
+	return 0;
+}
+
+static int
 l_spawn(lua_State *L)
 {
 	spawn(luaL_checkstring(L, 1));
@@ -119,7 +285,9 @@ l_reload(lua_State *L)
 }
 
 static const luaL_Reg api[] = {
+	{ "autostart", l_autostart },
 	{ "bind", l_bind },
+	{ "set", l_set },
 	{ "spawn", l_spawn },
 	{ "close", l_close },
 	{ "quit", l_quit },
@@ -133,6 +301,9 @@ freeconfig(Config *c)
 	if (c->L)
 		lua_close(c->L);
 	free(c->binds);
+	for (size_t i = 0; i < c->nautostart; i++)
+		free(c->autostart[i]);
+	free(c->autostart);
 	*c = (Config){ 0 };
 }
 
@@ -146,7 +317,7 @@ loadconfig(const char *file)
 		wlr_log(WLR_ERROR, "config: out of memory");
 		return 0;
 	}
-	load = (Config){ .L = L };
+	load = (Config){ .L = L, .settings = defaults };
 	luaL_openlibs(L);
 	luaL_newlib(L, api);
 	lua_setglobal(L, "dfwc");
@@ -168,6 +339,10 @@ loadconfig(const char *file)
 	freeconfig(&cur);
 	cur = load;
 	load = (Config){ 0 };
+	settings = cur.settings;
+	applysettings();
+	for (size_t i = 0; i < cur.nautostart; i++)
+		autostart(cur.autostart[i]);
 	return 1;
 }
 
@@ -261,4 +436,7 @@ config_finish(void)
 	if (watchfd >= 0)
 		close(watchfd);
 	freeconfig(&cur);
+	for (size_t i = 0; i < nstarted; i++)
+		free(started[i]);
+	free(started);
 }
