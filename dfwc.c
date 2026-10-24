@@ -77,7 +77,7 @@ typedef struct {
 	struct wl_list link; /* in clients, most recently focused first */
 	struct wlr_xdg_toplevel *toplevel;
 	struct wlr_scene_tree *scene;   /* at the window geometry's top-left: borders, then surf */
-	struct wlr_scene_tree *surf;    /* the app's surfaces, offset by its geometry */
+	struct wlr_scene_tree *surf;    /* the app's surfaces; wlroots offsets them by its geometry */
 	struct wlr_scene_rect *ring[2]; /* outer and inner border */
 	struct wlr_scene_rect *arm[8];  /* corner brackets, for border_corners */
 	struct wlr_xdg_toplevel_decoration_v1 *deco;
@@ -353,9 +353,9 @@ updateborders(Client *c)
 	struct wlr_box in, gap, out;
 	int bare = c->fullscreen, R, L;
 
+	/* wlroots already offsets surf by the app's geometry, so the window's
+	 * visible part starts at the root's origin */
 	c->geom = *geo;
-	/* the surface draws its geometry at the root's origin */
-	wlr_scene_node_set_position(&c->surf->node, -geo->x, -geo->y);
 	/* square when maximized/fullscreen, and when the app draws its own shadows */
 	c->radius = c->maximized || c->fullscreen || geo->x || geo->y ? 0 : s->corner_radius;
 	R = c->radius;
