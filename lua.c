@@ -11,6 +11,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/inotify.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <lauxlib.h>
 #include <lualib.h>
@@ -848,6 +849,7 @@ void
 config_init(struct wl_event_loop *loop)
 {
 	const char *xdg = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
+	char parent[PATH_MAX];
 	int fd;
 
 	if (xdg && *xdg)
@@ -859,8 +861,13 @@ config_init(struct wl_event_loop *loop)
 	if (access(path, F_OK) || !loadconfig(path))
 		loadconfig(NULL);
 
-	/* shortcut: the directory must exist at startup to be watched; watch its
-	 * parent too if creating it while dfwc runs should start live reloads */
+	/* create the folder (and ~/.config) when missing: inotify can only watch
+	 * what exists, and a config written there later should reload on save */
+	snprintf(parent, sizeof(parent), "%s", dir);
+	if (strrchr(parent, '/'))
+		*strrchr(parent, '/') = '\0';
+	mkdir(parent, 0755);
+	mkdir(dir, 0755);
 	if ((fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC)) < 0
 	|| inotify_add_watch(fd, dir, IN_CLOSE_WRITE | IN_MOVED_TO) < 0) {
 		wlr_log(WLR_INFO, "config: not watching %s for changes", dir);
