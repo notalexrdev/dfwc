@@ -62,6 +62,7 @@
 #include <wlr/types/wlr_xdg_output_v1.h>
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/log.h>
+#include <wlr/xwayland.h>
 
 #include "dfwc.h"
 
@@ -73,12 +74,15 @@
 
 enum { CurNormal, CurMove, CurResize, CurDraw };
 /* scene layers, bottom to top */
-enum { LyrBg, LyrBottom, LyrClients, LyrOnTop, LyrTop, LyrFullscreen, LyrOverlay, NumLayers };
+enum { LyrBg, LyrBottom, LyrClients, LyrOnTop, LyrTop, LyrFullscreen, LyrX11Menus, LyrOverlay, NumLayers };
 
 typedef struct {
 	struct wl_list link; /* in clients, most recently focused first */
 	struct wl_list tlink; /* in tiles: tiling order, newest first */
-	struct wlr_xdg_toplevel *toplevel;
+	struct wlr_xdg_toplevel *toplevel;      /* a Wayland app, or */
+	struct wlr_xwayland_surface *xs;       /* an X11 app through XWayland */
+	int unmanaged;       /* X11 menus and tooltips: placed by the app, never focused or framed */
+	int associated;      /* the X11 window has its Wayland surface (and listeners on it) */
 	struct wlr_scene_tree *scene;   /* at the window geometry's top-left: borders, then surf */
 	struct wlr_scene_tree *surf;    /* the app's surfaces; wlroots offsets them by its geometry */
 	struct wlr_scene_rect *ring[2]; /* outer and inner border */
@@ -98,6 +102,7 @@ typedef struct {
 	struct wl_listener map, unmap, commit, destroy, set_title, set_app_id;
 	struct wl_listener request_move, request_resize, request_maximize, request_fullscreen;
 	struct wl_listener deco_mode, deco_destroy;
+	struct wl_listener associate, dissociate, configure, request_activate, set_geometry; /* X11 */
 } Client;
 
 typedef struct {
@@ -179,6 +184,8 @@ static struct wlr_xdg_shell *xdg_shell;
 static struct wlr_layer_shell_v1 *layer_shell;
 static struct wlr_xdg_decoration_manager_v1 *deco_mgr;
 static struct wlr_xdg_activation_v1 *activation;
+static struct wlr_compositor *compositor;
+static struct wlr_xwayland *xwayland;
 static struct wlr_cursor_shape_manager_v1 *cursor_shape_mgr;
 static struct wlr_cursor *cursor;
 static struct wlr_xcursor_manager *cursor_mgr;
@@ -230,6 +237,7 @@ clientat(double x, double y, struct wlr_surface **surface, double *sx, double *s
 {
 	struct wlr_scene_node *node = wlr_scene_node_at(&scene->tree.node, x, y, sx, sy);
 	struct wlr_scene_surface *ss;
+	Client *c;
 
 	if (node && node->type == WLR_SCENE_NODE_RECT)
 		return clientof(node); /* a border: the window, but no surface to send input to */
@@ -237,7 +245,8 @@ clientat(double x, double y, struct wlr_surface **surface, double *sx, double *s
 	|| !(ss = wlr_scene_surface_try_from_buffer(wlr_scene_buffer_from_node(node))))
 		return NULL;
 	*surface = ss->surface;
-	return clientof(node);
+	c = clientof(node);
+	return c && c->unmanaged ? NULL : c; /* X11 menus get the pointer, never focus */
 }
 
 static Client *clientfrom(struct wlr_surface *surface);
@@ -270,12 +279,141 @@ outputbox(struct wlr_box *box)
 	*box = m ? m->usable : (struct wlr_box){ 0 };
 }
 
+/* the few things that differ between Wayland apps and X11 apps */
+
+static struct wlr_surface *
+csurface(Client *c)
+{
+	return c->xs ? c->xs->surface : c->toplevel->base->surface;
+}
+
+static struct wlr_box
+cgeom(Client *c)
+{
+	/* the visible window inside its surface; X11 windows have no shadow margin */
+	return c->xs ? (struct wlr_box){ 0, 0, c->xs->width, c->xs->height } : c->toplevel->base->geometry;
+}
+
+static int
+cmapped(Client *c)
+{
+	return csurface(c) && csurface(c)->mapped;
+}
+
+static void
+cconfigure(Client *c, int x, int y, int w, int h)
+{
+	/* X11 windows get their screen position too, or their menus open in the wrong place */
+	if (c->xs)
+		wlr_xwayland_surface_configure(c->xs, x, y, MAX(w, 1), MAX(h, 1));
+	else
+		wlr_xdg_toplevel_set_size(c->toplevel, MAX(w, 1), MAX(h, 1));
+}
+
+static void
+cmove(Client *c, int x, int y)
+{
+	struct wlr_box g = cgeom(c);
+
+	wlr_scene_node_set_position(&c->scene->node, x, y);
+	if (c->xs)
+		wlr_xwayland_surface_configure(c->xs, x, y, g.width, g.height);
+}
+
+static void
+cactivate(Client *c, int on)
+{
+	if (!c->xs) {
+		wlr_xdg_toplevel_set_activated(c->toplevel, on);
+		return;
+	}
+	wlr_xwayland_surface_activate(c->xs, on);
+	if (on) /* X11 keeps its own stacking order */
+		wlr_xwayland_surface_restack(c->xs, NULL, XCB_STACK_MODE_ABOVE);
+}
+
+static void
+cmaximize(Client *c, int on)
+{
+	if (c->xs)
+		wlr_xwayland_surface_set_maximized(c->xs, on, on);
+	else
+		wlr_xdg_toplevel_set_maximized(c->toplevel, on);
+}
+
+static void
+cfullscreen(Client *c, int on)
+{
+	if (c->xs)
+		wlr_xwayland_surface_set_fullscreen(c->xs, on);
+	else
+		wlr_xdg_toplevel_set_fullscreen(c->toplevel, on);
+}
+
+static void
+cresizing(Client *c, int on)
+{
+	/* X11 has no such state; an unmapped Wayland window may take no configures */
+	if (!c->xs && c->toplevel->base->initialized)
+		wlr_xdg_toplevel_set_resizing(c->toplevel, on);
+}
+
+static void
+cclose(Client *c)
+{
+	if (c->xs)
+		wlr_xwayland_surface_close(c->xs);
+	else
+		wlr_xdg_toplevel_send_close(c->toplevel);
+}
+
+static const char *
+cappid(Client *c)
+{
+	return c->xs ? c->xs->class : c->toplevel->app_id;
+}
+
+static const char *
+ctitle(Client *c)
+{
+	return c->xs ? c->xs->title : c->toplevel->title;
+}
+
+static Client *
+cparent(Client *c)
+{
+	if (c->xs)
+		return c->xs->parent ? c->xs->parent->data : NULL;
+	return c->toplevel->parent ? clientfrom(c->toplevel->parent->base->surface) : NULL;
+}
+
+static int
+cfloats(Client *c)
+{
+	/* dialogs and fixed-size windows float even while tiling */
+	xcb_size_hints_t *sh;
+
+	if (!c->xs)
+		return c->toplevel->parent || (c->toplevel->current.min_width
+			&& c->toplevel->current.min_width == c->toplevel->current.max_width
+			&& c->toplevel->current.min_height
+			&& c->toplevel->current.min_height == c->toplevel->current.max_height);
+	sh = c->xs->size_hints;
+	return c->xs->parent || c->xs->modal
+		|| wlr_xwayland_surface_has_window_type(c->xs, WLR_XWAYLAND_NET_WM_WINDOW_TYPE_DIALOG)
+		|| wlr_xwayland_surface_has_window_type(c->xs, WLR_XWAYLAND_NET_WM_WINDOW_TYPE_UTILITY)
+		|| wlr_xwayland_surface_has_window_type(c->xs, WLR_XWAYLAND_NET_WM_WINDOW_TYPE_TOOLBAR)
+		|| wlr_xwayland_surface_has_window_type(c->xs, WLR_XWAYLAND_NET_WM_WINDOW_TYPE_SPLASH)
+		|| (sh && sh->min_width > 0 && sh->min_width == sh->max_width
+		&& sh->min_height > 0 && sh->min_height == sh->max_height);
+}
+
 static struct wlr_box
 clientbox(Client *c)
 {
-	struct wlr_box *geo = &c->toplevel->base->geometry;
+	struct wlr_box g = cgeom(c);
 
-	return (struct wlr_box){ c->scene->node.x, c->scene->node.y, geo->width, geo->height };
+	return (struct wlr_box){ c->scene->node.x, c->scene->node.y, g.width, g.height };
 }
 
 static void
@@ -286,7 +424,7 @@ resizeclient(Client *c, struct wlr_box b)
 	 * like maximize, mouse resizes go through commitnotify instead */
 	c->anchor = 0;
 	wlr_scene_node_set_position(&c->scene->node, b.x, b.y);
-	wlr_xdg_toplevel_set_size(c->toplevel, MAX(b.width, 1), MAX(b.height, 1));
+	cconfigure(c, b.x, b.y, b.width, b.height);
 }
 
 static void
@@ -359,7 +497,7 @@ stylebuffer(struct wlr_scene_buffer *buffer, int sx, int sy, void *data)
 
 	wlr_scene_buffer_set_opacity(buffer, c->fullscreen ? 1 : c->style.opacity);
 	/* round only the main surface; popups and subsurfaces keep their shape */
-	if (ss && ss->surface == c->toplevel->base->surface)
+	if (ss && ss->surface == csurface(c))
 		wlr_scene_buffer_set_corner_radius(buffer, c->radius);
 }
 
@@ -368,7 +506,7 @@ updateborders(Client *c)
 {
 	static const float red[4] = { 1, 0.2, 0.2, 1 };
 	const Settings *s = &settings;
-	struct wlr_box *geo = &c->toplevel->base->geometry, win = { 0, 0, geo->width, geo->height };
+	struct wlr_box cg = cgeom(c), *geo = &cg, win = { 0, 0, geo->width, geo->height };
 	const float *outer = flashes % 2 ? red : c->style.border;
 	const float *inner = flashes % 2 ? red : c->style.inner_border;
 	const int *w = s->border_width, iw = s->inner_border_width, g = s->border_gap;
@@ -422,9 +560,11 @@ restyle(Client *c)
 	/* the settings' look for this window, then whatever dfwc.style() says */
 	const Settings *s = &settings;
 	struct wlr_surface *f = seat->keyboard_state.focused_surface;
-	int focused = f == c->toplevel->base->surface;
-	WinInfo w = { c->toplevel->app_id, c->toplevel->title, focused, c->maximized, c->fullscreen,
-		c->ontop };
+	int focused = f == csurface(c);
+	WinInfo w = { cappid(c), ctitle(c), focused, c->maximized, c->fullscreen, c->ontop };
+
+	if (c->unmanaged)
+		return;
 
 	memcpy(c->style.border, focused ? s->border_focused : s->border_unfocused, sizeof(float[4]));
 	memcpy(c->style.inner_border, focused ? s->inner_border_focused : s->inner_border_unfocused,
@@ -437,8 +577,16 @@ restyle(Client *c)
 static Client *
 clientfrom(struct wlr_surface *surface)
 {
-	struct wlr_xdg_toplevel *t = surface ? wlr_xdg_toplevel_try_from_wlr_surface(surface) : NULL;
+	/* the managed window a surface belongs to, if any */
+	struct wlr_xwayland_surface *xs;
+	struct wlr_xdg_toplevel *t;
+	Client *c;
 
+	if (!surface)
+		return NULL;
+	if ((xs = wlr_xwayland_surface_try_from_wlr_surface(surface)))
+		return (c = xs->data) && !c->unmanaged ? c : NULL;
+	t = wlr_xdg_toplevel_try_from_wlr_surface(surface);
 	return t && t->base->data ? ((struct wlr_scene_tree *)t->base->data)->node.data : NULL;
 }
 
@@ -470,22 +618,25 @@ static void
 focusclient(Client *c, int raise)
 {
 	struct wlr_surface *old = seat->keyboard_state.focused_surface;
-	struct wlr_xdg_toplevel *prev;
+	Client *prev;
 
 	if (!c)
 		return;
 	if (raise)
 		wlr_scene_node_raise_to_top(&c->scene->node);
-	if (exclusive || old == c->toplevel->base->surface)
+	if (exclusive || old == csurface(c))
 		return;
-	if (old && (prev = wlr_xdg_toplevel_try_from_wlr_surface(old)))
-		wlr_xdg_toplevel_set_activated(prev, false);
+	/* X11 windows that take no input (some tool palettes) never get the keyboard */
+	if (c->xs && wlr_xwayland_surface_icccm_input_model(c->xs) == WLR_ICCCM_INPUT_MODEL_NONE)
+		return;
+	if ((prev = clientfrom(old)))
+		cactivate(prev, 0);
 	if (!cycling) {
 		wl_list_remove(&c->link);
 		wl_list_insert(&clients, &c->link);
 	}
-	wlr_xdg_toplevel_set_activated(c->toplevel, true);
-	kbfocus(c->toplevel->base->surface);
+	cactivate(c, 1);
+	kbfocus(csurface(c));
 }
 
 static void
@@ -527,7 +678,7 @@ grab(Client *c, int mode, uint32_t edges)
 		floatout(c);
 	if (c->maximized) { /* moving a maximized window keeps its size */
 		c->maximized = 0;
-		wlr_xdg_toplevel_set_maximized(c->toplevel, false);
+		cmaximize(c, 0);
 	}
 	c->anchor = 0;
 	grabc = c;
@@ -536,7 +687,7 @@ grab(Client *c, int mode, uint32_t edges)
 	/* apps like foot hold their content still while this is set, instead of
 	 * reflowing on every step */
 	if (mode == CurResize)
-		wlr_xdg_toplevel_set_resizing(c->toplevel, true);
+		cresizing(c, 1);
 	grabgeo = clientbox(c);
 	grabx = cursor->x - (edges & WLR_EDGE_RIGHT ? grabgeo.x + grabgeo.width : grabgeo.x);
 	graby = cursor->y - (edges & WLR_EDGE_BOTTOM ? grabgeo.y + grabgeo.height : grabgeo.y);
@@ -581,9 +732,8 @@ ungrab(void)
 {
 	Client *c = grabc, *t = NULL;
 
-	/* an unmapped window may no longer take configures */
-	if (cursor_mode == CurResize && grabc->toplevel->base->initialized)
-		wlr_xdg_toplevel_set_resizing(grabc->toplevel, false);
+	if (cursor_mode == CurResize)
+		cresizing(grabc, 0);
 	cursor_mode = CurNormal;
 	grabc = NULL;
 	if (!tileddrag)
@@ -662,7 +812,7 @@ moveresize(int dx, int dy, int dw, int dh)
 	}
 	if (c->maximized) {
 		c->maximized = 0;
-		wlr_xdg_toplevel_set_maximized(c->toplevel, false);
+		cmaximize(c, 0);
 	}
 	floatout(c);
 	b = clientbox(c);
@@ -673,7 +823,7 @@ moveresize(int dx, int dy, int dw, int dh)
 	b.x += dx;
 	b.y += dy;
 	snap(c, &b.x, &b.y, dx, dy);
-	wlr_scene_node_set_position(&c->scene->node, b.x, b.y);
+	cmove(c, b.x, b.y);
 }
 
 static void
@@ -689,7 +839,7 @@ setmaximized(Client *c, int on)
 		restyle(c);
 		arrange();
 	}
-	wlr_xdg_toplevel_set_maximized(c->toplevel, c->maximized);
+	cmaximize(c, c->maximized);
 }
 
 static void
@@ -707,7 +857,7 @@ setfullscreen(Client *c, int on)
 		restyle(c);
 		arrange();
 	}
-	wlr_xdg_toplevel_set_fullscreen(c->toplevel, c->fullscreen);
+	cfullscreen(c, c->fullscreen);
 }
 
 void
@@ -807,7 +957,7 @@ restoremenu(void)
 		if (!c->minimized)
 			continue;
 		n = snprintf(line, sizeof(line), "%u %s\n", c->id,
-			c->toplevel->title ? c->toplevel->title : c->toplevel->app_id ? c->toplevel->app_id : "");
+			ctitle(c) ? ctitle(c) : cappid(c) ? cappid(c) : "");
 		send(in[0], line, MIN(n, (int)sizeof(line) - 1), MSG_NOSIGNAL | MSG_DONTWAIT);
 	}
 	close(in[0]);
@@ -841,7 +991,7 @@ killclient(void)
 	Client *c = selclient();
 
 	if (c)
-		wlr_xdg_toplevel_send_close(c->toplevel);
+		cclose(c);
 }
 
 void
@@ -938,7 +1088,7 @@ static void
 snap(Client *c, int *x, int *y, int dx, int dy)
 {
 	/* line the window's outer edges up with screen edges and other windows' edges */
-	struct wlr_box *geo = &c->toplevel->base->geometry;
+	struct wlr_box g = cgeom(c), *geo = &g;
 	struct wlr_box me = outset(c, (struct wlr_box){ *x, *y, geo->width, geo->height }), o;
 	Monitor *m = selmon();
 	int bx = INT_MAX, by = INT_MAX;
@@ -1174,7 +1324,7 @@ motionnotify(uint32_t time)
 		x = cursor->x - grabx;
 		y = cursor->y - graby;
 		snap(grabc, &x, &y, 0, 0);
-		wlr_scene_node_set_position(&grabc->scene->node, x, y);
+		cmove(grabc, x, y);
 		return;
 	}
 	if (cursor_mode == CurDraw) {
@@ -1200,7 +1350,7 @@ motionnotify(uint32_t time)
 		grabc->anchor = grabedges & (WLR_EDGE_LEFT | WLR_EDGE_TOP);
 		grabc->ax = grabgeo.x + grabgeo.width;
 		grabc->ay = grabgeo.y + grabgeo.height;
-		wlr_xdg_toplevel_set_size(grabc->toplevel, r - l, b - t);
+		cconfigure(grabc, l, t, r - l, b - t);
 		return;
 	}
 
@@ -1642,45 +1792,51 @@ static void
 mapnotify(struct wl_listener *listener, void *data)
 {
 	Client *c = wl_container_of(listener, c, map), *p;
-	struct wlr_box *geo = &c->toplevel->base->geometry, area, around, box;
+	struct wlr_box g, *geo = &g, area, around, box;
 	int w, h;
 
 	static unsigned int ids;
 
+	if (c->xs) { /* X11 surfaces come and go with each map */
+		c->surf = wlr_scene_subsurface_tree_create(c->scene, c->xs->surface);
+		c->surf->node.data = c;
+		if (draw.pending && !draw.claim && !cparent(c))
+			draw.claim = c; /* sized for the drawn box below, when it's placed */
+	}
+	g = cgeom(c);
 	c->id = ++ids;
 	wl_list_insert(&clients, &c->link);
 	wl_list_insert(&tiles, &c->tlink);
 	/* dialogs, fixed-size windows and drawn boxes float even while tiling */
-	c->floating = c->toplevel->parent || (draw.claim == c && settings.tiling)
-		|| (c->toplevel->current.min_width && c->toplevel->current.min_width == c->toplevel->current.max_width
-		&& c->toplevel->current.min_height && c->toplevel->current.min_height == c->toplevel->current.max_height);
+	c->floating = cfloats(c) || (draw.claim == c && settings.tiling);
 	wlr_scene_node_set_enabled(&c->scene->node, true);
 	outputbox(&area);
 	area = inset(c, area);
 	if (draw.claim == c) {
 		/* already sized for the drawn box; a click only sets the corner */
 		box = inset(c, draw.box);
-		wlr_scene_node_set_position(&c->scene->node, tinybox() ? draw.box.x : box.x,
-			tinybox() ? draw.box.y : box.y);
+		if (c->xs && !tinybox()) /* X11 apps aren't sized before they map */
+			cconfigure(c, box.x, box.y, box.width, box.height);
+		cmove(c, tinybox() ? draw.box.x : box.x, tinybox() ? draw.box.y : box.y);
 		endbox();
 	} else if (!wlr_box_empty(&area)) {
 		/* center on the screen, dialogs on their parent; shrink to fit */
 		around = area;
-		if (c->toplevel->parent && (p = clientfrom(c->toplevel->parent->base->surface)))
+		if ((p = cparent(c)))
 			around = clientbox(p);
 		w = MIN(geo->width, area.width);
 		h = MIN(geo->height, area.height);
+		box.x = MIN(MAX(around.x + (around.width - w) / 2, area.x), area.x + area.width - w);
+		box.y = MIN(MAX(around.y + (around.height - h) / 2, area.y), area.y + area.height - h);
 		if (w != geo->width || h != geo->height)
-			wlr_xdg_toplevel_set_size(c->toplevel, w, h);
-		wlr_scene_node_set_position(&c->scene->node,
-			MIN(MAX(around.x + (around.width - w) / 2, area.x), area.x + area.width - w),
-			MIN(MAX(around.y + (around.height - h) / 2, area.y), area.y + area.height - h));
+			cconfigure(c, box.x, box.y, w, h);
+		cmove(c, box.x, box.y);
 	}
 	restyle(c);
 	focusclient(c, 1);
-	if (c->toplevel->requested.fullscreen)
+	if (c->xs ? c->xs->fullscreen : c->toplevel->requested.fullscreen)
 		setfullscreen(c, 1);
-	else if (c->toplevel->requested.maximized)
+	else if (c->xs ? c->xs->maximized_vert && c->xs->maximized_horz : c->toplevel->requested.maximized)
 		setmaximized(c, 1);
 	arrange();
 }
@@ -1703,6 +1859,10 @@ unmapnotify(struct wl_listener *listener, void *data)
 	wl_list_remove(&c->link);
 	if (focused)
 		focustop();
+	if (c->xs) {
+		wlr_scene_node_destroy(&c->surf->node);
+		c->surf = NULL;
+	}
 	arrange();
 }
 
@@ -1710,16 +1870,16 @@ static void
 commitnotify(struct wl_listener *listener, void *data)
 {
 	Client *c = wl_container_of(listener, c, commit);
-	struct wlr_box *geo = &c->toplevel->base->geometry, box;
+	struct wlr_box g = cgeom(c), *geo = &g, box;
 
-	if (c->toplevel->base->surface->mapped) {
+	if (cmapped(c)) {
 		if (c->anchor) {
-			wlr_scene_node_set_position(&c->scene->node,
-				c->anchor & WLR_EDGE_LEFT ? c->ax - geo->width : c->scene->node.x,
+			cmove(c, c->anchor & WLR_EDGE_LEFT ? c->ax - geo->width : c->scene->node.x,
 				c->anchor & WLR_EDGE_TOP ? c->ay - geo->height : c->scene->node.y);
-			/* the drag is over and the app reached the last size asked for */
-			if (c != grabc && geo->width == c->toplevel->scheduled.width
-			&& geo->height == c->toplevel->scheduled.height)
+			/* the drag is over and the app reached the last size asked for
+			 * (X11 sizes change on request, not on commit) */
+			if (c != grabc && (c->xs || (geo->width == c->toplevel->scheduled.width
+			&& geo->height == c->toplevel->scheduled.height)))
 				c->anchor = 0;
 		}
 		if (!wlr_box_equal(geo, &c->geom))
@@ -1728,7 +1888,7 @@ commitnotify(struct wl_listener *listener, void *data)
 			wlr_scene_node_for_each_buffer(&c->surf->node, stylebuffer, c); /* new subsurfaces */
 		return;
 	}
-	if (!c->toplevel->base->initial_commit)
+	if (c->xs || !c->toplevel->base->initial_commit)
 		return;
 	if (draw.pending && !draw.claim && !c->toplevel->parent) {
 		/* sized for the drawn box before it ever shows, so it doesn't jump */
@@ -1815,7 +1975,7 @@ retitle(struct wl_listener *listener, void *data)
 {
 	Client *c = wl_container_of(listener, c, set_title);
 
-	if (c->toplevel->base->surface->mapped && config_hasstyle())
+	if (cmapped(c) && config_hasstyle())
 		restyle(c);
 }
 
@@ -1824,7 +1984,7 @@ reappid(struct wl_listener *listener, void *data)
 {
 	Client *c = wl_container_of(listener, c, set_app_id);
 
-	if (c->toplevel->base->surface->mapped && config_hasstyle())
+	if (cmapped(c) && config_hasstyle())
 		restyle(c);
 }
 
@@ -1867,7 +2027,7 @@ activate(struct wl_listener *listener, void *data)
 	struct wlr_xdg_activation_v1_request_activate_event *event = data;
 	Client *c = clientfrom(event->surface);
 
-	if (c && c->toplevel->base->surface->mapped)
+	if (c && cmapped(c))
 		focusclient(c, 1);
 }
 
@@ -1952,6 +2112,195 @@ createpopup(struct wl_listener *listener, void *data)
 	popup->base->data = wlr_scene_xdg_surface_create(parent->data, popup->base);
 	LISTEN(&popup->base->surface->events.commit, &p->commit, commitpopup);
 	LISTEN(&popup->events.destroy, &p->destroy, destroypopup);
+}
+
+/* X11 apps through XWayland */
+
+static void
+xconfigure(struct wl_listener *listener, void *data)
+{
+	/* an X11 app asks for a size or place: floating windows get it, the rest keep theirs */
+	Client *c = wl_container_of(listener, c, configure);
+	struct wlr_xwayland_surface_configure_event *e = data;
+	struct wlr_box b;
+
+	if (!cmapped(c) || !(c->tiled || c->maximized || c->fullscreen)) {
+		wlr_xwayland_surface_configure(c->xs, e->x, e->y, e->width, e->height);
+		if (cmapped(c))
+			wlr_scene_node_set_position(&c->scene->node, e->x, e->y);
+		return;
+	}
+	b = clientbox(c);
+	wlr_xwayland_surface_configure(c->xs, b.x, b.y, b.width, b.height);
+}
+
+static void
+xactivate(struct wl_listener *listener, void *data)
+{
+	Client *c = wl_container_of(listener, c, request_activate);
+
+	if (cmapped(c) && !c->unmanaged)
+		focusclient(c, 1);
+}
+
+static void
+xresize(struct wl_listener *listener, void *data)
+{
+	Client *c = wl_container_of(listener, c, request_resize);
+	struct wlr_xwayland_resize_event *event = data;
+
+	if (cmapped(c))
+		grab(c, CurResize, event->edges);
+}
+
+static void
+xmaximize(struct wl_listener *listener, void *data)
+{
+	Client *c = wl_container_of(listener, c, request_maximize);
+
+	if (cmapped(c))
+		setmaximized(c, c->xs->maximized_vert && c->xs->maximized_horz);
+}
+
+static void
+xfullscreen(struct wl_listener *listener, void *data)
+{
+	Client *c = wl_container_of(listener, c, request_fullscreen);
+
+	if (cmapped(c))
+		setfullscreen(c, c->xs->fullscreen);
+}
+
+static void
+xgeometry(struct wl_listener *listener, void *data)
+{
+	/* menus and tooltips place themselves */
+	Client *c = wl_container_of(listener, c, set_geometry);
+
+	if (c->unmanaged && cmapped(c))
+		wlr_scene_node_set_position(&c->scene->node, c->xs->x, c->xs->y);
+}
+
+static void
+mapunmanaged(struct wl_listener *listener, void *data)
+{
+	Client *c = wl_container_of(listener, c, map);
+
+	c->surf = wlr_scene_subsurface_tree_create(c->scene, c->xs->surface);
+	c->surf->node.data = c;
+	wlr_scene_node_set_position(&c->scene->node, c->xs->x, c->xs->y);
+	wlr_scene_node_set_enabled(&c->scene->node, true);
+	if (wlr_xwayland_surface_override_redirect_wants_focus(c->xs))
+		kbfocus(c->xs->surface);
+}
+
+static void
+unmapunmanaged(struct wl_listener *listener, void *data)
+{
+	Client *c = wl_container_of(listener, c, unmap);
+
+	wlr_scene_node_set_enabled(&c->scene->node, false);
+	wlr_scene_node_destroy(&c->surf->node);
+	c->surf = NULL;
+	if (seat->keyboard_state.focused_surface == c->xs->surface)
+		focustop();
+}
+
+static void
+xassociate(struct wl_listener *listener, void *data)
+{
+	Client *c = wl_container_of(listener, c, associate);
+
+	c->associated = 1;
+	LISTEN(&c->xs->surface->events.map, &c->map, c->unmanaged ? mapunmanaged : mapnotify);
+	LISTEN(&c->xs->surface->events.unmap, &c->unmap, c->unmanaged ? unmapunmanaged : unmapnotify);
+	LISTEN(&c->xs->surface->events.commit, &c->commit, commitnotify);
+}
+
+static void
+xdissociate(struct wl_listener *listener, void *data)
+{
+	Client *c = wl_container_of(listener, c, dissociate);
+
+	c->associated = 0;
+	wl_list_remove(&c->map.link);
+	wl_list_remove(&c->unmap.link);
+	wl_list_remove(&c->commit.link);
+}
+
+static void
+destroyx11(struct wl_listener *listener, void *data)
+{
+	Client *c = wl_container_of(listener, c, destroy);
+
+	if (c->associated)
+		xdissociate(&c->dissociate, NULL);
+	wl_list_remove(&c->associate.link);
+	wl_list_remove(&c->dissociate.link);
+	wl_list_remove(&c->destroy.link);
+	wl_list_remove(&c->configure.link);
+	wl_list_remove(&c->request_activate.link);
+	wl_list_remove(&c->request_move.link);
+	wl_list_remove(&c->request_resize.link);
+	wl_list_remove(&c->request_maximize.link);
+	wl_list_remove(&c->request_fullscreen.link);
+	wl_list_remove(&c->set_title.link);
+	wl_list_remove(&c->set_app_id.link);
+	wl_list_remove(&c->set_geometry.link);
+	wlr_scene_node_destroy(&c->scene->node);
+	if (draw.claim == c)
+		draw.claim = NULL;
+	c->xs->data = NULL;
+	free(c);
+}
+
+static void
+createx11(struct wl_listener *listener, void *data)
+{
+	struct wlr_xwayland_surface *xs = data;
+	Client *c = calloc(1, sizeof(*c));
+
+	if (!c) {
+		wlr_log(WLR_ERROR, "out of memory for an X11 window");
+		return;
+	}
+	c->xs = xs;
+	xs->data = c;
+	c->unmanaged = xs->override_redirect;
+	c->scene = wlr_scene_tree_create(layers[c->unmanaged ? LyrX11Menus : LyrClients]);
+	wlr_scene_node_set_enabled(&c->scene->node, false); /* until mapped */
+	if (!c->unmanaged) {
+		for (size_t i = 0; i < LENGTH(c->ring); i++)
+			c->ring[i] = wlr_scene_rect_create(c->scene, 0, 0, (float[4]){ 0 });
+		for (size_t i = 0; i < LENGTH(c->arm); i++)
+			c->arm[i] = wlr_scene_rect_create(c->scene, 0, 0, (float[4]){ 0 });
+	}
+	c->scene->node.data = c;
+
+	LISTEN(&xs->events.associate, &c->associate, xassociate);
+	LISTEN(&xs->events.dissociate, &c->dissociate, xdissociate);
+	LISTEN(&xs->events.destroy, &c->destroy, destroyx11);
+	LISTEN(&xs->events.request_configure, &c->configure, xconfigure);
+	LISTEN(&xs->events.request_activate, &c->request_activate, xactivate);
+	LISTEN(&xs->events.request_move, &c->request_move, requestmove);
+	LISTEN(&xs->events.request_resize, &c->request_resize, xresize);
+	LISTEN(&xs->events.request_maximize, &c->request_maximize, xmaximize);
+	LISTEN(&xs->events.request_fullscreen, &c->request_fullscreen, xfullscreen);
+	LISTEN(&xs->events.set_title, &c->set_title, retitle);
+	LISTEN(&xs->events.set_class, &c->set_app_id, reappid);
+	LISTEN(&xs->events.set_geometry, &c->set_geometry, xgeometry);
+}
+
+static void
+xready(struct wl_listener *listener, void *data)
+{
+	struct wlr_xcursor *xc;
+
+	wlr_xwayland_set_seat(xwayland, seat);
+	/* the cursor X11 apps show where they don't set their own */
+	if ((xc = wlr_xcursor_manager_get_xcursor(cursor_mgr, "default", 1)))
+		wlr_xwayland_set_cursor(xwayland, wlr_xcursor_image_get_buffer(xc->images[0]),
+			xc->images[0]->hotspot_x, xc->images[0]->hotspot_y);
 }
 
 /* layer surfaces: wallpapers, bars, launchers */
@@ -2401,6 +2750,8 @@ static struct wl_listener layout_change = { .notify = updatemons };
 static struct wl_listener new_layer = { .notify = createlayer };
 static struct wl_listener new_deco = { .notify = createdeco };
 static struct wl_listener request_activate = { .notify = activate };
+static struct wl_listener new_xsurface = { .notify = createx11 };
+static struct wl_listener xwayland_ready = { .notify = xready };
 
 static int
 quitsignal(int sig, void *data)
@@ -2454,7 +2805,7 @@ setup(void)
 	wlr_log(WLR_INFO, "explicit sync: %s",
 		drw->features.timeline && backend->features.timeline ? "on" : "unsupported here");
 
-	wlr_compositor_create(dpy, 6, drw);
+	compositor = wlr_compositor_create(dpy, 6, drw);
 	wlr_subcompositor_create(dpy);
 	wlr_data_device_manager_create(dpy);
 	wlr_primary_selection_v1_device_manager_create(dpy);
@@ -2505,6 +2856,16 @@ setup(void)
 	wl_signal_add(&seat->events.request_set_selection, &request_sel);
 	wl_signal_add(&seat->events.request_set_primary_selection, &request_psel);
 	wlr_seat_set_capabilities(seat, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
+
+	/* X11 apps; Xwayland itself starts only when the first one connects */
+	if ((xwayland = wlr_xwayland_create(dpy, compositor, true))) {
+		wl_signal_add(&xwayland->events.ready, &xwayland_ready);
+		wl_signal_add(&xwayland->events.new_surface, &new_xsurface);
+		setenv("DISPLAY", xwayland->display_name, 1);
+	} else {
+		wlr_log(WLR_ERROR, "couldn't set up XWayland: X11 apps won't open");
+		unsetenv("DISPLAY");
+	}
 }
 
 static void
@@ -2536,6 +2897,11 @@ cleanup(void)
 	Monitor *m;
 
 	wl_display_destroy_clients(dpy);
+	if (xwayland) {
+		wl_list_remove(&xwayland_ready.link);
+		wl_list_remove(&new_xsurface.link);
+		wlr_xwayland_destroy(xwayland);
+	}
 	config_finish();
 	for (size_t i = 0; i < LENGTH(sigsrc); i++)
 		wl_event_source_remove(sigsrc[i]);

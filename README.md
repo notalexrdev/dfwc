@@ -6,7 +6,8 @@ which reloads every time you save it.
 
 ## Build and install
 
-Needs `wlroots0.20 scenefx lua libinput fcft libpng wayland-protocols` and a C23 compiler (`#embed`).
+Needs `wlroots0.20 scenefx lua libinput fcft libpng libxcb xcb-util-wm wayland-protocols` and a
+C23 compiler (`#embed`); `xorg-xwayland` (Alpine: `xwayland`) at runtime for X11 apps.
 
     make
     sudo make install
@@ -23,6 +24,12 @@ Recommended companions: `foot` (terminal), `wmenu` (launcher), `swaybg` (wallpap
 The default config starts mako when it's installed: without a notification daemon, apps
 that send a notification wait 25 s for KDE's or GNOME's to start.
 Screen sharing asks which screen to share through wmenu.
+
+## X11 apps
+
+X11-only apps (Steam, many games, older programs) run through XWayland, which starts the
+moment the first one opens and costs nothing until then. They get the same borders, tiling,
+focus and keys as Wayland apps; their menus and tooltips stay unframed.
 
 ## Look
 

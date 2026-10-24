@@ -10,7 +10,7 @@ SYSCONFDIR = /etc
 LUA = lua
 
 # scenefx must come before wlroots so its wlr_scene_* symbols win
-PKGS = scenefx-0.5 wlroots-0.20 wayland-server wayland-protocols xkbcommon libinput $(LUA) pixman-1 libdrm libpng
+PKGS = scenefx-0.5 wlroots-0.20 wayland-server wayland-protocols xkbcommon libinput $(LUA) pixman-1 libdrm libpng xcb xcb-icccm
 
 CPPFLAGS = -I. -DVERSION=\"$(VERSION)\" -DPREFIX=\"$(PREFIX)\" -DWLR_USE_UNSTABLE -D_GNU_SOURCE
 CFLAGS   = -std=c23 -Wall -Wextra -Wno-unused-parameter -O2 `pkg-config --cflags $(PKGS)`
