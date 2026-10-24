@@ -1390,8 +1390,9 @@ snap(Client *c, int *x, int *y, int dx, int dy)
 	int bx = INT_MAX, by = INT_MAX;
 	Client *t;
 
-#define TRYX(v, hold) do { if (snapok(v, dx, hold) && abs(v) < abs(bx)) bx = (v); } while (0)
-#define TRYY(v, hold) do { if (snapok(v, dy, hold) && abs(v) < abs(by)) by = (v); } while (0)
+	/* a key move only snaps along the axis it moves on; the mouse snaps both */
+#define TRYX(v, hold) do { if ((dx || !dy) && snapok(v, dx, hold) && abs(v) < abs(bx)) bx = (v); } while (0)
+#define TRYY(v, hold) do { if ((dy || !dx) && snapok(v, dy, hold) && abs(v) < abs(by)) by = (v); } while (0)
 	if (!settings.snap)
 		return;
 	/* keys never push a window off the screen; a held key also stops at windows */
