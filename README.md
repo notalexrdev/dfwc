@@ -122,7 +122,7 @@ the bind while the key is held.
 | `error_alarm_fullscreen` | false: also blink the whole screen red on config errors |
 | `launcher` | `wmenu-run` in ink colors: Super+p and drawn boxes run it |
 | `restore_menu` | `wmenu -i -p restore` in ink colors: gets `id title` lines, prints the picked one |
-| `box_timeout` | 5000 ms a drawn box waits for its window |
+| `box_timeout` | 15000 ms a drawn box waits for its window (after the launcher closes) |
 | `snap` | 10 px: moved windows snap to screen and window edges (0 turns it off) |
 | `shadow_size`, `shadow_color` | 10 px, `"#0000008c"`: soft shadow under floating windows and their menus (0: none) |
 | `shadow_offset` | `{ 6, 8 }`: the shadow falls down and right |
