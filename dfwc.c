@@ -166,6 +166,7 @@ typedef struct {
 
 typedef struct {
 	struct wlr_xdg_popup *wlr;
+	struct wlr_scene_shadow *shadow;
 	struct wl_listener commit, destroy;
 } Popup;
 
@@ -2460,16 +2461,32 @@ commitpopup(struct wl_listener *listener, void *data)
 	Client *c;
 	struct wlr_box box;
 
-	if (!p->wlr->base->initial_commit)
-		return;
-	/* keep menus on screen; the box is relative to the toplevel's surface */
-	if ((c = clientof(&tree->node))) {
-		outputbox(&box);
-		box.x -= c->scene->node.x - c->toplevel->base->geometry.x;
-		box.y -= c->scene->node.y - c->toplevel->base->geometry.y;
-		wlr_xdg_popup_unconstrain_from_box(p->wlr, &box);
+	struct wlr_box g = p->wlr->base->geometry;
+	int sh = settings.shadow_size, *o = settings.shadow_offset;
+	float color[4];
+
+	if (p->wlr->base->initial_commit) {
+		/* keep menus on screen; the box is relative to the toplevel's surface */
+		if ((c = clientof(&tree->node))) {
+			outputbox(&box);
+			box.x -= c->scene->node.x - c->toplevel->base->geometry.x;
+			box.y -= c->scene->node.y - c->toplevel->base->geometry.y;
+			wlr_xdg_popup_unconstrain_from_box(p->wlr, &box);
+		}
+		wlr_xdg_surface_schedule_configure(p->wlr->base);
 	}
-	wlr_xdg_surface_schedule_configure(p->wlr->base);
+	/* the window shadow, cut out under the menu; skipped when the app leaves
+	 * a margin around it for a shadow of its own */
+	wlr_scene_node_set_enabled(&p->shadow->node, sh && !g.x && !g.y && g.width > 0);
+	if (!p->shadow->node.enabled)
+		return;
+	premul(settings.shadow_color, color);
+	wlr_scene_node_set_position(&p->shadow->node, o[0] - sh, o[1] - sh);
+	wlr_scene_shadow_set_size(p->shadow, g.width + 2 * sh, g.height + 2 * sh);
+	wlr_scene_shadow_set_blur_sigma(p->shadow, sh / 2.0f);
+	wlr_scene_shadow_set_color(p->shadow, color);
+	wlr_scene_shadow_set_clipped_region(p->shadow, (struct clipped_region){
+		{ sh - o[0], sh - o[1], g.width, g.height }, corner_radii_all(0) });
 }
 
 static void
@@ -2496,6 +2513,9 @@ createpopup(struct wl_listener *listener, void *data)
 	}
 	p->wlr = popup;
 	popup->base->data = wlr_scene_xdg_surface_create(parent->data, popup->base);
+	/* a child of the popup's tree, so wlroots places and frees it with the popup */
+	p->shadow = wlr_scene_shadow_create(popup->base->data, 0, 0, 0, 0, (float[4]){ 0 });
+	wlr_scene_node_lower_to_bottom(&p->shadow->node);
 	LISTEN(&popup->base->surface->events.commit, &p->commit, commitpopup);
 	LISTEN(&popup->events.destroy, &p->destroy, destroypopup);
 }
