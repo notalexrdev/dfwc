@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <wayland-server-core.h>
+#include <wlr/util/box.h>
 #include <xkbcommon/xkbcommon.h>
 
 /* binds use this bit for "Mod"; it is replaced by modkey when matching */
@@ -30,6 +31,14 @@ typedef struct {
 	char restore_menu[256]; /* reads "id title" lines, prints the picked one */
 	int box_timeout;        /* ms a drawn box waits for its window */
 	int snap;               /* px within which moved windows snap to edges */
+	/* tiling; these four keep their runtime value across reloads unless
+	 * the config's own value for them changes */
+	bool tiling;
+	char layout[64];
+	double mfact;
+	int nmaster;
+	int gaps_inner, gaps_outer;
+	bool smart_gaps;        /* a lone tiled window gets no gaps and no borders */
 } Settings;
 
 /* what a dfwc.style() function sees and may change */
@@ -48,6 +57,7 @@ enum { BindNone, BindDone, BindRepeat }; /* config_key() results */
 /* dfwc.c */
 extern uint32_t modkey;
 void applysettings(void);
+void arrange(void);
 void configerror(const char *msg);
 void focusstack(int dir);
 void killclient(void);
@@ -55,6 +65,8 @@ void moveresize(int dx, int dy, int dw, int dh);
 void quit(void);
 void spawn(const char *cmd);
 void minimize(void);
+void togglefloat(void);
+void zoom(void);
 void restoremenu(void);
 void togglefullscreen(void);
 void togglemaximize(void);
@@ -67,4 +79,6 @@ int config_key(uint32_t mods, xkb_keysym_t sym);
 void config_reload(void);
 void config_finish(void);
 bool config_hasstyle(void);
+bool config_haslayout(const char *name);
+bool config_layout(const char *name, struct wlr_box area, int n, struct wlr_box *out);
 void config_style(const WinInfo *w, Style *st);

@@ -64,6 +64,13 @@ the bind while the key is held.
 | `dfwc.ontop()` | toggle always on top |
 | `dfwc.minimize()` | hide the focused window |
 | `dfwc.restore()` | pick a hidden window from a menu to bring back |
+| `dfwc.tiling()` | switch between floating and tiling (`true`/`false` to set) |
+| `dfwc.layout(name)` | pick a tiling layout |
+| `dfwc.float()` | let the focused window float while the rest tile |
+| `dfwc.zoom()` | make the focused window the master |
+| `dfwc.mfact(delta)` | grow/shrink the master area, e.g. `0.05` |
+| `dfwc.nmaster(delta)` | more/fewer master windows, e.g. `1` |
+| `dfwc.addlayout(name, fn)` | add your own layout (see below) |
 | `dfwc.reload()` | reload the config |
 | `dfwc.quit()` | quit dfwc |
 
@@ -94,10 +101,40 @@ the bind while the key is held.
 | `restore_menu` | `"wmenu -p restore"`: gets `id title` lines, prints the picked one |
 | `box_timeout` | 5000 ms a drawn box waits for its window |
 | `snap` | 10 px: moved windows snap to screen and window edges (0 turns it off) |
+| `tiling` | false |
+| `layout` | `"tile"` |
+| `mfact`, `nmaster` | 0.55, 1 |
+| `gaps_inner`, `gaps_outer` | 0, 0 |
+| `smart_gaps` | false: a lone tiled window gets no gaps, borders or rounding |
 
 Every setting applies immediately when the file is saved. When a saved config has an
 error, all borders blink red three times and a black box at the top of the screen shows
 the file, line and message until the config loads fine again.
+
+`tiling`, `layout`, `mfact` and `nmaster` are also changed by keys while dfwc runs;
+saving the config keeps those changes unless you edited that setting's line.
+
+### Tiling
+
+Layouts: `tile` (master left, stack right), `bstack` (master on top), `spiral`, `dwindle`,
+`centeredmaster`, `grid`, `monocle`. Switching tiling off puts every window back where it
+floated. Dialogs, fixed-size windows and windows opened into a drawn box keep floating,
+and dragging or keyboard-moving a tiled window makes it float.
+
+Your own layout gets the window count, the area and `{ mfact, nmaster, gap }`, and
+returns one box per window, master first:
+
+    dfwc.addlayout("columns", function(n, area, p)
+        local boxes = {}
+        for i = 1, n do
+            local w = area.w // n
+            boxes[i] = { x = area.x + (i - 1) * w, y = area.y, w = w, h = area.h }
+        end
+        return boxes
+    end)
+    dfwc.layout("columns")
+
+It runs only when windows come, go or the layout changes; if it errors, dfwc uses `tile`.
 
 ### Per-window looks
 

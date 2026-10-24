@@ -75,6 +75,7 @@ enum { LyrBg, LyrBottom, LyrClients, LyrOnTop, LyrTop, LyrFullscreen, LyrOverlay
 
 typedef struct {
 	struct wl_list link; /* in clients, most recently focused first */
+	struct wl_list tlink; /* in tiles: tiling order, newest first */
 	struct wlr_xdg_toplevel *toplevel;
 	struct wlr_scene_tree *scene;   /* at the window geometry's top-left: borders, then surf */
 	struct wlr_scene_tree *surf;    /* the app's surfaces; wlroots offsets them by its geometry */
@@ -85,6 +86,10 @@ typedef struct {
 	struct wlr_box geom; /* geometry the borders were last drawn for */
 	Style style;         /* last dfwc.style() result, applied on top of settings */
 	int maximized, fullscreen, ontop, minimized, radius;
+	int floating;        /* stays floating while the rest tile */
+	int tiled;           /* placed by tiling since it last floated; floatbox is valid */
+	int smart;           /* the only tiled window on its screen, with smart_gaps */
+	struct wlr_box floatbox; /* where it floated before tiling took it */
 	uint32_t anchor;     /* edges a mouse resize grows, so the opposite ones stay put */
 	int ax, ay;          /* right and bottom edges to keep while anchored */
 	unsigned int id;     /* names the window in the restore menu */
@@ -172,6 +177,7 @@ static struct wlr_cursor *cursor;
 static struct wlr_xcursor_manager *cursor_mgr;
 static struct wlr_seat *seat;
 static struct wl_list clients;
+static struct wl_list tiles;
 static struct wl_list mons;
 static struct wl_list keyboards;
 static struct wl_list pointers; /* libinput pointers, for touchpad settings */
@@ -230,6 +236,7 @@ static Client *clientfrom(struct wlr_surface *surface);
 static void restyle(Client *c);
 static void placeerror(void);
 static void snap(Client *c, int *x, int *y, int dx, int dy);
+static void floatout(Client *c);
 
 static Client *
 selclient(void)
@@ -279,7 +286,8 @@ extents(Client *c, int e[4])
 	const Settings *s = &settings;
 
 	for (int i = 0; i < 4; i++)
-		e[i] = c->fullscreen ? 0 : s->border_width[i] + s->inner_border_width + s->border_gap;
+		e[i] = c->fullscreen || c->smart ? 0
+			: s->border_width[i] + s->inner_border_width + s->border_gap;
 }
 
 static struct wlr_box
@@ -355,13 +363,13 @@ updateborders(Client *c)
 	const float *inner = flashes % 2 ? red : c->style.inner_border;
 	const int *w = s->border_width, iw = s->inner_border_width, g = s->border_gap;
 	struct wlr_box in, gap, out;
-	int bare = c->fullscreen, R, L;
+	int bare = c->fullscreen || c->smart, R, L;
 
 	/* wlroots already offsets surf by the app's geometry, so the window's
 	 * visible part starts at the root's origin */
 	c->geom = *geo;
 	/* square when maximized/fullscreen, and when the app draws its own shadows */
-	c->radius = c->maximized || c->fullscreen || geo->x || geo->y ? 0 : s->corner_radius;
+	c->radius = c->maximized || c->fullscreen || c->smart || geo->x || geo->y ? 0 : s->corner_radius;
 	R = c->radius;
 
 	/* from the window outwards: inner border, gap, outer border */
@@ -487,10 +495,23 @@ focustop(void)
 }
 
 static void
+floatout(Client *c)
+{
+	/* moving a tiled window by hand floats it where it is, like dwm */
+	if (!settings.tiling || c->floating)
+		return;
+	c->floating = 1;
+	c->tiled = c->smart = 0;
+	restyle(c);
+	arrange();
+}
+
+static void
 grab(Client *c, int mode, uint32_t edges)
 {
 	if (c->fullscreen)
 		return;
+	floatout(c);
 	if (c->maximized) { /* moving a maximized window keeps its size */
 		c->maximized = 0;
 		wlr_xdg_toplevel_set_maximized(c->toplevel, false);
@@ -554,6 +575,7 @@ moveresize(int dx, int dy, int dw, int dh)
 		c->maximized = 0;
 		wlr_xdg_toplevel_set_maximized(c->toplevel, false);
 	}
+	floatout(c);
 	b = clientbox(c);
 	if (dw || dh) {
 		resizeclient(c, (struct wlr_box){ b.x + dx, b.y + dy, b.width + dw, b.height + dh });
@@ -576,6 +598,7 @@ setmaximized(Client *c, int on)
 		c->maximized = on;
 		resizeclient(c, on ? inset(c, m->usable) : c->prev);
 		restyle(c);
+		arrange();
 	}
 	wlr_xdg_toplevel_set_maximized(c->toplevel, c->maximized);
 }
@@ -593,6 +616,7 @@ setfullscreen(Client *c, int on)
 		wlr_scene_node_reparent(&c->scene->node, layers[clientlayer(c)]);
 		resizeclient(c, on ? m->area : c->maximized ? inset(c, m->usable) : c->prev);
 		restyle(c);
+		arrange();
 	}
 	wlr_xdg_toplevel_set_fullscreen(c->toplevel, c->fullscreen);
 }
@@ -619,6 +643,7 @@ minimize(void)
 	c->minimized = 1;
 	wlr_scene_node_set_enabled(&c->scene->node, false);
 	focustop();
+	arrange();
 }
 
 static int
@@ -643,6 +668,7 @@ menuread(int fd, uint32_t mask, void *data)
 				c->minimized = 0;
 				wlr_scene_node_set_enabled(&c->scene->node, true);
 				focusclient(c, 1);
+				arrange();
 				break;
 			}
 	wl_event_source_remove(menu.src);
@@ -1262,6 +1288,190 @@ destroymon(struct wl_listener *listener, void *data)
 	free(m);
 }
 
+/* tiling */
+
+static void
+split(struct wlr_box a, int k, int gap, int vertical, struct wlr_box *out)
+{
+	/* k boxes side by side (or stacked), gap apart; the last takes the rounding */
+	int len = vertical ? a.height : a.width, step = (len - (k - 1) * gap) / MAX(k, 1);
+
+	for (int i = 0; i < k; i++) {
+		out[i] = a;
+		if (vertical) {
+			out[i].y = a.y + i * (step + gap);
+			out[i].height = i == k - 1 ? a.y + a.height - out[i].y : step;
+		} else {
+			out[i].x = a.x + i * (step + gap);
+			out[i].width = i == k - 1 ? a.x + a.width - out[i].x : step;
+		}
+	}
+}
+
+static void
+halve(struct wlr_box *a, double f, int gap, int vertical, int first, struct wlr_box *out)
+{
+	/* cut a into out (fraction f of it) and what's left (back into a); first
+	 * puts out on the left/top side, else on the right/bottom */
+	struct wlr_box parts[2];
+	int len = (vertical ? a->height : a->width) - gap, n = len * f;
+
+	parts[0] = parts[1] = *a;
+	if (vertical) {
+		parts[0].height = first ? n : len - n;
+		parts[1].y = a->y + parts[0].height + gap;
+		parts[1].height = a->height - parts[0].height - gap;
+	} else {
+		parts[0].width = first ? n : len - n;
+		parts[1].x = a->x + parts[0].width + gap;
+		parts[1].width = a->width - parts[0].width - gap;
+	}
+	*out = parts[!first];
+	*a = parts[first];
+}
+
+static void
+layout(const char *name, struct wlr_box a, int n, struct wlr_box *out)
+{
+	const Settings *s = &settings;
+	int g = s->gaps_inner, nm = MIN(s->nmaster, n), cols, rows, i, k;
+	struct wlr_box main = a, rest = a;
+
+	if (!strcmp(name, "monocle")) {
+		for (i = 0; i < n; i++)
+			out[i] = a;
+	} else if (!strcmp(name, "grid")) {
+		for (cols = 1; cols * cols < n; cols++);
+		rows = (n + cols - 1) / cols;
+		struct wlr_box r[rows];
+		split(a, rows, g, 1, r);
+		for (i = 0; i < rows; i++) /* the last row may hold fewer, wider cells */
+			split(r[i], MIN(cols, n - i * cols), g, 0, out + i * cols);
+	} else if (!strcmp(name, "spiral") || !strcmp(name, "dwindle")) {
+		/* each window takes a share of what's left: dwindle always cuts toward
+		 * the bottom-right, spiral turns right, down, left, up */
+		for (i = 0; i < n - 1; i++) {
+			k = !strcmp(name, "spiral") ? i % 4 : i % 2;
+			halve(&rest, i ? 0.5 : s->mfact, g, k % 2, k < 2, &out[i]);
+		}
+		out[n - 1] = rest;
+	} else if (!strcmp(name, "centeredmaster") && n - nm > 1 && nm) {
+		/* masters in the middle, the stack alternating right and left */
+		int side = (a.width - a.width * s->mfact) / 2;
+		struct wlr_box l = a, r = a, mid = a;
+		l.width = r.width = MAX(side - g, 1);
+		r.x = a.x + a.width - r.width;
+		mid.x = l.x + l.width + g;
+		mid.width = r.x - g - mid.x;
+		split(mid, nm, g, 1, out);
+		struct wlr_box lb[n], rb[n];
+		k = (n - nm) / 2; /* left gets the smaller half */
+		split(r, n - nm - k, g, 1, rb);
+		split(l, k, g, 1, lb);
+		for (i = 0; i < n - nm; i++)
+			out[nm + i] = i % 2 ? lb[i / 2] : rb[i / 2];
+	} else {
+		/* tile (master left, stack right), bstack (master top), and the
+		 * fallback for centeredmaster with one or no stack window */
+		int v = !strcmp(name, "bstack");
+		if (!nm || nm == n) {
+			split(a, n, g, !v, out);
+			return;
+		}
+		halve(&rest, s->mfact, g, v, 1, &main);
+		split(main, nm, g, !v, out);
+		split(rest, n - nm, g, !v, out + nm);
+	}
+}
+
+static int
+istiled(Client *c)
+{
+	return settings.tiling && !c->floating && !c->minimized && !c->fullscreen && !c->maximized;
+}
+
+static void
+tile(Monitor *m)
+{
+	const Settings *s = &settings;
+	struct wlr_box a, *out;
+	Client *c;
+	int n = 0, i = 0, smart;
+
+	wl_list_for_each(c, &tiles, tlink)
+		n += istiled(c) && monof(c) == m;
+	if (!n || !(out = calloc(n, sizeof(*out))))
+		return;
+	smart = s->smart_gaps && n == 1;
+	a = m->usable;
+	if (!smart)
+		a = (struct wlr_box){ a.x + s->gaps_outer, a.y + s->gaps_outer,
+			a.width - 2 * s->gaps_outer, a.height - 2 * s->gaps_outer };
+	if (!config_layout(s->layout, a, n, out))
+		layout(s->layout, a, n, out);
+	wl_list_for_each(c, &tiles, tlink) {
+		if (!istiled(c) || monof(c) != m)
+			continue;
+		if (!c->tiled) {
+			c->floatbox = clientbox(c);
+			c->tiled = 1;
+		}
+		if (c->smart != smart) {
+			c->smart = smart;
+			restyle(c);
+		}
+		resizeclient(c, inset(c, out[i++]));
+	}
+	free(out);
+}
+
+void
+arrange(void)
+{
+	Monitor *m;
+	Client *c;
+
+	/* tiling turned off: everything back where it floated */
+	wl_list_for_each(c, &tiles, tlink) {
+		if (c->tiled && !settings.tiling) {
+			c->tiled = c->smart = 0;
+			resizeclient(c, c->floatbox);
+			restyle(c);
+		}
+	}
+	wl_list_for_each(m, &mons, link)
+		tile(m);
+}
+
+void
+togglefloat(void)
+{
+	Client *c = selclient();
+
+	if (!c)
+		return;
+	c->floating = !c->floating;
+	if (c->floating && c->tiled) {
+		c->tiled = c->smart = 0;
+		resizeclient(c, c->floatbox);
+		restyle(c);
+	}
+	arrange();
+}
+
+void
+zoom(void)
+{
+	/* the focused window becomes the (first) master */
+	Client *c = selclient();
+
+	if (!c || !istiled(c))
+		return;
+	wl_list_remove(&c->tlink);
+	wl_list_insert(&tiles, &c->tlink);
+	arrange();
+}
+
 static void
 arrangelayers(Monitor *m)
 {
@@ -1279,6 +1489,7 @@ arrangelayers(Monitor *m)
 	wl_list_for_each(c, &clients, link)
 		if (monof(c) == m && (c->maximized || c->fullscreen))
 			resizeclient(c, c->fullscreen ? m->area : inset(c, m->usable));
+	tile(m);
 }
 
 static void
@@ -1345,6 +1556,11 @@ mapnotify(struct wl_listener *listener, void *data)
 
 	c->id = ++ids;
 	wl_list_insert(&clients, &c->link);
+	wl_list_insert(&tiles, &c->tlink);
+	/* dialogs, fixed-size windows and drawn boxes float even while tiling */
+	c->floating = c->toplevel->parent || draw.claim == c
+		|| (c->toplevel->current.min_width && c->toplevel->current.min_width == c->toplevel->current.max_width
+		&& c->toplevel->current.min_height && c->toplevel->current.min_height == c->toplevel->current.max_height);
 	wlr_scene_node_set_enabled(&c->scene->node, true);
 	outputbox(&area);
 	area = inset(c, area);
@@ -1373,6 +1589,7 @@ mapnotify(struct wl_listener *listener, void *data)
 		setfullscreen(c, 1);
 	else if (c->toplevel->requested.maximized)
 		setmaximized(c, 1);
+	arrange();
 }
 
 static void
@@ -1382,7 +1599,8 @@ unmapnotify(struct wl_listener *listener, void *data)
 	int focused = selclient() == c;
 
 	/* an app that hides and shows its window starts over as a plain one */
-	c->maximized = c->fullscreen = c->minimized = 0;
+	c->maximized = c->fullscreen = c->minimized = c->tiled = c->smart = 0;
+	wl_list_remove(&c->tlink);
 	wlr_scene_node_reparent(&c->scene->node, layers[clientlayer(c)]);
 	wlr_scene_node_set_enabled(&c->scene->node, false);
 	if (c == grabc)
@@ -1390,6 +1608,7 @@ unmapnotify(struct wl_listener *listener, void *data)
 	wl_list_remove(&c->link);
 	if (focused)
 		focustop();
+	arrange();
 }
 
 static void
@@ -1794,6 +2013,7 @@ applysettings(void)
 	}
 	wl_list_for_each(c, &clients, link)
 		restyle(c);
+	arrange(); /* gaps, layout or tiling itself may have changed */
 	prev = *s;
 }
 
@@ -2017,6 +2237,7 @@ setup(void)
 	wl_list_init(&mons);
 
 	wl_list_init(&clients);
+	wl_list_init(&tiles);
 	xdg_shell = wlr_xdg_shell_create(dpy, 6);
 	wl_signal_add(&xdg_shell->events.new_toplevel, &new_toplevel);
 	wl_signal_add(&xdg_shell->events.new_popup, &new_popup);

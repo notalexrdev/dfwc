@@ -34,7 +34,8 @@ typedef struct {
 	size_t nbinds;
 	char **autostart;
 	size_t nautostart;
-	int style; /* registry ref of the dfwc.style() function, or LUA_NOREF */
+	int style;   /* registry ref of the dfwc.style() function, or LUA_NOREF */
+	int layouts; /* registry ref of the table of dfwc.addlayout() functions */
 	Settings settings;
 } Config;
 
@@ -77,6 +78,23 @@ static const struct {
 	FIELD(restore_menu, Str, 0, 0),
 	FIELD(box_timeout, Int, 0, 60000),
 	FIELD(snap, Int, 0, 200),
+	FIELD(tiling, Bool, 0, 0),
+	FIELD(layout, Str, 0, 0),
+	FIELD(mfact, Num, 0.05, 0.95),
+	FIELD(nmaster, Int, 0, 20),
+	FIELD(gaps_inner, Int, 0, 200),
+	FIELD(gaps_outer, Int, 0, 200),
+	FIELD(smart_gaps, Bool, 0, 0),
+};
+
+/* runtime changes to these survive a save, unless the config's value for them changed */
+#define KEEP(N) { offsetof(Settings, N), sizeof(((Settings *)0)->N) }
+static const struct { size_t off, size; } keep[] = {
+	KEEP(tiling), KEEP(layout), KEEP(mfact), KEEP(nmaster),
+};
+
+static const char *const layouts[] = {
+	"tile", "bstack", "spiral", "dwindle", "centeredmaster", "grid", "monocle", NULL,
 };
 
 #define HEX(C) { ((C) >> 16 & 0xff) / 255.0f, ((C) >> 8 & 0xff) / 255.0f, ((C) & 0xff) / 255.0f, 1 }
@@ -99,6 +117,9 @@ static const Settings defaults = {
 	.restore_menu = "wmenu -p restore",
 	.box_timeout = 5000,
 	.snap = 10,
+	.layout = "tile",
+	.mfact = 0.55,
+	.nmaster = 1,
 };
 
 static const struct { const char *name; uint32_t mask; } modnames[] = {
@@ -112,7 +133,8 @@ static const char defconfig[] = {
 #embed "init.lua"
 };
 
-static Config cur = { .style = LUA_NOREF }, load = { .style = LUA_NOREF }; /* running, loading */
+static Config cur = { .style = LUA_NOREF, .layouts = LUA_NOREF },
+	load = { .style = LUA_NOREF, .layouts = LUA_NOREF }; /* running, loading */
 static char dir[PATH_MAX], path[PATH_MAX + sizeof("/init.lua")];
 static struct wl_event_loop *evloop;
 static struct wl_event_source *pending; /* scheduled reload */
@@ -310,6 +332,168 @@ l_autostart(lua_State *L)
 }
 
 static int
+knownlayout(lua_State *L, const char *name)
+{
+	Config *c = L == load.L ? &load : &cur;
+	int found;
+
+	for (int i = 0; layouts[i]; i++)
+		if (!strcmp(name, layouts[i]))
+			return 1;
+	if (c->layouts == LUA_NOREF)
+		return 0;
+	lua_rawgeti(L, LUA_REGISTRYINDEX, c->layouts);
+	found = lua_getfield(L, -1, name) == LUA_TFUNCTION;
+	lua_pop(L, 2);
+	return found;
+}
+
+static int
+l_layout(lua_State *L)
+{
+	Settings *s = L == load.L ? &load.settings : &settings;
+	size_t len;
+	const char *name = luaL_checklstring(L, 1, &len);
+
+	if (!knownlayout(L, name) || len >= sizeof(s->layout))
+		return luaL_error(L, "unknown layout \"%s\"", name);
+	memcpy(s->layout, name, len + 1);
+	if (s == &settings)
+		arrange();
+	return 0;
+}
+
+static int
+l_addlayout(lua_State *L)
+{
+	/* fn(n, area, params) returns n boxes { x, y, w, h }; called only when windows
+	 * come, go or the layout changes, never per frame */
+	Config *c = L == load.L ? &load : &cur;
+
+	luaL_checkstring(L, 1);
+	luaL_checktype(L, 2, LUA_TFUNCTION);
+	lua_rawgeti(L, LUA_REGISTRYINDEX, c->layouts);
+	lua_pushvalue(L, 1);
+	lua_pushvalue(L, 2);
+	lua_rawset(L, -3);
+	lua_pop(L, 1);
+	return 0;
+}
+
+static int
+l_tiling(lua_State *L)
+{
+	Settings *s = L == load.L ? &load.settings : &settings;
+
+	s->tiling = lua_isnoneornil(L, 1) ? !s->tiling : lua_toboolean(L, 1);
+	if (s == &settings)
+		arrange();
+	return 0;
+}
+
+static int
+l_mfact(lua_State *L)
+{
+	Settings *s = L == load.L ? &load.settings : &settings;
+	double f = s->mfact + luaL_checknumber(L, 1);
+
+	s->mfact = f < 0.05 ? 0.05 : f > 0.95 ? 0.95 : f;
+	if (s == &settings)
+		arrange();
+	return 0;
+}
+
+static int
+l_nmaster(lua_State *L)
+{
+	Settings *s = L == load.L ? &load.settings : &settings;
+	lua_Integer n = s->nmaster + luaL_checkinteger(L, 1);
+
+	s->nmaster = n < 0 ? 0 : n > 20 ? 20 : n;
+	if (s == &settings)
+		arrange();
+	return 0;
+}
+
+static int
+l_float(lua_State *L)
+{
+	togglefloat();
+	return 0;
+}
+
+static int
+l_zoom(lua_State *L)
+{
+	zoom();
+	return 0;
+}
+
+bool
+config_haslayout(const char *name)
+{
+	bool found;
+
+	if (!cur.L || cur.layouts == LUA_NOREF)
+		return false;
+	lua_rawgeti(cur.L, LUA_REGISTRYINDEX, cur.layouts);
+	found = lua_getfield(cur.L, -1, name) == LUA_TFUNCTION;
+	lua_pop(cur.L, 2);
+	return found;
+}
+
+static int
+boxfield(lua_State *L, const char *k, int *v)
+{
+	int ok;
+
+	lua_getfield(L, -1, k);
+	*v = lua_tointegerx(L, -1, &ok);
+	lua_pop(L, 1);
+	return ok;
+}
+
+bool
+config_layout(const char *name, struct wlr_box a, int n, struct wlr_box *out)
+{
+	/* false: no such Lua layout, or it failed; dfwc then uses a built-in one */
+	lua_State *L = cur.L;
+	int i, ok = 1;
+
+	if (!config_haslayout(name))
+		return false;
+	lua_rawgeti(L, LUA_REGISTRYINDEX, cur.layouts);
+	lua_getfield(L, -1, name);
+	lua_pushinteger(L, n);
+	lua_createtable(L, 0, 4);
+	lua_pushinteger(L, a.x), lua_setfield(L, -2, "x");
+	lua_pushinteger(L, a.y), lua_setfield(L, -2, "y");
+	lua_pushinteger(L, a.width), lua_setfield(L, -2, "w");
+	lua_pushinteger(L, a.height), lua_setfield(L, -2, "h");
+	lua_createtable(L, 0, 3);
+	lua_pushnumber(L, settings.mfact), lua_setfield(L, -2, "mfact");
+	lua_pushinteger(L, settings.nmaster), lua_setfield(L, -2, "nmaster");
+	lua_pushinteger(L, settings.gaps_inner), lua_setfield(L, -2, "gap");
+	if (lua_pcall(L, 3, 1, 0) != LUA_OK) {
+		wlr_log(WLR_ERROR, "config: layout %s: %s", name, lua_tostring(L, -1));
+		lua_pop(L, 2);
+		return false;
+	}
+	for (i = 0; ok && i < n; i++) {
+		ok = lua_istable(L, -1) && lua_rawgeti(L, -1, i + 1) == LUA_TTABLE
+			&& boxfield(L, "x", &out[i].x) && boxfield(L, "y", &out[i].y)
+			&& boxfield(L, "w", &out[i].width) && boxfield(L, "h", &out[i].height)
+			&& out[i].width > 0 && out[i].height > 0;
+		if (lua_istable(L, -1))
+			lua_pop(L, 1);
+	}
+	lua_pop(L, 2);
+	if (!ok)
+		wlr_log(WLR_ERROR, "config: layout %s: needs %d boxes { x, y, w, h }", name, n);
+	return ok;
+}
+
+static int
 l_style(lua_State *L)
 {
 	Config *c = L == load.L ? &load : &cur;
@@ -472,14 +656,19 @@ l_reload(lua_State *L)
 }
 
 static const luaL_Reg api[] = {
+	{ "addlayout", l_addlayout },
 	{ "autostart", l_autostart },
 	{ "bind", l_bind },
 	{ "close", l_close },
+	{ "float", l_float },
 	{ "focus", l_focus },
 	{ "fullscreen", l_fullscreen },
+	{ "layout", l_layout },
 	{ "maximize", l_maximize },
+	{ "mfact", l_mfact },
 	{ "minimize", l_minimize },
 	{ "move", l_move },
+	{ "nmaster", l_nmaster },
 	{ "ontop", l_ontop },
 	{ "quit", l_quit },
 	{ "reload", l_reload },
@@ -488,6 +677,8 @@ static const luaL_Reg api[] = {
 	{ "set", l_set },
 	{ "spawn", l_spawn },
 	{ "style", l_style },
+	{ "tiling", l_tiling },
+	{ "zoom", l_zoom },
 	{ NULL, NULL },
 };
 
@@ -500,7 +691,7 @@ freeconfig(Config *c)
 	for (size_t i = 0; i < c->nautostart; i++)
 		free(c->autostart[i]);
 	free(c->autostart);
-	*c = (Config){ .style = LUA_NOREF };
+	*c = (Config){ .style = LUA_NOREF, .layouts = LUA_NOREF };
 }
 
 static int
@@ -514,6 +705,8 @@ loadconfig(const char *file)
 		return 0;
 	}
 	load = (Config){ .L = L, .style = LUA_NOREF, .settings = defaults };
+	lua_newtable(L);
+	load.layouts = luaL_ref(L, LUA_REGISTRYINDEX);
 	luaL_openlibs(L);
 	luaL_newlib(L, api);
 	lua_setglobal(L, "dfwc");
@@ -533,9 +726,12 @@ loadconfig(const char *file)
 		freeconfig(&load);
 		return 0;
 	}
+	for (size_t i = 0; i < LENGTH(keep); i++)
+		if (!memcmp((char *)&load.settings + keep[i].off, (char *)&cur.settings + keep[i].off, keep[i].size))
+			memcpy((char *)&load.settings + keep[i].off, (char *)&settings + keep[i].off, keep[i].size);
 	freeconfig(&cur);
 	cur = load;
-	load = (Config){ .style = LUA_NOREF };
+	load = (Config){ .style = LUA_NOREF, .layouts = LUA_NOREF };
 	settings = cur.settings;
 	configerror(NULL);
 	applysettings();
