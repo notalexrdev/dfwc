@@ -204,6 +204,11 @@ static struct {
 	void *claim;  /* the Client sized for it before it first showed */
 } draw; /* drag-to-open */
 static struct {
+	struct wlr_scene_rect *rect;
+	Anim a;
+	struct wlr_box from, to;
+} morph; /* the drawn box turning into the window that took it */
+static struct {
 	int fd;
 	struct wl_event_source *src;
 	char buf[64];
@@ -363,6 +368,7 @@ static void restyle(Client *c);
 static void placeerror(void);
 static void drawwallpaper(Monitor *m);
 static void snap(Client *c, int *x, int *y, int dx, int dy);
+static void showmorph(double e);
 static void constrain(struct wlr_pointer_constraint_v1 *con);
 static void floatout(Client *c);
 static int istiled(Client *c);
@@ -830,6 +836,10 @@ animate(void)
 		}
 		if (upd)
 			updateborders(c);
+	}
+	if (morph.a.dur) {
+		busy |= step(&morph.a, now, &e);
+		showmorph(e);
 	}
 	wl_list_for_each_safe(g, tmp, &ghosts, link) {
 		if (!step(&g->a, now, &e)) {
@@ -1361,6 +1371,26 @@ showbox(void)
 
 	setring(draw.rect, b, (struct wlr_box){ b.x + 2, b.y + 2, b.width - 4, b.height - 4 },
 		corner_radii_none(), 0, settings.border_focused);
+}
+
+static void
+showmorph(double e)
+{
+	/* the box's outline slides onto the window's frame and fades out */
+	struct wlr_box b = {
+		morph.from.x + (morph.to.x - morph.from.x) * e,
+		morph.from.y + (morph.to.y - morph.from.y) * e,
+		morph.from.width + (morph.to.width - morph.from.width) * e,
+		morph.from.height + (morph.to.height - morph.from.height) * e,
+	};
+	float color[4];
+
+	memcpy(color, settings.border_focused, sizeof(color));
+	color[3] *= MAX(1 - e, 0);
+	setring(morph.rect, b, (struct wlr_box){ b.x + 2, b.y + 2, b.width - 4, b.height - 4 },
+		corner_radii_none(), 0, color);
+	if (!morph.a.dur)
+		wlr_scene_node_set_enabled(&morph.rect->node, false);
 }
 
 static int
@@ -2170,7 +2200,7 @@ mapnotify(struct wl_listener *listener, void *data)
 {
 	Client *c = wl_container_of(listener, c, map), *p;
 	struct wlr_box g, *geo = &g, area, around, box;
-	int w, h;
+	int w, h, claimed;
 
 	static unsigned int ids;
 
@@ -2189,8 +2219,9 @@ mapnotify(struct wl_listener *listener, void *data)
 	wlr_scene_node_set_enabled(&c->scene->node, true);
 	outputbox(&area);
 	area = inset(c, area);
-	if (draw.claim == c) {
+	if ((claimed = draw.claim == c)) {
 		/* already sized for the drawn box; a click only sets the corner */
+		morph.from = draw.box;
 		box = inset(c, draw.box);
 		if (c->xs && !tinybox()) /* X11 apps aren't sized before they map */
 			cconfigure(c, box.x, box.y, box.width, box.height);
@@ -2213,6 +2244,11 @@ mapnotify(struct wl_listener *listener, void *data)
 	if (settings.anim_open)
 		startanim(&c->open, settings.anim_open);
 	restyle(c);
+	if (claimed && settings.anim_open) {
+		morph.to = outset(c, clientbox(c));
+		startanim(&morph.a, settings.anim_open);
+		showmorph(0);
+	}
 	focusclient(c, 1);
 	if (c->xs ? c->xs->fullscreen : c->toplevel->requested.fullscreen)
 		setfullscreen(c, 1);
@@ -3139,6 +3175,9 @@ setup(void)
 	draw.rect = wlr_scene_rect_create(layers[LyrTop], 0, 0, (float[4]){ 0 });
 	draw.rect->accepts_input = false;
 	wlr_scene_node_set_enabled(&draw.rect->node, false);
+	morph.rect = wlr_scene_rect_create(layers[LyrTop], 0, 0, (float[4]){ 0 });
+	morph.rect->accepts_input = false;
+	wlr_scene_node_set_enabled(&morph.rect->node, false);
 	optblur = wlr_scene_optimized_blur_create(layers[LyrBottom], 0, 0);
 	wlr_scene_node_lower_to_bottom(&optblur->node); /* right above every wallpaper */
 	alarmrect = wlr_scene_rect_create(layers[LyrOverlay], 0, 0, (float[4]){ 0.4, 0, 0, 0.4 });

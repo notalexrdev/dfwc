@@ -128,7 +128,7 @@ the bind while the key is held.
 | `shadow_offset` | `{ 6, 8 }`: the shadow falls down and right |
 | `blur` | true: the wallpaper shows blurred through see-through windows |
 | `blur_radius`, `blur_passes` | 5, 3: how strong the blur is |
-| `anim_open`, `anim_close` | 180, 140 ms: windows fade in and out (0: off) |
+| `anim_open`, `anim_close` | 180, 140 ms: windows fade in and out, and a drawn box morphs into its window (0: off) |
 | `anim_focus` | 150 ms: border colors blend when focus moves |
 | `anim_move` | 200 ms: tiling, maximize and zoom glide windows into place |
 | `anim_curve` | `{ 0.2, 0.9, 0.3, 1 }`: the easing of all of them, as a CSS cubic-bezier |
