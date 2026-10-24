@@ -499,6 +499,10 @@ grab(Client *c, int mode, uint32_t edges)
 	grabc = c;
 	cursor_mode = mode;
 	grabedges = edges;
+	/* apps like foot hold their content still while this is set, instead of
+	 * reflowing on every step */
+	if (mode == CurResize)
+		wlr_xdg_toplevel_set_resizing(c->toplevel, true);
 	grabgeo = clientbox(c);
 	grabx = cursor->x - (edges & WLR_EDGE_RIGHT ? grabgeo.x + grabgeo.width : grabgeo.x);
 	graby = cursor->y - (edges & WLR_EDGE_BOTTOM ? grabgeo.y + grabgeo.height : grabgeo.y);
@@ -507,6 +511,9 @@ grab(Client *c, int mode, uint32_t edges)
 static void
 ungrab(void)
 {
+	/* an unmapped window may no longer take configures */
+	if (cursor_mode == CurResize && grabc->toplevel->base->initialized)
+		wlr_xdg_toplevel_set_resizing(grabc->toplevel, false);
 	cursor_mode = CurNormal;
 	grabc = NULL;
 }
