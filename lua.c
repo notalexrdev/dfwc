@@ -41,12 +41,15 @@ typedef struct {
 
 enum { Str, Int, Num, Bool, Color, Mod, Sides };
 
-#define FIELD(N, T, MIN, MAX) { #N, T, offsetof(Settings, N), sizeof(((Settings *)0)->N), MIN, MAX }
+#define FIELD(N, T, MIN, MAX) { #N, T, offsetof(Settings, N), sizeof(((Settings *)0)->N), MIN, MAX, NULL }
+#define CHOICE(N, ...) { #N, Str, offsetof(Settings, N), sizeof(((Settings *)0)->N), 0, 0, \
+	(const char *const[]){ __VA_ARGS__, NULL } }
 static const struct {
 	const char *name;
 	int type;
 	size_t off, size;
 	double min, max;
+	const char *const *choices; /* for strings with a fixed set of values */
 } fields[] = {
 	FIELD(xkb_layout, Str, 0, 0),
 	FIELD(xkb_variant, Str, 0, 0),
@@ -85,6 +88,7 @@ static const struct {
 	FIELD(gaps_inner, Int, 0, 200),
 	FIELD(gaps_outer, Int, 0, 200),
 	FIELD(smart_gaps, Bool, 0, 0),
+	CHOICE(tiled_drag, "swap", "snap", "float"),
 };
 
 /* runtime changes to these survive a save, unless the config's value for them changed */
@@ -120,6 +124,7 @@ static const Settings defaults = {
 	.layout = "tile",
 	.mfact = 0.55,
 	.nmaster = 1,
+	.tiled_drag = "swap",
 };
 
 static const struct { const char *name; uint32_t mask; } modnames[] = {
@@ -235,6 +240,24 @@ l_set(lua_State *L)
 				str = lua_tolstring(L, -1, &len);
 				if (len >= fields[i].size)
 					return luaL_error(L, "%s: too long", key);
+				for (const char *const *c = fields[i].choices; c && *c; c++)
+					if (!strcmp(*c, str))
+						goto chosen;
+				if (fields[i].choices) { /* "tiled_drag: use swap, snap or float" */
+					luaL_Buffer b;
+					luaL_buffinit(L, &b);
+					luaL_where(L, 1);
+					luaL_addvalue(&b);
+					luaL_addstring(&b, key);
+					luaL_addstring(&b, ": use");
+					for (const char *const *c = fields[i].choices; *c; c++) {
+						luaL_addstring(&b, c == fields[i].choices ? " " : c[1] ? ", " : " or ");
+						luaL_addstring(&b, *c);
+					}
+					luaL_pushresult(&b);
+					return lua_error(L);
+				}
+			chosen:
 				memcpy(p, str, len + 1);
 			}
 			break;

@@ -39,6 +39,7 @@ typedef struct {
 	int nmaster;
 	int gaps_inner, gaps_outer;
 	bool smart_gaps;        /* a lone tiled window gets no gaps and no borders */
+	char tiled_drag[8];     /* moving a tiled window: "swap", "snap" or "float" */
 } Settings;
 
 /* what a dfwc.style() function sees and may change */

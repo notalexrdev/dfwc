@@ -109,6 +109,7 @@ the bind while the key is held.
 | `mfact`, `nmaster` | 0.55, 1 |
 | `gaps_inner`, `gaps_outer` | 0, 0 |
 | `smart_gaps` | false: a lone tiled window gets no gaps, borders or rounding |
+| `tiled_drag` | `"swap"`: dragging a tiled window onto another swaps them; `"snap"` puts it back in its tile; `"float"` makes it float |
 
 Every setting applies immediately when the file is saved. When a saved config has an
 error, all borders blink red three times and a black box at the top of the screen shows
@@ -121,8 +122,9 @@ saving the config keeps those changes unless you edited that setting's line.
 
 Layouts: `tile` (master left, stack right), `bstack` (master on top), `spiral`, `dwindle`,
 `centeredmaster`, `grid`, `monocle`. Switching tiling off puts every window back where it
-floated. Dialogs, fixed-size windows and windows drawn into a box while tiling keep floating,
-and dragging or keyboard-moving a tiled window makes it float.
+floated. Dialogs, fixed-size windows and windows drawn into a box while tiling keep floating.
+Dragging a tiled window and dropping it on another swaps the two (see `tiled_drag`);
+`dfwc.move` on a tiled window swaps it with its neighbor in that direction, once per press.
 
 Your own layout gets the window count, the area and `{ mfact, nmaster, gap }`, and
 returns one box per window, master first:

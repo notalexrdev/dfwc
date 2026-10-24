@@ -185,6 +185,7 @@ static struct wl_list pointers; /* libinput pointers, for touchpad settings */
 static LayerSurface *exclusive; /* layer surface holding the keyboard, e.g. wmenu */
 static int cycling; /* focus is walking the stack; the order commits when Mod is released */
 static int repeating; /* the running bind comes from a held key */
+static int tileddrag; /* the window being moved is tiled and stays tiled */
 static struct {
 	struct wl_event_source *timer;
 	uint32_t mods, keycode;
@@ -238,6 +239,7 @@ static void restyle(Client *c);
 static void placeerror(void);
 static void snap(Client *c, int *x, int *y, int dx, int dy);
 static void floatout(Client *c);
+static int istiled(Client *c);
 
 static Client *
 selclient(void)
@@ -512,7 +514,10 @@ grab(Client *c, int mode, uint32_t edges)
 {
 	if (c->fullscreen)
 		return;
-	floatout(c);
+	/* a tiled window being moved stays tiled, unless tiled_drag is "float" */
+	tileddrag = mode == CurMove && istiled(c) && strcmp(settings.tiled_drag, "float");
+	if (!tileddrag)
+		floatout(c);
 	if (c->maximized) { /* moving a maximized window keeps its size */
 		c->maximized = 0;
 		wlr_xdg_toplevel_set_maximized(c->toplevel, false);
@@ -531,13 +536,80 @@ grab(Client *c, int mode, uint32_t edges)
 }
 
 static void
+swaptiles(Client *a, Client *b)
+{
+	/* exchange two windows' places in the tiling order */
+	struct wl_list *pa = a->tlink.prev, *pb = b->tlink.prev;
+
+	wl_list_remove(&a->tlink);
+	wl_list_remove(&b->tlink);
+	if (pa == &b->tlink) { /* b right before a */
+		wl_list_insert(pb, &a->tlink);
+		wl_list_insert(&a->tlink, &b->tlink);
+	} else if (pb == &a->tlink) { /* a right before b */
+		wl_list_insert(pa, &b->tlink);
+		wl_list_insert(&b->tlink, &a->tlink);
+	} else {
+		wl_list_insert(pa, &b->tlink);
+		wl_list_insert(pb, &a->tlink);
+	}
+}
+
+static Client *
+tiledat(double x, double y, Client *except)
+{
+	struct wlr_box b;
+	Client *t;
+
+	wl_list_for_each(t, &tiles, tlink) {
+		b = outset(t, clientbox(t));
+		if (t != except && istiled(t) && wlr_box_contains_point(&b, x, y))
+			return t;
+	}
+	return NULL;
+}
+
+static void
 ungrab(void)
 {
+	Client *c = grabc, *t = NULL;
+
 	/* an unmapped window may no longer take configures */
 	if (cursor_mode == CurResize && grabc->toplevel->base->initialized)
 		wlr_xdg_toplevel_set_resizing(grabc->toplevel, false);
 	cursor_mode = CurNormal;
 	grabc = NULL;
+	if (!tileddrag)
+		return;
+	/* dropped on another tiled window: trade places; anywhere else: back to its tile */
+	tileddrag = 0;
+	if (!strcmp(settings.tiled_drag, "swap") && (t = tiledat(cursor->x, cursor->y, c)))
+		swaptiles(c, t);
+	arrange();
+}
+
+static Client *
+neighbor(Client *c, int dx, int dy)
+{
+	/* the nearest tiled window in that direction, favoring ones in line */
+	struct wlr_box a = clientbox(c), b;
+	double ax = a.x + a.width / 2.0, ay = a.y + a.height / 2.0, along, across, best = INFINITY;
+	Monitor *m = monof(c);
+	Client *t, *found = NULL;
+
+	wl_list_for_each(t, &tiles, tlink) {
+		if (t == c || !istiled(t) || monof(t) != m)
+			continue;
+		b = clientbox(t);
+		along = dx ? (b.x + b.width / 2.0 - ax) * (dx > 0 ? 1 : -1)
+			: (b.y + b.height / 2.0 - ay) * (dy > 0 ? 1 : -1);
+		across = dx ? fabs(b.y + b.height / 2.0 - ay) : fabs(b.x + b.width / 2.0 - ax);
+		if (along > 0 && along + 2 * across < best) {
+			best = along + 2 * across;
+			found = t;
+		}
+	}
+	return found;
 }
 
 void
@@ -572,6 +644,15 @@ moveresize(int dx, int dy, int dw, int dh)
 
 	if (!c || c->fullscreen)
 		return;
+	/* moving a tiled window by keys swaps it with its neighbor, once per press */
+	if (!dw && !dh && istiled(c) && strcmp(settings.tiled_drag, "float")) {
+		Client *t = repeating ? NULL : neighbor(c, dx, dy);
+		if (t) {
+			swaptiles(c, t);
+			arrange();
+		}
+		return;
+	}
 	if (c->maximized) {
 		c->maximized = 0;
 		wlr_xdg_toplevel_set_maximized(c->toplevel, false);
@@ -1602,6 +1683,8 @@ unmapnotify(struct wl_listener *listener, void *data)
 	/* an app that hides and shows its window starts over as a plain one */
 	c->maximized = c->fullscreen = c->minimized = c->tiled = c->smart = 0;
 	wl_list_remove(&c->tlink);
+	if (c == grabc)
+		tileddrag = 0; /* its tile is gone: nothing to swap or snap back to */
 	wlr_scene_node_reparent(&c->scene->node, layers[clientlayer(c)]);
 	wlr_scene_node_set_enabled(&c->scene->node, false);
 	if (c == grabc)
