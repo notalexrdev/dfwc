@@ -37,7 +37,8 @@ typedef struct {
 	size_t nautostart;
 	int style;   /* registry ref of the dfwc.style() function, or LUA_NOREF */
 	int layouts; /* registry ref of the table of dfwc.addlayout() functions */
-	Settings settings;
+	Settings settings; /* what dfwc runs with */
+	Settings own;      /* what the file itself set, before runtime changes were kept */
 } Config;
 
 enum { Str, Int, Num, Bool, Color, Mod, Sides, Wall };
@@ -716,8 +717,9 @@ loadconfig(const char *file)
 		freeconfig(&load);
 		return 0;
 	}
+	load.own = load.settings;
 	for (size_t i = 0; i < LENGTH(keep); i++)
-		if (!memcmp((char *)&load.settings + keep[i].off, (char *)&cur.settings + keep[i].off, keep[i].size))
+		if (!memcmp((char *)&load.own + keep[i].off, (char *)&cur.own + keep[i].off, keep[i].size))
 			memcpy((char *)&load.settings + keep[i].off, (char *)&settings + keep[i].off, keep[i].size);
 	freeconfig(&cur);
 	cur = load;

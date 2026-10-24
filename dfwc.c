@@ -813,10 +813,24 @@ moveresize(int dx, int dy, int dw, int dh)
 
 	if (!c || c->fullscreen)
 		return;
-	/* moving a tiled window by keys swaps it with its neighbor, once per press */
-	if (!dw && !dh && istiled(c) && strcmp(settings.tiled_drag, "float")) {
-		Client *t = repeating ? NULL : neighbor(c, dx, dy);
-		if (t) {
+	if (istiled(c) && strcmp(settings.tiled_drag, "float")) {
+		/* resizing a tiled window moves the master/stack split, so the window
+		 * grows whichever side it's on; moving swaps it with its neighbor */
+		Monitor *m = monof(c);
+		Client *t;
+		int n = 0, bstack = !strcmp(settings.layout, "bstack");
+		double d;
+
+		if ((dw || dh) && m) {
+			wl_list_for_each(t, &tiles, tlink) {
+				if (t == c)
+					break;
+				n += istiled(t) && monof(t) == m;
+			}
+			d = bstack ? (double)dh / m->usable.height : (double)dw / m->usable.width;
+			settings.mfact = MIN(MAX(settings.mfact + (n < settings.nmaster ? d : -d), 0.05), 0.95);
+			arrange();
+		} else if (!dw && !dh && (t = repeating ? NULL : neighbor(c, dx, dy))) {
 			swaptiles(c, t);
 			arrange();
 		}
