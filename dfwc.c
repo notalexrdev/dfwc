@@ -3266,11 +3266,15 @@ setup(void)
 static void
 run(const char *startup)
 {
-	const char *socket = wl_display_add_socket_auto(dpy);
+	const char *socket = wl_display_add_socket_auto(dpy), *dirs = getenv("XDG_CONFIG_DIRS");
+	char buf[4096];
 
 	if (!socket)
 		die("couldn't create socket");
 	setenv("WAYLAND_DISPLAY", socket, 1);
+	/* every foot started here finds the ink theme, unless the user has a foot.ini */
+	snprintf(buf, sizeof(buf), PREFIX "/share/dfwc/xdg:%s", dirs && *dirs ? dirs : "/etc/xdg");
+	setenv("XDG_CONFIG_DIRS", buf, 1);
 	config_init(wl_display_get_event_loop(dpy));
 	if (!wlr_backend_start(backend))
 		die("couldn't start backend");

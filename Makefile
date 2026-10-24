@@ -31,7 +31,9 @@ install: all
 		$(DESTDIR)$(SYSCONFDIR)/xdg/xdg-desktop-portal-wlr
 	cp -f dfwc dfwc-session $(DESTDIR)$(PREFIX)/bin
 	cp -f init.lua $(DESTDIR)$(PREFIX)/share/dfwc/init.lua
-	cp -f theme/foot.ini theme/mako $(DESTDIR)$(PREFIX)/share/dfwc
+	cp -f theme/mako $(DESTDIR)$(PREFIX)/share/dfwc
+	mkdir -p $(DESTDIR)$(PREFIX)/share/dfwc/xdg/foot
+	cp -f theme/foot.ini $(DESTDIR)$(PREFIX)/share/dfwc/xdg/foot/foot.ini
 	mkdir -p $(DESTDIR)$(PREFIX)/share/dfwc/wallpapers
 	cp -f wallpapers/*.png $(DESTDIR)$(PREFIX)/share/dfwc/wallpapers
 	cp -f dfwc-portals.conf $(DESTDIR)$(PREFIX)/share/xdg-desktop-portal
@@ -41,7 +43,7 @@ install: all
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/dfwc $(DESTDIR)$(PREFIX)/bin/dfwc-session \
 		$(DESTDIR)$(PREFIX)/share/dfwc/init.lua $(DESTDIR)$(PREFIX)/share/dfwc/wallpapers/*.png \
-		$(DESTDIR)$(PREFIX)/share/dfwc/foot.ini $(DESTDIR)$(PREFIX)/share/dfwc/mako \
+		$(DESTDIR)$(PREFIX)/share/dfwc/xdg/foot/foot.ini $(DESTDIR)$(PREFIX)/share/dfwc/mako \
 		$(DESTDIR)$(PREFIX)/share/xdg-desktop-portal/dfwc-portals.conf \
 		$(DESTDIR)$(SESSIONDIR)/dfwc.desktop \
 		$(DESTDIR)$(SYSCONFDIR)/xdg/xdg-desktop-portal-wlr/dfwc

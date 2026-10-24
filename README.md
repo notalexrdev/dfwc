@@ -39,7 +39,7 @@ window (mouse aiming), whether they run on Wayland or through XWayland.
 dfwc ships one theme, "ink": black, greys, and soft colors in the terminal. It covers
 dfwc itself, wmenu (launcher, restore list, screen-share picker), and foot and mako
 when you have no `~/.config/foot/foot.ini` or `~/.config/mako/config` of your own.
-To keep it in your own foot config, add `include=/usr/local/share/dfwc/foot.ini`.
+To keep it in your own foot config, add `include=/usr/local/share/dfwc/xdg/foot/foot.ini`.
 
 Try it in a window inside your current desktop first: `./dfwc -s foot`.
 Nested, the modifier is Alt instead of Super.
