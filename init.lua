@@ -20,4 +20,11 @@ dfwc.bind("Mod+Shift+c",      dfwc.close)
 dfwc.bind("Mod+Shift+q",      dfwc.quit)
 dfwc.bind("Mod+Control+r",    dfwc.reload)
 
+-- arrows move a window (hold two for diagonals), Shift+arrows resize it;
+-- tiled windows swap with their neighbour or move the split instead
+for key, d in pairs{ Left = { -20, 0 }, Right = { 20, 0 }, Up = { 0, -20 }, Down = { 0, 20 } } do
+	dfwc.bind("Mod+" .. key,       function() dfwc.move(d[1], d[2]) end,   { repeats = true })
+	dfwc.bind("Mod+Shift+" .. key, function() dfwc.resize(d[1], d[2]) end, { repeats = true })
+end
+
 -- More actions and settings: see README.md.
