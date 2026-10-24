@@ -35,7 +35,7 @@ typedef struct {
 /* what a dfwc.style() function sees and may change */
 typedef struct {
 	const char *app_id, *title;
-	bool focused, maximized, fullscreen;
+	bool focused, maximized, fullscreen, ontop;
 } WinInfo;
 
 typedef struct {

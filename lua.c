@@ -341,7 +341,7 @@ config_style(const WinInfo *w, Style *st)
 	if (!config_hasstyle())
 		return;
 	lua_rawgeti(L, LUA_REGISTRYINDEX, cur.style);
-	lua_createtable(L, 0, 5);
+	lua_createtable(L, 0, 6);
 	lua_pushstring(L, w->app_id ? w->app_id : "");
 	lua_setfield(L, -2, "app_id");
 	lua_pushstring(L, w->title ? w->title : "");
@@ -352,6 +352,8 @@ config_style(const WinInfo *w, Style *st)
 	lua_setfield(L, -2, "maximized");
 	lua_pushboolean(L, w->fullscreen);
 	lua_setfield(L, -2, "fullscreen");
+	lua_pushboolean(L, w->ontop);
+	lua_setfield(L, -2, "ontop");
 	if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
 		wlr_log(WLR_ERROR, "config: style: %s", lua_tostring(L, -1));
 		lua_pop(L, 1);

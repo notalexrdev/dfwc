@@ -102,7 +102,7 @@ the file, line and message until the config loads fine again.
         if not win.focused then return { border = "#444444" } end
     end)
 
-The function gets `app_id`, `title`, `focused`, `maximized` and `fullscreen`, and may
+The function gets `app_id`, `title`, `focused`, `maximized`, `fullscreen` and `ontop`, and may
 return `border`, `inner_border` and `opacity` to override the settings for that window.
 It runs only when one of those changes, never per frame. `dfwc.style(nil)` removes it.
 Fullscreen windows never get borders, rounding or transparency.

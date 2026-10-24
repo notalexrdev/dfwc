@@ -401,7 +401,8 @@ restyle(Client *c)
 	const Settings *s = &settings;
 	struct wlr_surface *f = seat->keyboard_state.focused_surface;
 	int focused = f == c->toplevel->base->surface;
-	WinInfo w = { c->toplevel->app_id, c->toplevel->title, focused, c->maximized, c->fullscreen };
+	WinInfo w = { c->toplevel->app_id, c->toplevel->title, focused, c->maximized, c->fullscreen,
+		c->ontop };
 
 	memcpy(c->style.border, focused ? s->border_focused : s->border_unfocused, sizeof(float[4]));
 	memcpy(c->style.inner_border, focused ? s->inner_border_focused : s->inner_border_unfocused,
@@ -593,6 +594,7 @@ toggleontop(void)
 		return;
 	c->ontop = !c->ontop;
 	wlr_scene_node_reparent(&c->scene->node, layers[clientlayer(c)]);
+	restyle(c);
 }
 
 void
