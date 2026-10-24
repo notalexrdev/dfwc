@@ -4,7 +4,10 @@
  * and keep the stacking order the user gives them; keybinds and settings come
  * from init.lua (see lua.c).
  */
+#include <drm_fourcc.h>
+#include <fcft/fcft.h>
 #include <getopt.h>
+#include <locale.h>
 #include <linux/input-event-codes.h>
 #include <signal.h>
 #include <stdio.h>
@@ -12,6 +15,7 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <uchar.h>
 #include <unistd.h>
 #include <scenefx/render/fx_renderer/fx_renderer.h>
 #include <libinput.h>
@@ -19,6 +23,7 @@
 #include <wlr/backend.h>
 #include <wlr/backend/libinput.h>
 #include <wlr/backend/session.h>
+#include <wlr/interfaces/wlr_buffer.h>
 #include <wlr/render/allocator.h>
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_cursor.h>
@@ -113,6 +118,11 @@ typedef struct {
 	struct wl_listener commit, destroy;
 } Popup;
 
+typedef struct {
+	struct wlr_buffer base;
+	pixman_image_t *img;
+} TextBuffer; /* CPU-drawn text the scene can show */
+
 uint32_t modkey;
 static int nested; /* running in a window inside another desktop */
 
@@ -127,6 +137,8 @@ static struct wlr_scene_rect *bg;
 static struct wlr_scene_rect *alarmrect; /* full-screen red blink on config errors */
 static struct wl_event_source *flashtimer;
 static int flashes; /* half-blinks left of the config error flash; odd = red */
+static struct wlr_scene_buffer *errbox; /* config error message at the top */
+static struct fcft_font *font;
 static struct wlr_output_layout *output_layout;
 static struct wlr_scene_output_layout *scene_layout;
 static struct wlr_xdg_shell *xdg_shell;
@@ -193,6 +205,7 @@ clientat(double x, double y, struct wlr_surface **surface, double *sx, double *s
 
 static Client *clientfrom(struct wlr_surface *surface);
 static void restyle(Client *c);
+static void placeerror(void);
 
 static Client *
 selclient(void)
@@ -972,6 +985,7 @@ updatemons(struct wl_listener *listener, void *data)
 		wlr_output_layout_get_box(output_layout, m->wlr, &m->area);
 		arrangelayers(m);
 	}
+	placeerror();
 }
 
 static void
@@ -1443,16 +1457,125 @@ flashstep(void *data)
 		flashes--;
 	wl_list_for_each(c, &clients, link)
 		updateborders(c);
-	wlr_scene_node_set_enabled(&alarmrect->node, settings.error_alarm && flashes % 2);
+	wlr_scene_node_set_enabled(&alarmrect->node, settings.error_alarm_fullscreen && flashes % 2);
 	if (flashes)
 		wl_event_source_timer_update(flashtimer, 150);
 	return 0;
 }
 
-void
-configerror(void)
+static void
+textbufdestroy(struct wlr_buffer *buffer)
 {
-	/* three red blinks of every border, plus the whole screen if error_alarm is set */
+	TextBuffer *t = wl_container_of(buffer, t, base);
+
+	pixman_image_unref(t->img);
+	free(t);
+}
+
+static bool
+textbufaccess(struct wlr_buffer *buffer, uint32_t flags, void **data, uint32_t *format, size_t *stride)
+{
+	TextBuffer *t = wl_container_of(buffer, t, base);
+
+	if (flags & WLR_BUFFER_DATA_PTR_ACCESS_WRITE)
+		return false;
+	*data = pixman_image_get_data(t->img);
+	*format = DRM_FORMAT_ARGB8888;
+	*stride = pixman_image_get_stride(t->img);
+	return true;
+}
+
+static void
+textbufend(struct wlr_buffer *buffer)
+{
+}
+
+static const struct wlr_buffer_impl textbufimpl = {
+	.destroy = textbufdestroy,
+	.begin_data_ptr_access = textbufaccess,
+	.end_data_ptr_access = textbufend,
+};
+
+static void
+placeerror(void)
+{
+	/* top center; again when screens appear, since startup errors come before them */
+	struct wlr_box area;
+
+	if (!errbox)
+		return;
+	outputbox(&area);
+	wlr_scene_node_set_position(&errbox->node,
+		area.x + MAX((area.width - errbox->buffer->width) / 2, 0), area.y + 8);
+}
+
+static void
+showerror(const char *msg)
+{
+	/* a black box at the top of the screen, until the config loads fine */
+	enum { Pad = 8 };
+	static pixman_color_t white = { 0xffff, 0xffff, 0xffff, 0xffff };
+	const struct fcft_glyph *glyphs[256];
+	pixman_image_t *fg;
+	TextBuffer *t;
+	struct wlr_box area;
+	mbstate_t ps = { 0 };
+	char32_t cp;
+	size_t n = 0, len;
+	int w = 2 * Pad, h, x;
+
+	if (errbox) {
+		wlr_scene_node_destroy(&errbox->node);
+		errbox = NULL;
+	}
+	/* shortcut: drawn at scale 1; pass the output's dpi to fcft for crisp HiDPI text */
+	if (!msg || (!font && !(font = fcft_from_name(1, (const char *[]){ "monospace:size=11" }, NULL))))
+		return;
+	outputbox(&area);
+	for (const char *p = msg; *p && n < LENGTH(glyphs); p += len) {
+		if ((len = mbrtoc32(&cp, p, strlen(p), &ps)) == 0 || len > 4) { /* invalid UTF-8 */
+			cp = '?';
+			len = 1;
+			ps = (mbstate_t){ 0 };
+		}
+		if (!(glyphs[n] = fcft_rasterize_char_utf32(font, cp, FCFT_SUBPIXEL_NONE)))
+			continue;
+		if (area.width && w + glyphs[n]->advance.x > area.width)
+			break;
+		w += glyphs[n++]->advance.x;
+	}
+	h = font->height + 2 * Pad;
+	if (!(t = calloc(1, sizeof(*t)))
+	|| !(t->img = pixman_image_create_bits_no_clear(PIXMAN_a8r8g8b8, w, h, NULL, 0))) {
+		free(t);
+		return;
+	}
+	pixman_image_fill_rectangles(PIXMAN_OP_SRC, t->img, &(pixman_color_t){ 0, 0, 0, 0xffff },
+		1, &(pixman_rectangle16_t){ 0, 0, w, h });
+	fg = pixman_image_create_solid_fill(&white);
+	x = Pad;
+	for (size_t i = 0; i < n; i++) {
+		/* color glyphs (emoji) are images; the rest are masks for the white fill */
+		pixman_image_composite32(PIXMAN_OP_OVER, glyphs[i]->is_color_glyph ? glyphs[i]->pix : fg,
+			glyphs[i]->is_color_glyph ? NULL : glyphs[i]->pix, t->img, 0, 0, 0, 0,
+			x + glyphs[i]->x, Pad + font->ascent - glyphs[i]->y, glyphs[i]->width, glyphs[i]->height);
+		x += glyphs[i]->advance.x;
+	}
+	pixman_image_unref(fg);
+	wlr_buffer_init(&t->base, &textbufimpl, w, h);
+	errbox = wlr_scene_buffer_create(layers[LyrOverlay], &t->base);
+	wlr_buffer_drop(&t->base); /* the scene buffer holds its own reference */
+	placeerror();
+}
+
+void
+configerror(const char *msg)
+{
+	/* NULL: the config loaded fine. Otherwise three red blinks of every
+	 * border (and the whole screen with error_alarm_fullscreen) */
+	showerror(msg);
+	if (!msg)
+		return;
 	flashes = 6;
 	flashstep(NULL);
 }
@@ -1489,6 +1612,8 @@ setup(void)
 {
 	struct wl_event_loop *loop;
 
+	setlocale(LC_CTYPE, ""); /* error messages are UTF-8 */
+	fcft_init(FCFT_LOG_COLORIZE_NEVER, false, FCFT_LOG_CLASS_ERROR);
 	dpy = wl_display_create();
 	loop = wl_display_get_event_loop(dpy);
 	sigsrc[0] = wl_event_loop_add_signal(loop, SIGINT, quitsignal, NULL);
@@ -1601,6 +1726,10 @@ cleanup(void)
 		wl_event_source_remove(sigsrc[i]);
 	wl_event_source_remove(rep.timer);
 	wl_event_source_remove(flashtimer);
+	if (errbox)
+		wlr_scene_node_destroy(&errbox->node);
+	fcft_destroy(font);
+	fcft_fini();
 	for (size_t i = 0; i < LENGTH(listeners); i++)
 		wl_list_remove(&listeners[i]->link);
 	wlr_scene_node_destroy(&scene->tree.node);

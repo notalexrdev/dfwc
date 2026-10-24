@@ -25,7 +25,7 @@ typedef struct {
 	int border_corners;  /* 0: full border, else length of corner-only brackets */
 	int corner_radius;
 	double opacity;
-	bool error_alarm;
+	bool error_alarm_fullscreen;
 } Settings;
 
 /* what a dfwc.style() function sees and may change */
@@ -44,7 +44,7 @@ enum { BindNone, BindDone, BindRepeat }; /* config_key() results */
 /* dfwc.c */
 extern uint32_t modkey;
 void applysettings(void);
-void configerror(void);
+void configerror(const char *msg);
 void focusstack(int dir);
 void killclient(void);
 void moveresize(int dx, int dy, int dw, int dh);

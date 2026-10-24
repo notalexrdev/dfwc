@@ -72,7 +72,7 @@ static const struct {
 	FIELD(border_corners, Int, 0, 1000),
 	FIELD(corner_radius, Int, 0, 1000),
 	FIELD(opacity, Num, 0.05, 1),
-	FIELD(error_alarm, Bool, 0, 0),
+	FIELD(error_alarm_fullscreen, Bool, 0, 0),
 };
 
 #define HEX(C) { ((C) >> 16 & 0xff) / 255.0f, ((C) >> 8 & 0xff) / 255.0f, ((C) & 0xff) / 255.0f, 1 }
@@ -494,14 +494,15 @@ loadconfig(const char *file)
 	          : luaL_loadbuffer(L, defconfig, sizeof(defconfig), "=default init.lua")) != LUA_OK
 	|| lua_pcall(L, 0, 0, 0) != LUA_OK) {
 		wlr_log(WLR_ERROR, "config: %s", lua_tostring(L, -1));
+		configerror(lua_tostring(L, -1));
 		freeconfig(&load);
-		configerror();
 		return 0;
 	}
 	freeconfig(&cur);
 	cur = load;
 	load = (Config){ .style = LUA_NOREF };
 	settings = cur.settings;
+	configerror(NULL);
 	applysettings();
 	for (size_t i = 0; i < cur.nautostart; i++)
 		autostart(cur.autostart[i]);

@@ -6,7 +6,7 @@ which reloads every time you save it.
 
 ## Build and install
 
-Needs `wlroots0.20 scenefx lua libinput wayland-protocols` and a C23 compiler (`#embed`).
+Needs `wlroots0.20 scenefx lua libinput fcft wayland-protocols` and a C23 compiler (`#embed`).
 
     make
     sudo make install
@@ -82,10 +82,11 @@ the bind while the key is held.
 | `border_corners` | 0: full border; N draws only N-pixel corner brackets |
 | `corner_radius` | 0: rounds windows and borders |
 | `opacity` | 1 (0.05 to 1) |
-| `error_alarm` | false: also blink the whole screen red on config errors |
+| `error_alarm_fullscreen` | false: also blink the whole screen red on config errors |
 
 Every setting applies immediately when the file is saved. When a saved config has an
-error, all borders blink red three times.
+error, all borders blink red three times and a black box at the top of the screen shows
+the file, line and message until the config loads fine again.
 
 ### Per-window looks
 
