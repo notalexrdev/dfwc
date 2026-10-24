@@ -15,6 +15,7 @@
 #include <math.h>
 #include <linux/input-event-codes.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -214,6 +215,18 @@ static Client *grabc;
 static struct wlr_box grabgeo; /* grabbed window geometry, layout coords, at grab start */
 static double grabx, graby;    /* cursor offset from the grabbed edges */
 static uint32_t grabedges;
+
+static void
+unlisten(struct wl_listener *l, ...)
+{
+	/* stop each listener; the list ends with NULL */
+	va_list ap;
+
+	va_start(ap, l);
+	for (; l; l = va_arg(ap, struct wl_listener *))
+		wl_list_remove(&l->link);
+	va_end(ap);
+}
 
 static void
 die(const char *msg)
@@ -1208,9 +1221,7 @@ destroykeyboard(struct wl_listener *listener, void *data)
 {
 	Keyboard *kb = wl_container_of(listener, kb, destroy);
 
-	wl_list_remove(&kb->modifiers.link);
-	wl_list_remove(&kb->key.link);
-	wl_list_remove(&kb->destroy.link);
+	unlisten(&kb->modifiers, &kb->key, &kb->destroy, NULL);
 	wl_list_remove(&kb->link);
 	free(kb);
 }
@@ -1523,9 +1534,7 @@ destroymon(struct wl_listener *listener, void *data)
 		wl_list_for_each_safe(l, tmp, &m->layers[i], link)
 			wlr_layer_surface_v1_destroy(l->wlr);
 	wl_list_remove(&m->link);
-	wl_list_remove(&m->frame.link);
-	wl_list_remove(&m->request_state.link);
-	wl_list_remove(&m->destroy.link);
+	unlisten(&m->frame, &m->request_state, &m->destroy, NULL);
 	free(m);
 }
 
@@ -1950,23 +1959,14 @@ destroynotify(struct wl_listener *listener, void *data)
 {
 	Client *c = wl_container_of(listener, c, destroy);
 
-	wl_list_remove(&c->map.link);
-	wl_list_remove(&c->unmap.link);
-	wl_list_remove(&c->commit.link);
-	wl_list_remove(&c->destroy.link);
-	wl_list_remove(&c->request_move.link);
-	wl_list_remove(&c->request_resize.link);
-	wl_list_remove(&c->request_maximize.link);
-	wl_list_remove(&c->request_fullscreen.link);
-	wl_list_remove(&c->set_title.link);
-	wl_list_remove(&c->set_app_id.link);
+	unlisten(&c->map, &c->unmap, &c->commit, &c->destroy, &c->request_move,
+		&c->request_resize, &c->request_maximize, &c->request_fullscreen, &c->set_title,
+		&c->set_app_id, NULL);
 	wlr_scene_node_destroy(&c->scene->node);
 	if (draw.claim == c)
 		draw.claim = NULL; /* closed before showing: the next window gets the box */
-	if (c->deco) { /* its destroy fires after ours, when c is gone */
-		wl_list_remove(&c->deco_mode.link);
-		wl_list_remove(&c->deco_destroy.link);
-	}
+	if (c->deco) /* its destroy fires after ours, when c is gone */
+		unlisten(&c->deco_mode, &c->deco_destroy, NULL);
 	free(c);
 }
 
@@ -2004,8 +2004,7 @@ destroydeco(struct wl_listener *listener, void *data)
 {
 	Client *c = wl_container_of(listener, c, deco_destroy);
 
-	wl_list_remove(&c->deco_mode.link);
-	wl_list_remove(&c->deco_destroy.link);
+	unlisten(&c->deco_mode, &c->deco_destroy, NULL);
 	c->deco = NULL;
 }
 
@@ -2032,6 +2031,20 @@ activate(struct wl_listener *listener, void *data)
 }
 
 static void
+clientscene(Client *c, int layer, int framed)
+{
+	/* the window's root tree, hidden until it maps, with its border rects
+	 * first so they sit below the surface added later */
+	c->scene = wlr_scene_tree_create(layers[layer]);
+	c->scene->node.data = c;
+	wlr_scene_node_set_enabled(&c->scene->node, false);
+	for (size_t i = 0; framed && i < LENGTH(c->ring); i++)
+		c->ring[i] = wlr_scene_rect_create(c->scene, 0, 0, (float[4]){ 0 });
+	for (size_t i = 0; framed && i < LENGTH(c->arm); i++)
+		c->arm[i] = wlr_scene_rect_create(c->scene, 0, 0, (float[4]){ 0 });
+}
+
+static void
 createnotify(struct wl_listener *listener, void *data)
 {
 	struct wlr_xdg_toplevel *toplevel = data;
@@ -2042,15 +2055,9 @@ createnotify(struct wl_listener *listener, void *data)
 		return;
 	}
 	c->toplevel = toplevel;
-	c->scene = wlr_scene_tree_create(layers[LyrClients]);
-	wlr_scene_node_set_enabled(&c->scene->node, false); /* until mapped */
-	/* created first, so they sit below the surface */
-	for (size_t i = 0; i < LENGTH(c->ring); i++)
-		c->ring[i] = wlr_scene_rect_create(c->scene, 0, 0, (float[4]){ 0 });
-	for (size_t i = 0; i < LENGTH(c->arm); i++)
-		c->arm[i] = wlr_scene_rect_create(c->scene, 0, 0, (float[4]){ 0 });
+	clientscene(c, LyrClients, 1);
 	c->surf = wlr_scene_xdg_surface_create(c->scene, toplevel->base);
-	c->scene->node.data = c->surf->node.data = c;
+	c->surf->node.data = c;
 	toplevel->base->data = c->surf;
 
 	LISTEN(&toplevel->base->surface->events.map, &c->map, mapnotify);
@@ -2090,8 +2097,7 @@ destroypopup(struct wl_listener *listener, void *data)
 {
 	Popup *p = wl_container_of(listener, p, destroy);
 
-	wl_list_remove(&p->commit.link);
-	wl_list_remove(&p->destroy.link);
+	unlisten(&p->commit, &p->destroy, NULL);
 	free(p);
 }
 
@@ -2223,9 +2229,7 @@ xdissociate(struct wl_listener *listener, void *data)
 	Client *c = wl_container_of(listener, c, dissociate);
 
 	c->associated = 0;
-	wl_list_remove(&c->map.link);
-	wl_list_remove(&c->unmap.link);
-	wl_list_remove(&c->commit.link);
+	unlisten(&c->map, &c->unmap, &c->commit, NULL);
 }
 
 static void
@@ -2235,18 +2239,9 @@ destroyx11(struct wl_listener *listener, void *data)
 
 	if (c->associated)
 		xdissociate(&c->dissociate, NULL);
-	wl_list_remove(&c->associate.link);
-	wl_list_remove(&c->dissociate.link);
-	wl_list_remove(&c->destroy.link);
-	wl_list_remove(&c->configure.link);
-	wl_list_remove(&c->request_activate.link);
-	wl_list_remove(&c->request_move.link);
-	wl_list_remove(&c->request_resize.link);
-	wl_list_remove(&c->request_maximize.link);
-	wl_list_remove(&c->request_fullscreen.link);
-	wl_list_remove(&c->set_title.link);
-	wl_list_remove(&c->set_app_id.link);
-	wl_list_remove(&c->set_geometry.link);
+	unlisten(&c->associate, &c->dissociate, &c->destroy, &c->configure, &c->request_activate,
+		&c->request_move, &c->request_resize, &c->request_maximize, &c->request_fullscreen,
+		&c->set_title, &c->set_app_id, &c->set_geometry, NULL);
 	wlr_scene_node_destroy(&c->scene->node);
 	if (draw.claim == c)
 		draw.claim = NULL;
@@ -2267,15 +2262,7 @@ createx11(struct wl_listener *listener, void *data)
 	c->xs = xs;
 	xs->data = c;
 	c->unmanaged = xs->override_redirect;
-	c->scene = wlr_scene_tree_create(layers[c->unmanaged ? LyrX11Menus : LyrClients]);
-	wlr_scene_node_set_enabled(&c->scene->node, false); /* until mapped */
-	if (!c->unmanaged) {
-		for (size_t i = 0; i < LENGTH(c->ring); i++)
-			c->ring[i] = wlr_scene_rect_create(c->scene, 0, 0, (float[4]){ 0 });
-		for (size_t i = 0; i < LENGTH(c->arm); i++)
-			c->arm[i] = wlr_scene_rect_create(c->scene, 0, 0, (float[4]){ 0 });
-	}
-	c->scene->node.data = c;
+	clientscene(c, c->unmanaged ? LyrX11Menus : LyrClients, !c->unmanaged);
 
 	LISTEN(&xs->events.associate, &c->associate, xassociate);
 	LISTEN(&xs->events.dissociate, &c->dissociate, xdissociate);
@@ -2370,10 +2357,7 @@ destroylayer(struct wl_listener *listener, void *data)
 	LayerSurface *l = wl_container_of(listener, l, destroy);
 
 	wl_list_remove(&l->link);
-	wl_list_remove(&l->map.link);
-	wl_list_remove(&l->unmap.link);
-	wl_list_remove(&l->commit.link);
-	wl_list_remove(&l->destroy.link);
+	unlisten(&l->map, &l->unmap, &l->commit, &l->destroy, NULL);
 	free(l);
 }
 
@@ -2513,6 +2497,40 @@ static const struct wlr_buffer_impl textbufimpl = {
 	.end_data_ptr_access = textbufend,
 };
 
+static int
+drawtext(pixman_image_t *dst, struct fcft_font *f, const char *str, int x, int y,
+	pixman_color_t *color, int maxw)
+{
+	/* UTF-8 text with its top-left at x, y, stopping before maxw (0: no limit);
+	 * dst NULL only measures. Returns the width it covers */
+	pixman_image_t *fg = dst ? pixman_image_create_solid_fill(color) : NULL;
+	const struct fcft_glyph *g;
+	mbstate_t ps = { 0 };
+	char32_t cp;
+	size_t len;
+	int w = 0;
+
+	for (const char *p = str; *p; p += len) {
+		if ((len = mbrtoc32(&cp, p, strlen(p), &ps)) == 0 || len > 4) { /* invalid UTF-8 */
+			cp = '?';
+			len = 1;
+			ps = (mbstate_t){ 0 };
+		}
+		if (!(g = fcft_rasterize_char_utf32(f, cp, FCFT_SUBPIXEL_NONE)))
+			continue;
+		if (maxw && w + g->advance.x > maxw)
+			break;
+		if (fg) /* color glyphs (emoji) are images; the rest are masks for the color */
+			pixman_image_composite32(PIXMAN_OP_OVER, g->is_color_glyph ? g->pix : fg,
+				g->is_color_glyph ? NULL : g->pix, dst, 0, 0, 0, 0,
+				x + w + g->x, y + f->ascent - g->y, g->width, g->height);
+		w += g->advance.x;
+	}
+	if (fg)
+		pixman_image_unref(fg);
+	return w;
+}
+
 static pixman_color_t
 pixcolor(const float c[4], float alpha)
 {
@@ -2571,17 +2589,15 @@ drawwallpaper(Monitor *m)
 	/* a PNG scaled to cover the screen, or "glow": a soft glow of the focus
 	 * color with a faint mark; drawn once per screen size, swaybg draws over it */
 	const Settings *s = &settings;
-	int w = m->wlr->width, h = m->wlr->height, x;
+	int w = m->wlr->width, h = m->wlr->height;
 	pixman_image_t *src;
 	pixman_transform_t tr;
 	double sc;
 	float tint[4];
 	pixman_gradient_stop_t stops[2];
-	static const char mark[] = "dfwc";
 	pixman_point_fixed_t center;
 	pixman_color_t markcolor;
-	pixman_image_t *glow, *fg;
-	const struct fcft_glyph *g;
+	pixman_image_t *glow;
 	char name[64];
 	TextBuffer *t;
 
@@ -2623,20 +2639,10 @@ drawwallpaper(Monitor *m)
 	if (!bigfont || bigfont->height < h / 9 || bigfont->height > h / 5)
 		bigfont = (fcft_destroy(bigfont), fcft_from_name(1, (const char *[]){ name }, NULL));
 	markcolor = pixcolor(s->border_focused, 0.07f); /* a watermark, not a label */
-	if (bigfont && (fg = pixman_image_create_solid_fill(&markcolor))) {
-		x = w - bigfont->height / 2;
-		for (const char *p = mark; *p; p++) /* right-aligned to the margin */
-			if ((g = fcft_rasterize_char_utf32(bigfont, *p, FCFT_SUBPIXEL_NONE)))
-				x -= g->advance.x;
-		for (const char *p = mark; *p; p++) {
-			if (!(g = fcft_rasterize_char_utf32(bigfont, *p, FCFT_SUBPIXEL_NONE)))
-				continue;
-			pixman_image_composite32(PIXMAN_OP_OVER, fg, g->pix, t->img, 0, 0, 0, 0,
-				x + g->x, h - bigfont->height * 5 / 4 + bigfont->ascent - g->y, g->width, g->height);
-			x += g->advance.x;
-		}
-		pixman_image_unref(fg);
-	}
+	if (bigfont) /* right-aligned to the margin */
+		drawtext(t->img, bigfont, "dfwc",
+			w - bigfont->height / 2 - drawtext(NULL, bigfont, "dfwc", 0, 0, NULL, 0),
+			h - bigfont->height * 5 / 4, &markcolor, 0);
 done:
 	wlr_buffer_init(&t->base, &textbufimpl, w, h);
 	if ((m->wall = wlr_scene_buffer_create(walltree, &t->base))) {
@@ -2665,14 +2671,9 @@ showerror(const char *msg)
 	/* a black box at the top of the screen, until the config loads fine */
 	enum { Pad = 8 };
 	static pixman_color_t white = { 0xffff, 0xffff, 0xffff, 0xffff };
-	const struct fcft_glyph *glyphs[256];
-	pixman_image_t *fg;
 	TextBuffer *t;
 	struct wlr_box area;
-	mbstate_t ps = { 0 };
-	char32_t cp;
-	size_t n = 0, len;
-	int w = 2 * Pad, h, x;
+	int w, h, maxw;
 
 	if (errbox) {
 		wlr_scene_node_destroy(&errbox->node);
@@ -2682,18 +2683,8 @@ showerror(const char *msg)
 	if (!msg || (!font && !(font = fcft_from_name(1, (const char *[]){ "monospace:size=11" }, NULL))))
 		return;
 	outputbox(&area);
-	for (const char *p = msg; *p && n < LENGTH(glyphs); p += len) {
-		if ((len = mbrtoc32(&cp, p, strlen(p), &ps)) == 0 || len > 4) { /* invalid UTF-8 */
-			cp = '?';
-			len = 1;
-			ps = (mbstate_t){ 0 };
-		}
-		if (!(glyphs[n] = fcft_rasterize_char_utf32(font, cp, FCFT_SUBPIXEL_NONE)))
-			continue;
-		if (area.width && w + glyphs[n]->advance.x > area.width)
-			break;
-		w += glyphs[n++]->advance.x;
-	}
+	maxw = area.width ? area.width - 2 * Pad : 0;
+	w = drawtext(NULL, font, msg, 0, 0, NULL, maxw) + 2 * Pad;
 	h = font->height + 2 * Pad;
 	if (!(t = calloc(1, sizeof(*t)))
 	|| !(t->img = pixman_image_create_bits_no_clear(PIXMAN_a8r8g8b8, w, h, NULL, 0))) {
@@ -2703,16 +2694,7 @@ showerror(const char *msg)
 	/* black at 85%, so the windows behind still show a little */
 	pixman_image_fill_rectangles(PIXMAN_OP_SRC, t->img, &(pixman_color_t){ 0, 0, 0, 0xd999 },
 		1, &(pixman_rectangle16_t){ 0, 0, w, h });
-	fg = pixman_image_create_solid_fill(&white);
-	x = Pad;
-	for (size_t i = 0; i < n; i++) {
-		/* color glyphs (emoji) are images; the rest are masks for the white fill */
-		pixman_image_composite32(PIXMAN_OP_OVER, glyphs[i]->is_color_glyph ? glyphs[i]->pix : fg,
-			glyphs[i]->is_color_glyph ? NULL : glyphs[i]->pix, t->img, 0, 0, 0, 0,
-			x + glyphs[i]->x, Pad + font->ascent - glyphs[i]->y, glyphs[i]->width, glyphs[i]->height);
-		x += glyphs[i]->advance.x;
-	}
-	pixman_image_unref(fg);
+	drawtext(t->img, font, msg, Pad, Pad, &white, maxw);
 	wlr_buffer_init(&t->base, &textbufimpl, w, h);
 	errbox = wlr_scene_buffer_create(layers[LyrOverlay], &t->base);
 	wlr_buffer_drop(&t->base); /* the scene buffer holds its own reference */

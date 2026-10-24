@@ -458,20 +458,6 @@ l_nmaster(lua_State *L)
 	return 0;
 }
 
-static int
-l_float(lua_State *L)
-{
-	togglefloat();
-	return 0;
-}
-
-static int
-l_zoom(lua_State *L)
-{
-	zoom();
-	return 0;
-}
-
 bool
 config_haslayout(const char *name)
 {
@@ -636,74 +622,25 @@ l_resize(lua_State *L)
 }
 
 static int
-l_maximize(lua_State *L)
-{
-	togglemaximize();
-	return 0;
-}
-
-static int
-l_fullscreen(lua_State *L)
-{
-	togglefullscreen();
-	return 0;
-}
-
-static int
-l_ontop(lua_State *L)
-{
-	toggleontop();
-	return 0;
-}
-
-static int
-l_minimize(lua_State *L)
-{
-	minimize();
-	return 0;
-}
-
-static int
-l_restore(lua_State *L)
-{
-	restoremenu();
-	return 0;
-}
-
-static int
-l_launch(lua_State *L)
-{
-	spawn(settings.launcher);
-	return 0;
-}
-
-static int
 l_spawn(lua_State *L)
 {
 	spawn(luaL_checkstring(L, 1));
 	return 0;
 }
 
-static int
-l_close(lua_State *L)
-{
-	killclient();
-	return 0;
-}
-
-static int
-l_quit(lua_State *L)
-{
-	quit();
-	return 0;
-}
-
-static int
-l_reload(lua_State *L)
-{
-	config_reload();
-	return 0;
-}
+/* actions that take no arguments */
+#define ACTION(N, CALL) static int l_##N(lua_State *L) { CALL; return 0; }
+ACTION(close, killclient())
+ACTION(float, togglefloat())
+ACTION(fullscreen, togglefullscreen())
+ACTION(launch, spawn(settings.launcher))
+ACTION(maximize, togglemaximize())
+ACTION(minimize, minimize())
+ACTION(ontop, toggleontop())
+ACTION(quit, quit())
+ACTION(reload, config_reload())
+ACTION(restore, restoremenu())
+ACTION(zoom, zoom())
 
 static const luaL_Reg api[] = {
 	{ "addlayout", l_addlayout },
