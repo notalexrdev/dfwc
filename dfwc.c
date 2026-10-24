@@ -2501,10 +2501,10 @@ commitpopup(struct wl_listener *listener, void *data)
 	Popup *p = wl_container_of(listener, p, commit);
 	struct wlr_scene_tree *tree = p->wlr->base->data;
 	Client *c;
-	struct wlr_box box;
-
-	struct wlr_box g = p->wlr->base->geometry;
+	struct wlr_box box, g = p->wlr->base->geometry;
 	int sh = settings.shadow_size, *o = settings.shadow_offset;
+	pixman_box32_t *e = pixman_region32_extents(&p->wlr->base->surface->opaque_region);
+	struct wlr_box b = { e->x1 - g.x, e->y1 - g.y, e->x2 - e->x1, e->y2 - e->y1 };
 	float color[4];
 
 	if (p->wlr->base->initial_commit) {
@@ -2517,18 +2517,19 @@ commitpopup(struct wl_listener *listener, void *data)
 		}
 		wlr_xdg_surface_schedule_configure(p->wlr->base);
 	}
-	/* the window shadow, cut out under the menu; skipped when the app leaves
-	 * a margin around it for a shadow of its own */
-	wlr_scene_node_set_enabled(&p->shadow->node, sh && !g.x && !g.y && g.width > 0);
+	/* the window shadow under the menu's solid part (Firefox draws tooltips
+	 * inside a see-through margin), cut out under it; skipped when the app
+	 * leaves a margin for a shadow of its own, or says nothing is solid */
+	wlr_scene_node_set_enabled(&p->shadow->node, sh && !g.x && !g.y && b.width > 0 && b.height > 0);
 	if (!p->shadow->node.enabled)
 		return;
 	premul(settings.shadow_color, color);
-	wlr_scene_node_set_position(&p->shadow->node, o[0] - sh, o[1] - sh);
-	wlr_scene_shadow_set_size(p->shadow, g.width + 2 * sh, g.height + 2 * sh);
+	wlr_scene_node_set_position(&p->shadow->node, b.x + o[0] - sh, b.y + o[1] - sh);
+	wlr_scene_shadow_set_size(p->shadow, b.width + 2 * sh, b.height + 2 * sh);
 	wlr_scene_shadow_set_blur_sigma(p->shadow, sh / 2.0f);
 	wlr_scene_shadow_set_color(p->shadow, color);
 	wlr_scene_shadow_set_clipped_region(p->shadow, (struct clipped_region){
-		{ sh - o[0], sh - o[1], g.width, g.height }, corner_radii_all(0) });
+		{ sh - o[0], sh - o[1], b.width, b.height }, corner_radii_all(0) });
 }
 
 static void
