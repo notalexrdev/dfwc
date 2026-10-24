@@ -188,6 +188,19 @@ return `border`, `inner_border` and `opacity` to override the settings for that 
 It runs only when one of those changes, never per frame. `dfwc.style(nil)` removes it.
 Fullscreen windows never get borders, rounding or transparency.
 
+### Window rules
+
+    dfwc.rule(function(win)
+        if win.app_id == "pavucontrol" then return { float = true, size = { 600, 400 } } end
+        if win.app_id == "mpv" then return { ontop = true } end
+    end)
+
+Runs once when a window opens, with `app_id` and `title`. It may return `float` (stays
+floating while tiling), `size = { width, height }`, `pos = { x, y }` (from the top left of
+the screen, kept on it), `ontop`, `maximized` and `fullscreen`. Rules add up: call
+`dfwc.rule` as often as you like, later ones win. A window opened into a drawn box keeps
+the box's size and place.
+
 ## Mouse
 
 Focus follows the mouse; clicking raises a window.

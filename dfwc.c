@@ -116,6 +116,7 @@ typedef struct {
 	uint32_t anchor;     /* edges a mouse resize grows, so the opposite ones stay put */
 	int ax, ay;          /* right and bottom edges to keep while anchored */
 	unsigned int id;     /* names the window in the restore menu */
+	Rule rule;           /* what dfwc.rule() said when it opened */
 	struct wl_listener map, unmap, commit, destroy, set_title, set_app_id;
 	struct wl_listener request_move, request_resize, request_maximize, request_fullscreen;
 	struct wl_listener deco_mode, deco_destroy;
@@ -2209,13 +2210,15 @@ mapnotify(struct wl_listener *listener, void *data)
 		c->surf->node.data = c;
 		if (draw.pending && !draw.claim && !cparent(c))
 			draw.claim = c; /* sized for the drawn box below, when it's placed */
+		c->rule = (Rule){ 0 }; /* Wayland windows got theirs at the first commit */
+		config_rule(&(WinInfo){ .app_id = cappid(c), .title = ctitle(c) }, &c->rule);
 	}
 	g = cgeom(c);
 	c->id = ++ids;
 	wl_list_insert(&clients, &c->link);
 	wl_list_insert(&tiles, &c->tlink);
-	/* dialogs, fixed-size windows and drawn boxes float even while tiling */
-	c->floating = cfloats(c) || (draw.claim == c && settings.tiling);
+	/* dialogs, fixed-size windows, drawn boxes and rules float even while tiling */
+	c->floating = cfloats(c) || (draw.claim == c && settings.tiling) || c->rule.floating;
 	wlr_scene_node_set_enabled(&c->scene->node, true);
 	outputbox(&area);
 	area = inset(c, area);
@@ -2228,17 +2231,24 @@ mapnotify(struct wl_listener *listener, void *data)
 		cmove(c, tinybox() ? draw.box.x : box.x, tinybox() ? draw.box.y : box.y);
 		endbox();
 	} else if (!wlr_box_empty(&area)) {
-		/* center on the screen, dialogs on their parent; shrink to fit */
+		/* where the rule says, else centered on the screen, dialogs on their
+		 * parent; shrink to fit */
 		around = area;
 		if ((p = cparent(c)))
 			around = clientbox(p);
-		w = MIN(geo->width, area.width);
-		h = MIN(geo->height, area.height);
-		box.x = MIN(MAX(around.x + (around.width - w) / 2, area.x), area.x + area.width - w);
-		box.y = MIN(MAX(around.y + (around.height - h) / 2, area.y), area.y + area.height - h);
+		w = MIN(c->rule.width ? c->rule.width : geo->width, area.width);
+		h = MIN(c->rule.height ? c->rule.height : geo->height, area.height);
+		box.x = c->rule.pos ? area.x + c->rule.x : around.x + (around.width - w) / 2;
+		box.y = c->rule.pos ? area.y + c->rule.y : around.y + (around.height - h) / 2;
+		box.x = MIN(MAX(box.x, area.x), area.x + area.width - w);
+		box.y = MIN(MAX(box.y, area.y), area.y + area.height - h);
 		if (w != geo->width || h != geo->height)
 			cconfigure(c, box.x, box.y, w, h);
 		cmove(c, box.x, box.y);
+	}
+	if (c->rule.ontop) {
+		c->ontop = 1;
+		wlr_scene_node_reparent(&c->scene->node, layers[clientlayer(c)]);
 	}
 	c->fade = settings.anim_open ? 0 : 1;
 	if (settings.anim_open)
@@ -2250,10 +2260,10 @@ mapnotify(struct wl_listener *listener, void *data)
 		showmorph(0);
 	}
 	focusclient(c, 1);
-	if (c->xs ? c->xs->fullscreen : c->toplevel->requested.fullscreen)
+	if (c->rule.fullscreen || (c->xs ? c->xs->fullscreen : c->toplevel->requested.fullscreen))
 		setfullscreen(c, 1);
-	else if (!claimed /* a drawn box beats the app's saved "maximized" */
-	&& (c->xs ? c->xs->maximized_vert && c->xs->maximized_horz : c->toplevel->requested.maximized))
+	else if (c->rule.maximized || (!claimed /* a drawn box beats the app's saved "maximized" */
+	&& (c->xs ? c->xs->maximized_vert && c->xs->maximized_horz : c->toplevel->requested.maximized)))
 		setmaximized(c, 1);
 	arrange();
 }
@@ -2310,6 +2320,8 @@ commitnotify(struct wl_listener *listener, void *data)
 	}
 	if (c->xs || !c->toplevel->base->initial_commit)
 		return;
+	c->rule = (Rule){ 0 };
+	config_rule(&(WinInfo){ .app_id = cappid(c), .title = ctitle(c) }, &c->rule);
 	if (draw.pending && !draw.claim && !c->toplevel->parent) {
 		/* sized for the drawn box before it ever shows, so it doesn't jump */
 		draw.claim = c;
@@ -2317,8 +2329,8 @@ commitnotify(struct wl_listener *listener, void *data)
 		wlr_xdg_toplevel_set_size(c->toplevel, tinybox() ? 0 : MAX(box.width, 1),
 			tinybox() ? 0 : MAX(box.height, 1));
 	} else {
-		/* 0x0 lets the client pick its own size */
-		wlr_xdg_toplevel_set_size(c->toplevel, 0, 0);
+		/* the rule's size, or 0x0: the client picks its own */
+		wlr_xdg_toplevel_set_size(c->toplevel, c->rule.width, c->rule.height);
 	}
 	/* "tiled" on every edge: GTK apps like Firefox drop their rounded corners
 	 * and shadow margin, and take the size they're given over their saved one */

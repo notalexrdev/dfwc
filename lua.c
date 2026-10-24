@@ -37,6 +37,7 @@ typedef struct {
 	size_t nautostart;
 	int style;   /* registry ref of the dfwc.style() function, or LUA_NOREF */
 	int layouts; /* registry ref of the table of dfwc.addlayout() functions */
+	int rules;   /* registry ref of the list of dfwc.rule() functions */
 	Settings settings; /* what dfwc runs with */
 	Settings own;      /* what the file itself set, before runtime changes were kept */
 } Config;
@@ -584,6 +585,24 @@ l_style(lua_State *L)
 	return 0;
 }
 
+static void
+pushwin(lua_State *L, const WinInfo *w)
+{
+	lua_createtable(L, 0, 6);
+	lua_pushstring(L, w->app_id ? w->app_id : "");
+	lua_setfield(L, -2, "app_id");
+	lua_pushstring(L, w->title ? w->title : "");
+	lua_setfield(L, -2, "title");
+	lua_pushboolean(L, w->focused);
+	lua_setfield(L, -2, "focused");
+	lua_pushboolean(L, w->maximized);
+	lua_setfield(L, -2, "maximized");
+	lua_pushboolean(L, w->fullscreen);
+	lua_setfield(L, -2, "fullscreen");
+	lua_pushboolean(L, w->ontop);
+	lua_setfield(L, -2, "ontop");
+}
+
 bool
 config_hasstyle(void)
 {
@@ -602,19 +621,7 @@ config_style(const WinInfo *w, Style *st)
 	if (!config_hasstyle())
 		return;
 	lua_rawgeti(L, LUA_REGISTRYINDEX, cur.style);
-	lua_createtable(L, 0, 6);
-	lua_pushstring(L, w->app_id ? w->app_id : "");
-	lua_setfield(L, -2, "app_id");
-	lua_pushstring(L, w->title ? w->title : "");
-	lua_setfield(L, -2, "title");
-	lua_pushboolean(L, w->focused);
-	lua_setfield(L, -2, "focused");
-	lua_pushboolean(L, w->maximized);
-	lua_setfield(L, -2, "maximized");
-	lua_pushboolean(L, w->fullscreen);
-	lua_setfield(L, -2, "fullscreen");
-	lua_pushboolean(L, w->ontop);
-	lua_setfield(L, -2, "ontop");
+	pushwin(L, w);
 	if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
 		wlr_log(WLR_ERROR, "config: style: %s", lua_tostring(L, -1));
 		lua_pop(L, 1);
@@ -643,6 +650,86 @@ config_style(const WinInfo *w, Style *st)
 	lua_pop(L, 1);
 	if (err)
 		wlr_log(WLR_ERROR, "config: style: bad %s", err);
+}
+
+static int
+l_rule(lua_State *L)
+{
+	/* rules add up: each runs when a window opens, later ones win */
+	Config *c = L == load.L ? &load : &cur;
+
+	luaL_checktype(L, 1, LUA_TFUNCTION);
+	lua_rawgeti(L, LUA_REGISTRYINDEX, c->rules);
+	lua_pushvalue(L, 1);
+	lua_rawseti(L, -2, lua_rawlen(L, -2) + 1);
+	lua_pop(L, 1);
+	return 0;
+}
+
+static int
+rulepair(lua_State *L, const char *k, int *a, int *b, int min)
+{
+	/* { a, b }: 1 set, 0 absent, -1 bad */
+	int ok = 1, *v[] = { a, b };
+
+	if (lua_getfield(L, -1, k) == LUA_TNIL) {
+		lua_pop(L, 1);
+		return 0;
+	}
+	for (int j = 0; (ok = lua_istable(L, -1)) && j < 2; j++) {
+		lua_rawgeti(L, -1, j + 1);
+		*v[j] = lua_tointegerx(L, -1, &ok);
+		ok = ok && *v[j] >= min;
+		lua_pop(L, 1);
+		if (!ok)
+			break;
+	}
+	lua_pop(L, 1);
+	return ok ? 1 : -1;
+}
+
+void
+config_rule(const WinInfo *w, Rule *r)
+{
+	static const char *const flags[] = { "float", "ontop", "maximized", "fullscreen" };
+	bool *set[] = { &r->floating, &r->ontop, &r->maximized, &r->fullscreen };
+	lua_State *L = cur.L;
+	const char *err;
+	lua_Integer n;
+
+	if (!L)
+		return;
+	lua_rawgeti(L, LUA_REGISTRYINDEX, cur.rules);
+	n = lua_rawlen(L, -1);
+	for (lua_Integer i = 1; i <= n; i++) {
+		err = NULL;
+		lua_rawgeti(L, -1, i);
+		pushwin(L, w);
+		if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+			wlr_log(WLR_ERROR, "config: rule: %s", lua_tostring(L, -1));
+			lua_pop(L, 1);
+			continue;
+		}
+		if (lua_istable(L, -1)) {
+			for (size_t j = 0; j < LENGTH(flags); j++) {
+				if (lua_getfield(L, -1, flags[j]) != LUA_TNIL)
+					*set[j] = lua_toboolean(L, -1);
+				lua_pop(L, 1);
+			}
+			if (rulepair(L, "size", &r->width, &r->height, 1) < 0)
+				err = "size (should be { width, height })";
+			switch (rulepair(L, "pos", &r->x, &r->y, INT_MIN)) {
+			case 1: r->pos = true; break;
+			case -1: err = "pos (should be { x, y })"; break;
+			}
+		} else if (!lua_isnil(L, -1)) {
+			err = "the result (should be a table)";
+		}
+		lua_pop(L, 1);
+		if (err)
+			wlr_log(WLR_ERROR, "config: rule: bad %s", err);
+	}
+	lua_pop(L, 1);
 }
 
 static int
@@ -709,6 +796,7 @@ static const luaL_Reg api[] = {
 	{ "reload", l_reload },
 	{ "resize", l_resize },
 	{ "restore", l_restore },
+	{ "rule", l_rule },
 	{ "set", l_set },
 	{ "spawn", l_spawn },
 	{ "style", l_style },
@@ -742,6 +830,8 @@ loadconfig(const char *file)
 	load = (Config){ .L = L, .style = LUA_NOREF, .settings = defaults };
 	lua_newtable(L);
 	load.layouts = luaL_ref(L, LUA_REGISTRYINDEX);
+	lua_newtable(L);
+	load.rules = luaL_ref(L, LUA_REGISTRYINDEX);
 	luaL_openlibs(L);
 	luaL_newlib(L, api);
 	lua_pushstring(L, PREFIX "/share/dfwc");

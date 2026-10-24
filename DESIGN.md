@@ -144,5 +144,5 @@ Successor to dfwm (X11 dwm fork in `~/Projekte/dfwm-ste/dwm`). Planning confirme
    - XWayland ("from the start", but not in milestone 1, so right after it).
    - Gaming: pointer lock, relative pointer, opt-in tearing.
    - Effects: shadows, blur, gradients (scenefx patch if needed), animations. The default rice arrives here.
-   - Window rules.
+   - Window rules: done 2026-10-24 (`dfwc.rule`).
 3. **Later, maybe:** workspaces, external monitors with per-monitor scale, media keys, lock screen, idle handling, IPC/dfwcctl, notifications.

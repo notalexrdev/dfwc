@@ -51,7 +51,7 @@ typedef struct {
 	float anim_curve[4];    /* cubic-bezier x1 y1 x2 y2, like CSS */
 } Settings;
 
-/* what a dfwc.style() function sees and may change */
+/* what a dfwc.style() or dfwc.rule() function sees */
 typedef struct {
 	const char *app_id, *title;
 	bool focused, maximized, fullscreen, ontop;
@@ -61,6 +61,13 @@ typedef struct {
 	float border[4], inner_border[4];
 	double opacity;
 } Style;
+
+typedef struct {
+	bool floating, ontop, maximized, fullscreen;
+	int width, height; /* 0: the app's own size */
+	bool pos;          /* x, y of the usable area instead of centering */
+	int x, y;
+} Rule; /* how a window starts, from dfwc.rule() */
 
 enum { BindNone, BindDone, BindRepeat }; /* config_key() results */
 
@@ -92,3 +99,4 @@ bool config_hasstyle(void);
 bool config_haslayout(const char *name);
 bool config_layout(const char *name, struct wlr_box area, int n, struct wlr_box *out);
 void config_style(const WinInfo *w, Style *st);
+void config_rule(const WinInfo *w, Rule *r);
