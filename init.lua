@@ -20,6 +20,17 @@ dfwc.bind("Mod+Shift+c",      dfwc.close)
 dfwc.bind("Mod+Shift+q",      dfwc.quit)
 dfwc.bind("Mod+Control+r",    dfwc.reload)
 
+-- laptop keys (F1/F2 etc. on most laptops): brightnessctl and PipeWire's wpctl
+local function key(k, cmd, repeats)
+	dfwc.bind(k, function() dfwc.spawn(cmd) end, { repeats = repeats })
+end
+key("XF86MonBrightnessUp",   "brightnessctl -q set 5%+", true)
+key("XF86MonBrightnessDown", "brightnessctl -q -n1 set 5%-", true)
+key("XF86AudioRaiseVolume",  "wpctl set-volume -l 1 @DEFAULT_AUDIO_SINK@ 5%+", true)
+key("XF86AudioLowerVolume",  "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-", true)
+key("XF86AudioMute",         "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle")
+key("XF86AudioMicMute",      "wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle")
+
 -- arrows move a window (hold two for diagonals), Shift+arrows resize it;
 -- tiled windows swap with their neighbour or move the split instead
 for key, d in pairs{ Left = { -20, 0 }, Right = { 20, 0 }, Up = { 0, -20 }, Down = { 0, 20 } } do
