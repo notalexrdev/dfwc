@@ -139,7 +139,7 @@ Successor to dfwm (X11 dwm fork in `~/Projekte/dfwm-ste/dwm`). Planning confirme
    - Config: Lua with reload on save and safety keys.
    - Protocols: those listed in round 1, plus portals.
    - Looks: scenefx with borders (all styles), rounded corners and Lua colors.
-2. **Tiling + XWayland + gaming + effects.** Tiling with all 7 layouts and Lua layouts done 2026-10-24. XWayland done 2026-10-24. Shadows, optimized blur and animations (open/close fade, focus fade, move glide) done 2026-10-24; border gradients and the drawn-box morph still open.
+2. **Tiling + XWayland + gaming + effects.** Tiling with all 7 layouts and Lua layouts done 2026-10-24. XWayland done 2026-10-24. Shadows, optimized blur and animations (open/close fade, focus fade, move glide) done 2026-10-24; border gradients and the drawn-box morph still open. Gaming protocols (relative pointer, pointer constraints, opt-in tearing) done 2026-10-24.
    - Master/stack tiling with per-window float.
    - XWayland ("from the start", but not in milestone 1, so right after it).
    - Gaming: pointer lock, relative pointer, opt-in tearing.

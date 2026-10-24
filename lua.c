@@ -103,6 +103,7 @@ static const struct {
 	FIELD(anim_focus, Int, 0, 2000),
 	FIELD(anim_move, Int, 0, 2000),
 	FIELD(anim_curve, Curve, 0, 0),
+	FIELD(tearing, Bool, 0, 0),
 };
 
 /* runtime changes to these survive a save, unless the config's value for them changed */

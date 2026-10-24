@@ -49,6 +49,10 @@
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_pointer.h>
+#include <wlr/types/wlr_pointer_constraints_v1.h>
+#include <wlr/types/wlr_relative_pointer_v1.h>
+#include <wlr/types/wlr_tearing_control_v1.h>
+#include <wlr/util/region.h>
 #include <wlr/types/wlr_presentation_time.h>
 #include <wlr/types/wlr_primary_selection.h>
 #include <wlr/types/wlr_primary_selection_v1.h>
@@ -166,6 +170,11 @@ typedef struct {
 } Popup;
 
 typedef struct {
+	struct wlr_pointer_constraint_v1 *wlr;
+	struct wl_listener destroy;
+} Constraint; /* a game locking or confining the pointer */
+
+typedef struct {
 	struct wlr_buffer base;
 	pixman_image_t *img;
 } TextBuffer; /* CPU-drawn text the scene can show */
@@ -210,6 +219,10 @@ static struct wlr_layer_shell_v1 *layer_shell;
 static struct wlr_xdg_decoration_manager_v1 *deco_mgr;
 static struct wlr_xdg_activation_v1 *activation;
 static struct wlr_compositor *compositor;
+static struct wlr_relative_pointer_manager_v1 *relptr;
+static struct wlr_pointer_constraints_v1 *constraints;
+static struct wlr_pointer_constraint_v1 *activecon; /* the one under the pointer, if any */
+static struct wlr_tearing_control_manager_v1 *tearingmgr;
 static struct wlr_xwayland *xwayland;
 static struct wlr_cursor_shape_manager_v1 *cursor_shape_mgr;
 static struct wlr_cursor *cursor;
@@ -349,6 +362,7 @@ static void restyle(Client *c);
 static void placeerror(void);
 static void drawwallpaper(Monitor *m);
 static void snap(Client *c, int *x, int *y, int dx, int dy);
+static void constrain(struct wlr_pointer_constraint_v1 *con);
 static void floatout(Client *c);
 static int istiled(Client *c);
 
@@ -1639,18 +1653,72 @@ motionnotify(uint32_t time)
 	if (!surface) {
 		wlr_cursor_set_xcursor(cursor, cursor_mgr, "default");
 		wlr_seat_pointer_clear_focus(seat);
+		constrain(NULL);
 		return;
 	}
 	wlr_seat_pointer_notify_enter(seat, surface, sx, sy);
 	wlr_seat_pointer_notify_motion(seat, time, sx, sy);
+	constrain(wlr_pointer_constraints_v1_constraint_for_surface(constraints, surface, seat));
+}
+
+static void
+constrain(struct wlr_pointer_constraint_v1 *con)
+{
+	/* only the constraint of the surface under the pointer is active */
+	if (activecon == con)
+		return;
+	if (activecon)
+		wlr_pointer_constraint_v1_send_deactivated(activecon);
+	if ((activecon = con))
+		wlr_pointer_constraint_v1_send_activated(con);
+}
+
+static void
+destroyconstraint(struct wl_listener *listener, void *data)
+{
+	Constraint *pc = wl_container_of(listener, pc, destroy);
+
+	/* shortcut: the cursor stays where it is instead of warping to the app's hint */
+	if (activecon == pc->wlr)
+		activecon = NULL;
+	wl_list_remove(&pc->destroy.link);
+	free(pc);
+}
+
+static void
+createconstraint(struct wl_listener *listener, void *data)
+{
+	struct wlr_pointer_constraint_v1 *con = data;
+	Constraint *pc = calloc(1, sizeof(*pc));
+
+	if (!pc)
+		return;
+	pc->wlr = con;
+	LISTEN(&con->events.destroy, &pc->destroy, destroyconstraint);
+	if (seat->pointer_state.focused_surface == con->surface)
+		constrain(con);
 }
 
 static void
 motionrelative(struct wl_listener *listener, void *data)
 {
 	struct wlr_pointer_motion_event *event = data;
+	double dx = event->delta_x, dy = event->delta_y, sx, sy, cx, cy;
 
-	wlr_cursor_move(cursor, &event->pointer->base, event->delta_x, event->delta_y);
+	/* games aim with the raw, unaccelerated movement */
+	wlr_relative_pointer_manager_v1_send_relative_motion(relptr, seat,
+		(uint64_t)event->time_msec * 1000, dx, dy, event->unaccel_dx, event->unaccel_dy);
+	if (activecon && cursor_mode == CurNormal) {
+		if (activecon->type == WLR_POINTER_CONSTRAINT_V1_LOCKED)
+			return; /* the cursor stays put; the game only reads the movement */
+		sx = seat->pointer_state.sx;
+		sy = seat->pointer_state.sy;
+		if (wlr_region_confine(&activecon->region, sx, sy, sx + dx, sy + dy, &cx, &cy)) {
+			dx = cx - sx;
+			dy = cy - sy;
+		}
+	}
+	wlr_cursor_move(cursor, &event->pointer->base, dx, dy);
 	motionnotify(event->time_msec);
 }
 
@@ -1770,16 +1838,43 @@ setpsel(struct wl_listener *listener, void *data)
 
 /* outputs */
 
+static int
+wantstearing(Monitor *m)
+{
+	/* the config allows it and a fullscreen app on this screen asks for it */
+	Client *c;
+
+	if (!settings.tearing)
+		return 0;
+	wl_list_for_each(c, &clients, link)
+		if (c->fullscreen && cmapped(c) && monof(c) == m)
+			return wlr_tearing_control_manager_v1_surface_hint_from_surface(tearingmgr,
+				csurface(c)) == WP_TEARING_CONTROL_V1_PRESENTATION_HINT_ASYNC;
+	return 0;
+}
+
 static void
 rendermon(struct wl_listener *listener, void *data)
 {
 	Monitor *m = wl_container_of(listener, m, frame);
 	struct wlr_scene_output *so = wlr_scene_get_scene_output(scene, m->wlr);
+	struct wlr_output_state state;
 	struct timespec now;
 
 	if (animating && (animating = animate()))
 		wlr_output_schedule_frame(m->wlr); /* until the last animation ends */
-	wlr_scene_output_commit(so, NULL);
+	if (!wantstearing(m)) {
+		wlr_scene_output_commit(so, NULL);
+	} else if (wlr_scene_output_needs_frame(so)) {
+		wlr_output_state_init(&state);
+		if (wlr_scene_output_build_state(so, &state, NULL)) {
+			state.tearing_page_flip = true;
+			if (!wlr_output_test_state(m->wlr, &state))
+				state.tearing_page_flip = false; /* the driver can't: vsync after all */
+			wlr_output_commit_state(m->wlr, &state);
+		}
+		wlr_output_state_finish(&state);
+	}
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	wlr_scene_output_send_frame_done(so, &now);
 }
@@ -2984,6 +3079,7 @@ static struct wl_listener new_layer = { .notify = createlayer };
 static struct wl_listener new_deco = { .notify = createdeco };
 static struct wl_listener request_activate = { .notify = activate };
 static struct wl_listener new_xsurface = { .notify = createx11 };
+static struct wl_listener new_constraint = { .notify = createconstraint };
 static struct wl_listener xwayland_ready = { .notify = xready };
 
 static int
@@ -3053,6 +3149,10 @@ setup(void)
 	wlr_screencopy_manager_v1_create(dpy);
 	wlr_ext_output_image_capture_source_manager_v1_create(dpy, 1);
 	wlr_ext_image_copy_capture_manager_v1_create(dpy, 1);
+	relptr = wlr_relative_pointer_manager_v1_create(dpy);
+	constraints = wlr_pointer_constraints_v1_create(dpy);
+	wl_signal_add(&constraints->events.new_constraint, &new_constraint);
+	tearingmgr = wlr_tearing_control_manager_v1_create(dpy, 1);
 
 	output_layout = wlr_output_layout_create(dpy);
 	wl_signal_add(&output_layout->events.change, &layout_change);
@@ -3129,7 +3229,7 @@ cleanup(void)
 	struct wl_listener *listeners[] = { &new_output, &new_input, &new_toplevel, &new_popup,
 		&cursor_motion, &cursor_motion_absolute, &cursor_button, &cursor_axis, &cursor_frame,
 		&request_cursor, &request_sel, &request_psel, &request_shape, &layout_change,
-		&new_layer, &new_deco, &request_activate };
+		&new_layer, &new_deco, &request_activate, &new_constraint };
 	Monitor *m;
 	Ghost *g, *gtmp;
 

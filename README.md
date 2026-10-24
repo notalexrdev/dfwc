@@ -31,6 +31,9 @@ X11-only apps (Steam, many games, older programs) run through XWayland, which st
 moment the first one opens and costs nothing until then. They get the same borders, tiling,
 focus and keys as Wayland apps; their menus and tooltips stay unframed.
 
+Games get the raw, unaccelerated mouse movement and can lock or confine the pointer to their
+window (mouse aiming), whether they run on Wayland or through XWayland.
+
 ## Look
 
 dfwc ships one theme, "ink": black, greys, and soft colors in the terminal. It covers
@@ -129,6 +132,7 @@ the bind while the key is held.
 | `anim_focus` | 150 ms: border colors blend when focus moves |
 | `anim_move` | 200 ms: tiling, maximize and zoom glide windows into place |
 | `anim_curve` | `{ 0.2, 0.9, 0.3, 1 }`: the easing of all of them, as a CSS cubic-bezier |
+| `tearing` | false: fullscreen games that ask may skip vsync for less input lag |
 | `tiling` | false |
 | `layout` | `"tile"` |
 | `mfact`, `nmaster` | 0.55, 1 |

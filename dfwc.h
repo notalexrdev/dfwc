@@ -47,6 +47,7 @@ typedef struct {
 	bool blur;              /* blur the wallpaper behind see-through windows */
 	int blur_radius, blur_passes;
 	int anim_open, anim_close, anim_focus, anim_move; /* ms; 0: off */
+	bool tearing;           /* fullscreen apps that ask may skip vsync for less input lag */
 	float anim_curve[4];    /* cubic-bezier x1 y1 x2 y2, like CSS */
 } Settings;
 
