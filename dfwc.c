@@ -5,14 +5,18 @@
  * from init.lua (see lua.c).
  */
 #include <drm_fourcc.h>
+#include <errno.h>
 #include <fcft/fcft.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <locale.h>
+#include <math.h>
 #include <linux/input-event-codes.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <uchar.h>
@@ -64,9 +68,9 @@
 #define LISTEN(E, L, H)         wl_signal_add((E), ((L)->notify = (H), (L)))
 #define MODMASK                 (WLR_MODIFIER_SHIFT | WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT | WLR_MODIFIER_LOGO)
 
-enum { CurNormal, CurMove, CurResize };
+enum { CurNormal, CurMove, CurResize, CurDraw };
 /* scene layers, bottom to top */
-enum { LyrBg, LyrBottom, LyrClients, LyrTop, LyrFullscreen, LyrOverlay, NumLayers };
+enum { LyrBg, LyrBottom, LyrClients, LyrOnTop, LyrTop, LyrFullscreen, LyrOverlay, NumLayers };
 
 typedef struct {
 	struct wl_list link; /* in clients, most recently focused first */
@@ -79,7 +83,8 @@ typedef struct {
 	struct wlr_box prev; /* geometry to restore after maximize/fullscreen */
 	struct wlr_box geom; /* geometry the borders were last drawn for */
 	Style style;         /* last dfwc.style() result, applied on top of settings */
-	int maximized, fullscreen, radius;
+	int maximized, fullscreen, ontop, minimized, radius;
+	unsigned int id;     /* names the window in the restore menu */
 	struct wl_listener map, unmap, commit, destroy, set_title, set_app_id;
 	struct wl_listener request_move, request_resize, request_maximize, request_fullscreen;
 	struct wl_listener deco_mode, deco_destroy;
@@ -138,6 +143,19 @@ static struct wlr_scene_rect *alarmrect; /* full-screen red blink on config erro
 static struct wl_event_source *flashtimer;
 static int flashes; /* half-blinks left of the config error flash; odd = red */
 static struct wlr_scene_buffer *errbox; /* config error message at the top */
+static struct {
+	struct wlr_scene_rect *rect;
+	struct wl_event_source *timer;
+	struct wlr_box box;
+	double x, y;  /* where the drag started */
+	int pending;  /* drawn and waiting for the next window */
+} draw; /* drag-to-open */
+static struct {
+	int fd;
+	struct wl_event_source *src;
+	char buf[64];
+	size_t len;
+} menu = { .fd = -1 }; /* restore menu being read */
 static struct fcft_font *font;
 static struct wlr_output_layout *output_layout;
 static struct wlr_scene_output_layout *scene_layout;
@@ -246,16 +264,39 @@ resizeclient(Client *c, struct wlr_box b)
 	wlr_xdg_toplevel_set_size(c->toplevel, MAX(b.width, 1), MAX(b.height, 1));
 }
 
+static void
+extents(Client *c, int e[4])
+{
+	/* how far the borders reach out of the window: top, right, bottom, left */
+	const Settings *s = &settings;
+
+	for (int i = 0; i < 4; i++)
+		e[i] = c->fullscreen ? 0 : s->border_width[i] + s->inner_border_width + s->border_gap;
+}
+
 static struct wlr_box
 inset(Client *c, struct wlr_box b)
 {
 	/* the room left for the window once its borders fit inside b */
-	const Settings *s = &settings;
 	int e[4];
 
-	for (int i = 0; i < 4; i++)
-		e[i] = c->fullscreen ? 0 : s->border_width[i] + s->inner_border_width + s->border_gap;
+	extents(c, e);
 	return (struct wlr_box){ b.x + e[3], b.y + e[0], b.width - e[1] - e[3], b.height - e[0] - e[2] };
+}
+
+static struct wlr_box
+outset(Client *c, struct wlr_box b)
+{
+	int e[4];
+
+	extents(c, e);
+	return (struct wlr_box){ b.x - e[3], b.y - e[0], b.width + e[1] + e[3], b.height + e[0] + e[2] };
+}
+
+static int
+clientlayer(Client *c)
+{
+	return c->fullscreen ? LyrFullscreen : c->ontop ? LyrOnTop : LyrClients;
 }
 
 static void
@@ -428,8 +469,12 @@ focustop(void)
 	/* clear first so focusclient() doesn't deactivate a dying surface */
 	wlr_seat_keyboard_notify_clear_focus(seat);
 	/* shortcut: the cleared window isn't restyled; it's unmapping anyway */
-	if (!wl_list_empty(&clients))
-		focusclient(wl_container_of(clients.next, c, link), 0);
+	wl_list_for_each(c, &clients, link) {
+		if (!c->minimized) {
+			focusclient(c, 0);
+			return;
+		}
+	}
 }
 
 static void
@@ -462,14 +507,22 @@ focusstack(int dir)
 	Client *c = selclient();
 	struct wl_list *l;
 
+	Client *n;
+
 	if (!c)
 		return;
-	/* walk most recently focused first, like alt-tab */
-	l = dir > 0 ? c->link.next : c->link.prev;
-	if (l == &clients)
+	/* walk most recently focused first, like alt-tab, past minimized windows */
+	for (l = &c->link;;) {
 		l = dir > 0 ? l->next : l->prev;
+		if (l == &clients)
+			continue;
+		if (l == &c->link)
+			return;
+		if (!(n = wl_container_of(l, n, link))->minimized)
+			break;
+	}
 	cycling = 1;
-	focusclient(wl_container_of(l, c, link), 1);
+	focusclient(n, 1);
 }
 
 void
@@ -512,12 +565,116 @@ setfullscreen(Client *c, int on)
 		if (on && !c->maximized)
 			c->prev = clientbox(c);
 		/* above bars, below overlays like lock screens */
-		wlr_scene_node_reparent(&c->scene->node, layers[on ? LyrFullscreen : LyrClients]);
 		c->fullscreen = on;
+		wlr_scene_node_reparent(&c->scene->node, layers[clientlayer(c)]);
 		resizeclient(c, on ? m->area : c->maximized ? inset(c, m->usable) : c->prev);
 		restyle(c);
 	}
 	wlr_xdg_toplevel_set_fullscreen(c->toplevel, c->fullscreen);
+}
+
+void
+toggleontop(void)
+{
+	Client *c = selclient();
+
+	if (!c)
+		return;
+	c->ontop = !c->ontop;
+	wlr_scene_node_reparent(&c->scene->node, layers[clientlayer(c)]);
+}
+
+void
+minimize(void)
+{
+	Client *c = selclient();
+
+	if (!c)
+		return;
+	c->minimized = 1;
+	wlr_scene_node_set_enabled(&c->scene->node, false);
+	focustop();
+}
+
+static int
+menuread(int fd, uint32_t mask, void *data)
+{
+	/* the menu prints the picked line, "id title"; EOF means it closed */
+	ssize_t n = 0;
+	unsigned int id;
+	Client *c;
+
+	if ((mask & WL_EVENT_READABLE) && menu.len < sizeof(menu.buf) - 1
+	&& (n = read(fd, menu.buf + menu.len, sizeof(menu.buf) - 1 - menu.len)) > 0) {
+		menu.len += n;
+		return 0;
+	}
+	if (n < 0 && errno == EAGAIN)
+		return 0;
+	menu.buf[menu.len] = '\0';
+	if (sscanf(menu.buf, "%u", &id) == 1)
+		wl_list_for_each(c, &clients, link)
+			if (c->id == id && c->minimized) {
+				c->minimized = 0;
+				wlr_scene_node_set_enabled(&c->scene->node, true);
+				focusclient(c, 1);
+				break;
+			}
+	wl_event_source_remove(menu.src);
+	close(menu.fd);
+	menu.fd = -1;
+	return 0;
+}
+
+void
+restoremenu(void)
+{
+	/* list minimized windows in a menu; the one picked comes back */
+	int in[2], out[2];
+	char line[512];
+	pid_t pid;
+	Client *c;
+	int n;
+
+	if (menu.fd >= 0)
+		return;
+	/* a socket for the list, so writing to a menu that died is EPIPE, not SIGPIPE */
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, in) < 0)
+		return;
+	if (pipe2(out, O_CLOEXEC | O_NONBLOCK) < 0) {
+		close(in[0]);
+		close(in[1]);
+		return;
+	}
+	if ((pid = fork()) == 0) {
+		sigset_t none;
+		sigemptyset(&none);
+		sigprocmask(SIG_SETMASK, &none, NULL);
+		setsid();
+		if (fork() == 0) {
+			dup2(in[1], STDIN_FILENO);
+			dup2(out[1], STDOUT_FILENO);
+			execl("/bin/sh", "/bin/sh", "-c", settings.restore_menu, (char *)NULL);
+			_exit(127);
+		}
+		_exit(0);
+	}
+	close(in[1]);
+	close(out[1]);
+	if (pid > 0)
+		waitpid(pid, NULL, 0);
+	wl_list_for_each(c, &clients, link) {
+		if (!c->minimized)
+			continue;
+		n = snprintf(line, sizeof(line), "%u %s\n", c->id,
+			c->toplevel->title ? c->toplevel->title : c->toplevel->app_id ? c->toplevel->app_id : "");
+		send(in[0], line, MIN(n, (int)sizeof(line) - 1), MSG_NOSIGNAL | MSG_DONTWAIT);
+	}
+	close(in[0]);
+	menu.fd = out[0];
+	menu.len = 0;
+	menu.src = wl_event_loop_add_fd(wl_display_get_event_loop(dpy), out[0],
+		WL_EVENT_READABLE, menuread, NULL);
 }
 
 void
@@ -594,6 +751,77 @@ safetykey(uint32_t mods, xkb_keysym_t sym)
 	return 0;
 }
 
+static void
+endbox(void)
+{
+	draw.pending = 0;
+	wlr_scene_node_set_enabled(&draw.rect->node, false);
+	wl_event_source_timer_update(draw.timer, 0);
+}
+
+static int
+boxtimeout(void *data)
+{
+	endbox();
+	return 0;
+}
+
+static void
+showbox(void)
+{
+	struct wlr_box b = draw.box;
+
+	setring(draw.rect, b, (struct wlr_box){ b.x + 2, b.y + 2, b.width - 4, b.height - 4 },
+		corner_radii_none(), 0, settings.border_focused);
+}
+
+static int
+tinybox(void)
+{
+	/* a click more than a drag: the app opens at its own size */
+	return draw.box.width < 32 || draw.box.height < 32;
+}
+
+static void
+snap(Client *c, int *x, int *y)
+{
+	/* pull the window's outer edges onto nearby screen edges and window edges */
+	struct wlr_box *geo = &c->toplevel->base->geometry;
+	struct wlr_box me = outset(c, (struct wlr_box){ *x, *y, geo->width, geo->height }), o;
+	Monitor *m = selmon();
+	int d = settings.snap, bx = d + 1, by = d + 1;
+	Client *t;
+
+#define TRY(best, v) do { if (abs(v) <= d && abs(v) < abs(best)) best = (v); } while (0)
+	if (!d)
+		return;
+	if (m) {
+		o = m->usable;
+		TRY(bx, o.x - me.x);
+		TRY(bx, o.x + o.width - me.x - me.width);
+		TRY(by, o.y - me.y);
+		TRY(by, o.y + o.height - me.y - me.height);
+	}
+	wl_list_for_each(t, &clients, link) {
+		if (t == c || t->minimized)
+			continue;
+		o = outset(t, clientbox(t));
+		if (me.y < o.y + o.height && o.y < me.y + me.height) { /* side by side */
+			TRY(bx, o.x + o.width - me.x);
+			TRY(bx, o.x - me.x - me.width);
+		}
+		if (me.x < o.x + o.width && o.x < me.x + me.width) { /* stacked */
+			TRY(by, o.y + o.height - me.y);
+			TRY(by, o.y - me.y - me.height);
+		}
+	}
+#undef TRY
+	if (bx <= d)
+		*x += bx;
+	if (by <= d)
+		*y += by;
+}
+
 /* input */
 
 static void
@@ -606,6 +834,12 @@ keypress(struct wl_listener *listener, void *data)
 	const xkb_keysym_t *syms;
 	int n, handled;
 
+	if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED && cursor_mode == CurDraw
+	&& xkb_state_key_get_one_sym(kb->wlr->xkb_state, code) == XKB_KEY_Escape) {
+		cursor_mode = CurNormal;
+		endbox();
+		return;
+	}
 	if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
 		wl_event_source_timer_update(rep.timer, 0); /* a new key ends any repeat */
 		/* level 0 so "Mod+Shift+c" matches c, not C, on every layout */
@@ -774,10 +1008,19 @@ motionnotify(uint32_t time)
 	struct wlr_surface *surface = NULL;
 	double sx, sy;
 	Client *c;
-	int l, r, t, b, ex, ey;
+	int l, r, t, b, ex, ey, x, y;
 
 	if (cursor_mode == CurMove) {
-		wlr_scene_node_set_position(&grabc->scene->node, cursor->x - grabx, cursor->y - graby);
+		x = cursor->x - grabx;
+		y = cursor->y - graby;
+		snap(grabc, &x, &y);
+		wlr_scene_node_set_position(&grabc->scene->node, x, y);
+		return;
+	}
+	if (cursor_mode == CurDraw) {
+		draw.box = (struct wlr_box){ MIN(draw.x, cursor->x), MIN(draw.y, cursor->y),
+			fabs(cursor->x - draw.x), fabs(cursor->y - draw.y) };
+		showbox();
 		return;
 	}
 	if (cursor_mode == CurResize) {
@@ -856,6 +1099,24 @@ buttonpress(struct wl_listener *listener, void *data)
 					| (cursor->y < cy ? WLR_EDGE_TOP : WLR_EDGE_BOTTOM));
 			return;
 		}
+		if (!c && kb && (wlr_keyboard_get_modifiers(kb) & MODMASK) == modkey
+		&& event->button == BTN_LEFT) {
+			/* Mod+drag on the desktop draws where the next window goes */
+			endbox();
+			cursor_mode = CurDraw;
+			draw.x = cursor->x;
+			draw.y = cursor->y;
+			draw.box = (struct wlr_box){ cursor->x, cursor->y, 0, 0 };
+			return;
+		}
+	} else if (cursor_mode == CurDraw) {
+		cursor_mode = CurNormal;
+		draw.pending = 1;
+		if (tinybox())
+			wlr_scene_node_set_enabled(&draw.rect->node, false);
+		wl_event_source_timer_update(draw.timer, settings.box_timeout);
+		spawn(settings.launcher);
+		return;
 	} else if (cursor_mode != CurNormal) {
 		ungrab();
 	}
@@ -1030,11 +1291,21 @@ mapnotify(struct wl_listener *listener, void *data)
 	struct wlr_box *geo = &c->toplevel->base->geometry, area, around;
 	int w, h;
 
+	static unsigned int ids;
+
+	c->id = ++ids;
 	wl_list_insert(&clients, &c->link);
 	wlr_scene_node_set_enabled(&c->scene->node, true);
 	outputbox(&area);
 	area = inset(c, area);
-	if (!wlr_box_empty(&area)) {
+	if (draw.pending && !c->toplevel->parent) {
+		/* the box drawn for it: its corner if it was a click, else its size too */
+		if (tinybox())
+			wlr_scene_node_set_position(&c->scene->node, draw.box.x, draw.box.y);
+		else
+			resizeclient(c, inset(c, draw.box));
+		endbox();
+	} else if (!wlr_box_empty(&area)) {
 		/* center on the screen, dialogs on their parent; shrink to fit */
 		around = area;
 		if (c->toplevel->parent && (p = clientfrom(c->toplevel->parent->base->surface)))
@@ -1062,8 +1333,8 @@ unmapnotify(struct wl_listener *listener, void *data)
 	int focused = selclient() == c;
 
 	/* an app that hides and shows its window starts over as a plain one */
-	c->maximized = c->fullscreen = 0;
-	wlr_scene_node_reparent(&c->scene->node, layers[LyrClients]);
+	c->maximized = c->fullscreen = c->minimized = 0;
+	wlr_scene_node_reparent(&c->scene->node, layers[clientlayer(c)]);
 	wlr_scene_node_set_enabled(&c->scene->node, false);
 	if (c == grabc)
 		ungrab();
@@ -1621,6 +1892,7 @@ setup(void)
 	sigsrc[1] = wl_event_loop_add_signal(loop, SIGTERM, quitsignal, NULL);
 	rep.timer = wl_event_loop_add_timer(loop, repeatkey, NULL);
 	flashtimer = wl_event_loop_add_timer(loop, flashstep, NULL);
+	draw.timer = wl_event_loop_add_timer(loop, boxtimeout, NULL);
 
 	if (!(backend = wlr_backend_autocreate(loop, &session)))
 		die("couldn't create backend");
@@ -1633,6 +1905,9 @@ setup(void)
 	bg = wlr_scene_rect_create(&scene->tree, 0, 0, (float[4]){ 0 });
 	for (size_t i = 0; i < LENGTH(layers); i++)
 		layers[i] = wlr_scene_tree_create(&scene->tree);
+	draw.rect = wlr_scene_rect_create(layers[LyrTop], 0, 0, (float[4]){ 0 });
+	draw.rect->accepts_input = false;
+	wlr_scene_node_set_enabled(&draw.rect->node, false);
 	alarmrect = wlr_scene_rect_create(layers[LyrOverlay], 0, 0, (float[4]){ 0.4, 0, 0, 0.4 });
 	alarmrect->accepts_input = false;
 	wlr_scene_node_set_enabled(&alarmrect->node, false);
@@ -1727,6 +2002,11 @@ cleanup(void)
 		wl_event_source_remove(sigsrc[i]);
 	wl_event_source_remove(rep.timer);
 	wl_event_source_remove(flashtimer);
+	wl_event_source_remove(draw.timer);
+	if (menu.fd >= 0) {
+		wl_event_source_remove(menu.src);
+		close(menu.fd);
+	}
 	if (errbox)
 		wlr_scene_node_destroy(&errbox->node);
 	fcft_destroy(font);

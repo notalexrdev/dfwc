@@ -57,6 +57,9 @@ the bind while the key is held.
 | `dfwc.resize(dw, dh)` | resize the focused window by pixels |
 | `dfwc.maximize()` | toggle maximize |
 | `dfwc.fullscreen()` | toggle fullscreen |
+| `dfwc.ontop()` | toggle always on top |
+| `dfwc.minimize()` | hide the focused window |
+| `dfwc.restore()` | pick a hidden window from a menu to bring back |
 | `dfwc.reload()` | reload the config |
 | `dfwc.quit()` | quit dfwc |
 
@@ -83,6 +86,10 @@ the bind while the key is held.
 | `corner_radius` | 0: rounds windows and borders |
 | `opacity` | 1 (0.05 to 1) |
 | `error_alarm_fullscreen` | false: also blink the whole screen red on config errors |
+| `launcher` | `"wmenu-run"`: runs after you draw a box |
+| `restore_menu` | `"wmenu -p restore"`: gets `id title` lines, prints the picked one |
+| `box_timeout` | 5000 ms a drawn box waits for its window |
+| `snap` | 10 px: moved windows snap to screen and window edges (0 turns it off) |
 
 Every setting applies immediately when the file is saved. When a saved config has an
 error, all borders blink red three times and a black box at the top of the screen shows
@@ -104,6 +111,10 @@ Fullscreen windows never get borders, rounding or transparency.
 
 Focus follows the mouse; clicking raises a window.
 Mod+left-drag moves a window, Mod+right-drag resizes it from the nearest corner.
+
+Mod+left-drag on the empty desktop draws a box and opens the launcher: the next window
+that opens takes the box. A short click instead of a drag opens it at its own size
+at that spot. Escape while drawing cancels; an unused box disappears after `box_timeout`.
 
 ## License
 

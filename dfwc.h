@@ -26,6 +26,10 @@ typedef struct {
 	int corner_radius;
 	double opacity;
 	bool error_alarm_fullscreen;
+	char launcher[256];     /* runs after drawing a box */
+	char restore_menu[256]; /* reads "id title" lines, prints the picked one */
+	int box_timeout;        /* ms a drawn box waits for its window */
+	int snap;               /* px within which moved windows snap to edges */
 } Settings;
 
 /* what a dfwc.style() function sees and may change */
@@ -50,8 +54,11 @@ void killclient(void);
 void moveresize(int dx, int dy, int dw, int dh);
 void quit(void);
 void spawn(const char *cmd);
+void minimize(void);
+void restoremenu(void);
 void togglefullscreen(void);
 void togglemaximize(void);
+void toggleontop(void);
 
 /* lua.c */
 extern Settings settings;

@@ -73,6 +73,10 @@ static const struct {
 	FIELD(corner_radius, Int, 0, 1000),
 	FIELD(opacity, Num, 0.05, 1),
 	FIELD(error_alarm_fullscreen, Bool, 0, 0),
+	FIELD(launcher, Str, 0, 0),
+	FIELD(restore_menu, Str, 0, 0),
+	FIELD(box_timeout, Int, 0, 60000),
+	FIELD(snap, Int, 0, 200),
 };
 
 #define HEX(C) { ((C) >> 16 & 0xff) / 255.0f, ((C) >> 8 & 0xff) / 255.0f, ((C) & 0xff) / 255.0f, 1 }
@@ -90,6 +94,10 @@ static const Settings defaults = {
 	.inner_border_focused = HEX(0x1d1f21),
 	.inner_border_unfocused = HEX(0x1d1f21),
 	.opacity = 1,
+	.launcher = "wmenu-run",
+	.restore_menu = "wmenu -p restore",
+	.box_timeout = 5000,
+	.snap = 10,
 };
 
 static const struct { const char *name; uint32_t mask; } modnames[] = {
@@ -412,6 +420,27 @@ l_fullscreen(lua_State *L)
 }
 
 static int
+l_ontop(lua_State *L)
+{
+	toggleontop();
+	return 0;
+}
+
+static int
+l_minimize(lua_State *L)
+{
+	minimize();
+	return 0;
+}
+
+static int
+l_restore(lua_State *L)
+{
+	restoremenu();
+	return 0;
+}
+
+static int
 l_spawn(lua_State *L)
 {
 	spawn(luaL_checkstring(L, 1));
@@ -446,10 +475,13 @@ static const luaL_Reg api[] = {
 	{ "focus", l_focus },
 	{ "fullscreen", l_fullscreen },
 	{ "maximize", l_maximize },
+	{ "minimize", l_minimize },
 	{ "move", l_move },
+	{ "ontop", l_ontop },
 	{ "quit", l_quit },
 	{ "reload", l_reload },
 	{ "resize", l_resize },
+	{ "restore", l_restore },
 	{ "set", l_set },
 	{ "spawn", l_spawn },
 	{ "style", l_style },
