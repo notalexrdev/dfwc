@@ -43,6 +43,7 @@
 #include <wlr/types/wlr_keyboard.h>
 #include <wlr/types/wlr_layer_shell_v1.h>
 #include <wlr/types/wlr_linux_dmabuf_v1.h>
+#include <wlr/types/wlr_linux_drm_syncobj_v1.h>
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_pointer.h>
@@ -2214,6 +2215,12 @@ setup(void)
 		wlr_drm_create(dpy, drw);
 		wlr_scene_set_linux_dmabuf_v1(scene, wlr_linux_dmabuf_v1_create_with_renderer(dpy, 5, drw));
 	}
+	/* explicit sync: without it NVIDIA shows GPU-drawn windows (kitty, browsers)
+	 * before they're finished, so they flicker */
+	if (drw->features.timeline && backend->features.timeline)
+		wlr_linux_drm_syncobj_manager_v1_create(dpy, 1, wlr_renderer_get_drm_fd(drw));
+	wlr_log(WLR_INFO, "explicit sync: %s",
+		drw->features.timeline && backend->features.timeline ? "on" : "unsupported here");
 
 	wlr_compositor_create(dpy, 6, drw);
 	wlr_subcompositor_create(dpy);
