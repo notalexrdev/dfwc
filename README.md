@@ -11,6 +11,8 @@ Needs `wlroots0.20 scenefx lua libinput fcft wayland-protocols` and a C23 compil
     make
     sudo make install
 
+On Alpine (edge only; stable lacks wlroots 0.20 and gcc 15): `make LUA=lua5.5`.
+
 Pick **dfwc** on the login screen, or run `dfwc-session` from a TTY.
 The log goes to `~/.local/state/dfwc/log`; `dfwc-session -d` logs debug output.
 
