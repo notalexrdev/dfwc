@@ -9,6 +9,7 @@
 #include <fcft/fcft.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <locale.h>
 #include <math.h>
 #include <linux/input-event-codes.h>
@@ -149,6 +150,7 @@ static struct {
 	struct wlr_box box;
 	double x, y;  /* where the drag started */
 	int pending;  /* drawn and waiting for the next window */
+	void *claim;  /* the Client sized for it before it first showed */
 } draw; /* drag-to-open */
 static struct {
 	int fd;
@@ -224,6 +226,7 @@ clientat(double x, double y, struct wlr_surface **surface, double *sx, double *s
 static Client *clientfrom(struct wlr_surface *surface);
 static void restyle(Client *c);
 static void placeerror(void);
+static void snap(Client *c, int *x, int *y, int dx, int dy);
 
 static Client *
 selclient(void)
@@ -538,7 +541,14 @@ moveresize(int dx, int dy, int dw, int dh)
 		wlr_xdg_toplevel_set_maximized(c->toplevel, false);
 	}
 	b = clientbox(c);
-	resizeclient(c, (struct wlr_box){ b.x + dx, b.y + dy, b.width + dw, b.height + dh });
+	if (dw || dh) {
+		resizeclient(c, (struct wlr_box){ b.x + dx, b.y + dy, b.width + dw, b.height + dh });
+		return;
+	}
+	b.x += dx;
+	b.y += dy;
+	snap(c, &b.x, &b.y, dx, dy);
+	wlr_scene_node_set_position(&c->scene->node, b.x, b.y);
 }
 
 static void
@@ -755,6 +765,7 @@ static void
 endbox(void)
 {
 	draw.pending = 0;
+	draw.claim = NULL;
 	wlr_scene_node_set_enabled(&draw.rect->node, false);
 	wl_event_source_timer_update(draw.timer, 0);
 }
@@ -782,43 +793,55 @@ tinybox(void)
 	return draw.box.width < 32 || draw.box.height < 32;
 }
 
-static void
-snap(Client *c, int *x, int *y)
+static int
+snapok(int v, int step)
 {
-	/* pull the window's outer edges onto nearby screen edges and window edges */
+	/* mouse (no step): edges within settings.snap pull the window in.
+	 * keys: the window stops at an edge it would cross, and passes it next press */
+	if (!step)
+		return abs(v) <= settings.snap;
+	return v * step < 0 && abs(v) < abs(step);
+}
+
+static void
+snap(Client *c, int *x, int *y, int dx, int dy)
+{
+	/* line the window's outer edges up with screen edges and other windows' edges */
 	struct wlr_box *geo = &c->toplevel->base->geometry;
 	struct wlr_box me = outset(c, (struct wlr_box){ *x, *y, geo->width, geo->height }), o;
 	Monitor *m = selmon();
-	int d = settings.snap, bx = d + 1, by = d + 1;
+	int bx = INT_MAX, by = INT_MAX;
 	Client *t;
 
-#define TRY(best, v) do { if (abs(v) <= d && abs(v) < abs(best)) best = (v); } while (0)
-	if (!d)
+#define TRYX(v) do { if (snapok(v, dx) && abs(v) < abs(bx)) bx = (v); } while (0)
+#define TRYY(v) do { if (snapok(v, dy) && abs(v) < abs(by)) by = (v); } while (0)
+	if (!settings.snap)
 		return;
 	if (m) {
 		o = m->usable;
-		TRY(bx, o.x - me.x);
-		TRY(bx, o.x + o.width - me.x - me.width);
-		TRY(by, o.y - me.y);
-		TRY(by, o.y + o.height - me.y - me.height);
+		TRYX(o.x - me.x);
+		TRYX(o.x + o.width - me.x - me.width);
+		TRYY(o.y - me.y);
+		TRYY(o.y + o.height - me.y - me.height);
 	}
 	wl_list_for_each(t, &clients, link) {
 		if (t == c || t->minimized)
 			continue;
 		o = outset(t, clientbox(t));
 		if (me.y < o.y + o.height && o.y < me.y + me.height) { /* side by side */
-			TRY(bx, o.x + o.width - me.x);
-			TRY(bx, o.x - me.x - me.width);
+			TRYX(o.x + o.width - me.x);
+			TRYX(o.x - me.x - me.width);
 		}
 		if (me.x < o.x + o.width && o.x < me.x + me.width) { /* stacked */
-			TRY(by, o.y + o.height - me.y);
-			TRY(by, o.y - me.y - me.height);
+			TRYY(o.y + o.height - me.y);
+			TRYY(o.y - me.y - me.height);
 		}
 	}
-#undef TRY
-	if (bx <= d)
+#undef TRYX
+#undef TRYY
+	if (bx != INT_MAX)
 		*x += bx;
-	if (by <= d)
+	if (by != INT_MAX)
 		*y += by;
 }
 
@@ -1013,7 +1036,7 @@ motionnotify(uint32_t time)
 	if (cursor_mode == CurMove) {
 		x = cursor->x - grabx;
 		y = cursor->y - graby;
-		snap(grabc, &x, &y);
+		snap(grabc, &x, &y, 0, 0);
 		wlr_scene_node_set_position(&grabc->scene->node, x, y);
 		return;
 	}
@@ -1288,7 +1311,7 @@ static void
 mapnotify(struct wl_listener *listener, void *data)
 {
 	Client *c = wl_container_of(listener, c, map), *p;
-	struct wlr_box *geo = &c->toplevel->base->geometry, area, around;
+	struct wlr_box *geo = &c->toplevel->base->geometry, area, around, box;
 	int w, h;
 
 	static unsigned int ids;
@@ -1298,12 +1321,11 @@ mapnotify(struct wl_listener *listener, void *data)
 	wlr_scene_node_set_enabled(&c->scene->node, true);
 	outputbox(&area);
 	area = inset(c, area);
-	if (draw.pending && !c->toplevel->parent) {
-		/* the box drawn for it: its corner if it was a click, else its size too */
-		if (tinybox())
-			wlr_scene_node_set_position(&c->scene->node, draw.box.x, draw.box.y);
-		else
-			resizeclient(c, inset(c, draw.box));
+	if (draw.claim == c) {
+		/* already sized for the drawn box; a click only sets the corner */
+		box = inset(c, draw.box);
+		wlr_scene_node_set_position(&c->scene->node, tinybox() ? draw.box.x : box.x,
+			tinybox() ? draw.box.y : box.y);
 		endbox();
 	} else if (!wlr_box_empty(&area)) {
 		/* center on the screen, dialogs on their parent; shrink to fit */
@@ -1347,7 +1369,7 @@ static void
 commitnotify(struct wl_listener *listener, void *data)
 {
 	Client *c = wl_container_of(listener, c, commit);
-	struct wlr_box *geo = &c->toplevel->base->geometry;
+	struct wlr_box *geo = &c->toplevel->base->geometry, box;
 
 	if (c->toplevel->base->surface->mapped) {
 		if (!wlr_box_equal(geo, &c->geom))
@@ -1358,8 +1380,16 @@ commitnotify(struct wl_listener *listener, void *data)
 	}
 	if (!c->toplevel->base->initial_commit)
 		return;
-	/* 0x0 lets the client pick its own size */
-	wlr_xdg_toplevel_set_size(c->toplevel, 0, 0);
+	if (draw.pending && !draw.claim && !c->toplevel->parent) {
+		/* sized for the drawn box before it ever shows, so it doesn't jump */
+		draw.claim = c;
+		box = inset(c, draw.box);
+		wlr_xdg_toplevel_set_size(c->toplevel, tinybox() ? 0 : MAX(box.width, 1),
+			tinybox() ? 0 : MAX(box.height, 1));
+	} else {
+		/* 0x0 lets the client pick its own size */
+		wlr_xdg_toplevel_set_size(c->toplevel, 0, 0);
+	}
 	if (c->deco)
 		wlr_xdg_toplevel_decoration_v1_set_mode(c->deco,
 			WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
@@ -1421,6 +1451,8 @@ destroynotify(struct wl_listener *listener, void *data)
 	wl_list_remove(&c->set_title.link);
 	wl_list_remove(&c->set_app_id.link);
 	wlr_scene_node_destroy(&c->scene->node);
+	if (draw.claim == c)
+		draw.claim = NULL; /* closed before showing: the next window gets the box */
 	if (c->deco) { /* its destroy fires after ours, when c is gone */
 		wl_list_remove(&c->deco_mode.link);
 		wl_list_remove(&c->deco_destroy.link);
@@ -1582,6 +1614,9 @@ maplayer(struct wl_listener *listener, void *data)
 	if (l->wlr->current.keyboard_interactive == ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE) {
 		exclusive = l;
 		kbfocus(l->wlr->surface);
+		/* the drawn box waits as long as the launcher is open */
+		if (draw.pending)
+			wl_event_source_timer_update(draw.timer, 0);
 	}
 	arrangelayers(l->mon);
 }
@@ -1591,8 +1626,11 @@ unmaplayer(struct wl_listener *listener, void *data)
 {
 	LayerSurface *l = wl_container_of(listener, l, unmap);
 
-	if (exclusive == l)
+	if (exclusive == l) {
 		exclusive = NULL;
+		if (draw.pending && !draw.claim)
+			wl_event_source_timer_update(draw.timer, settings.box_timeout);
+	}
 	if (seat->keyboard_state.focused_surface == l->wlr->surface)
 		focustop();
 	arrangelayers(l->mon);
