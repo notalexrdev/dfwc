@@ -648,17 +648,20 @@ updateborders(Client *c)
 		premul(s->shadow_color, color);
 		for (int i = 0; i < 4; i++)
 			color[i] *= c->fade;
-		wlr_scene_node_set_position(&c->shadow->node, out.x - sh, out.y - sh);
+		wlr_scene_node_set_position(&c->shadow->node,
+			out.x - sh + s->shadow_offset[0], out.y - sh + s->shadow_offset[1]);
 		wlr_scene_shadow_set_size(c->shadow, out.width + 2 * sh, out.height + 2 * sh);
 		wlr_scene_shadow_set_blur_sigma(c->shadow, sh / 2.0f);
 		wlr_scene_shadow_set_corner_radius(c->shadow, R ? R + iw + g + w[0] : 0);
 		wlr_scene_shadow_set_color(c->shadow, color);
 		wlr_scene_shadow_set_clipped_region(c->shadow, (struct clipped_region){
-			{ sh, sh, out.width, out.height }, corner_radii_all(R ? R + iw + g + w[0] : 0) });
+			{ sh - s->shadow_offset[0], sh - s->shadow_offset[1], out.width, out.height },
+			corner_radii_all(R ? R + iw + g + w[0] : 0) });
 	}
 	/* blur only shows through see-through windows; opaque ones hide it for free */
 	wlr_scene_node_set_enabled(&c->blur->node, s->blur && !c->fullscreen);
 	wlr_scene_blur_set_size(c->blur, win.width, win.height);
+	wlr_scene_blur_set_alpha(c->blur, c->fade); /* fades in with the window, not before it */
 	wlr_scene_blur_set_corner_radius(c->blur, R);
 
 	wlr_scene_node_set_enabled(&c->ring[1]->node, !bare && iw);

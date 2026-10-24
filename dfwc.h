@@ -42,6 +42,7 @@ typedef struct {
 	char tiled_drag[8];     /* moving a tiled window: "swap", "snap" or "float" */
 	char wallpaper[256];    /* built-in name ("girl", "matrix", "hands"), a PNG path, or "" */
 	int shadow_size;        /* blur radius of the shadow under floating windows; 0: none */
+	int shadow_offset[2];   /* x, y: down and right by default, like a light from the top left */
 	float shadow_color[4];
 	bool blur;              /* blur the wallpaper behind see-through windows */
 	int blur_radius, blur_passes;

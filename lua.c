@@ -41,7 +41,7 @@ typedef struct {
 	Settings own;      /* what the file itself set, before runtime changes were kept */
 } Config;
 
-enum { Str, Int, Num, Bool, Color, Mod, Sides, Wall, Curve };
+enum { Str, Int, Num, Bool, Color, Mod, Sides, Wall, Curve, Pair };
 
 #define FIELD(N, T, MIN, MAX) { #N, T, offsetof(Settings, N), sizeof(((Settings *)0)->N), MIN, MAX, NULL }
 #define CHOICE(N, ...) { #N, Str, offsetof(Settings, N), sizeof(((Settings *)0)->N), 0, 0, \
@@ -94,6 +94,7 @@ static const struct {
 	FIELD(wallpaper, Wall, 0, 0),
 	FIELD(shadow_size, Int, 0, 200),
 	FIELD(shadow_color, Color, 0, 0),
+	FIELD(shadow_offset, Pair, -200, 200),
 	FIELD(blur, Bool, 0, 0),
 	FIELD(blur_radius, Int, 1, 64),
 	FIELD(blur_passes, Int, 1, 10),
@@ -138,8 +139,9 @@ static const Settings defaults = {
 	.nmaster = 1,
 	.tiled_drag = "swap",
 	.wallpaper = "girl",
-	.shadow_size = 20,
-	.shadow_color = { 0, 0, 0, 0.6f },
+	.shadow_size = 10,
+	.shadow_offset = { 6, 8 },
+	.shadow_color = { 0, 0, 0, 0.55f },
 	.blur = true,
 	.blur_radius = 5,
 	.blur_passes = 3,
@@ -337,6 +339,17 @@ l_set(lua_State *L)
 				return luaL_error(L, "%s: path too long", key);
 			if (access(p, R_OK))
 				return luaL_error(L, "%s: can't read %s (built-ins: girl, matrix, hands)", key, (char *)p);
+			break;
+		case Pair: /* { x, y } */
+			for (int j = 0; (ok = lua_istable(L, -1)) && j < 2; j++) {
+				lua_rawgeti(L, -1, j + 1);
+				n = lua_tointegerx(L, -1, &ok);
+				ok = ok && n >= fields[i].min && n <= fields[i].max;
+				((int *)p)[j] = n;
+				lua_pop(L, 1);
+				if (!ok)
+					break;
+			}
 			break;
 		case Curve: /* { x1, y1, x2, y2 }; x must stay in 0..1 */
 			for (int j = 0; (ok = lua_istable(L, -1)) && j < 4; j++) {
