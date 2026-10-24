@@ -1550,7 +1550,8 @@ showerror(const char *msg)
 		free(t);
 		return;
 	}
-	pixman_image_fill_rectangles(PIXMAN_OP_SRC, t->img, &(pixman_color_t){ 0, 0, 0, 0xffff },
+	/* black at 85%, so the windows behind still show a little */
+	pixman_image_fill_rectangles(PIXMAN_OP_SRC, t->img, &(pixman_color_t){ 0, 0, 0, 0xd999 },
 		1, &(pixman_rectangle16_t){ 0, 0, w, h });
 	fg = pixman_image_create_solid_fill(&white);
 	x = Pad;
