@@ -89,6 +89,7 @@ static const Settings defaults = {
 	.background = HEX(0x1d1f21),
 	.scale = 1,
 	.border_width = { 2, 2, 2, 2 },
+	.corner_radius = 2,
 	.border_focused = HEX(0x81a2be),
 	.border_unfocused = HEX(0x373b41),
 	.inner_border_focused = HEX(0x1d1f21),

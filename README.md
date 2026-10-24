@@ -83,7 +83,7 @@ the bind while the key is held.
 | `inner_border_focused`, `inner_border_unfocused` | `"#1d1f21"` |
 | `border_gap` | 0: see-through space between window and border |
 | `border_corners` | 0: full border; N draws only N-pixel corner brackets |
-| `corner_radius` | 0: rounds windows and borders |
+| `corner_radius` | 2: rounds windows and borders (0 is square) |
 | `opacity` | 1 (0.05 to 1) |
 | `error_alarm_fullscreen` | false: also blink the whole screen red on config errors |
 | `launcher` | `"wmenu-run"`: runs after you draw a box |
