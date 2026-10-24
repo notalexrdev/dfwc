@@ -1664,8 +1664,12 @@ unmaplayer(struct wl_listener *listener, void *data)
 
 	if (exclusive == l) {
 		exclusive = NULL;
-		if (draw.pending && !draw.claim)
+		/* launcher closed: picked an app or escaped, dfwc can't tell. Hide the
+		 * box, but a window opening within box_timeout still lands in it */
+		if (draw.pending && !draw.claim) {
+			wlr_scene_node_set_enabled(&draw.rect->node, false);
 			wl_event_source_timer_update(draw.timer, settings.box_timeout);
+		}
 	}
 	if (seat->keyboard_state.focused_surface == l->wlr->surface)
 		focustop();
