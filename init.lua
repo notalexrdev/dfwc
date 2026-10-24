@@ -31,7 +31,7 @@ key("XF86AudioLowerVolume",  "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-", true)
 key("XF86AudioMute",         "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle")
 key("XF86AudioMicMute",      "wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle")
 
--- arrows move a window (hold two for diagonals), Shift+arrows resize it;
+-- arrows move a window, Shift+arrows resize it;
 -- tiled windows swap with their neighbour or move the split instead
 for key, d in pairs{ Left = { -20, 0 }, Right = { 20, 0 }, Up = { 0, -20 }, Down = { 0, 20 } } do
 	dfwc.bind("Mod+" .. key,       function() dfwc.move(d[1], d[2]) end,   { repeats = true })
