@@ -66,11 +66,16 @@ enum { LyrBg, LyrBottom, LyrClients, LyrTop, LyrFullscreen, LyrOverlay, NumLayer
 typedef struct {
 	struct wl_list link; /* in clients, most recently focused first */
 	struct wlr_xdg_toplevel *toplevel;
-	struct wlr_scene_tree *scene;
+	struct wlr_scene_tree *scene;   /* at the window geometry's top-left: borders, then surf */
+	struct wlr_scene_tree *surf;    /* the app's surfaces, offset by its geometry */
+	struct wlr_scene_rect *ring[2]; /* outer and inner border */
+	struct wlr_scene_rect *arm[8];  /* corner brackets, for border_corners */
 	struct wlr_xdg_toplevel_decoration_v1 *deco;
 	struct wlr_box prev; /* geometry to restore after maximize/fullscreen */
-	int maximized, fullscreen;
-	struct wl_listener map, unmap, commit, destroy;
+	struct wlr_box geom; /* geometry the borders were last drawn for */
+	Style style;         /* last dfwc.style() result, applied on top of settings */
+	int maximized, fullscreen, radius;
+	struct wl_listener map, unmap, commit, destroy, set_title, set_app_id;
 	struct wl_listener request_move, request_resize, request_maximize, request_fullscreen;
 	struct wl_listener deco_mode, deco_destroy;
 } Client;
@@ -119,6 +124,9 @@ static struct wlr_allocator *alloc;
 static struct wlr_scene *scene;
 static struct wlr_scene_tree *layers[NumLayers];
 static struct wlr_scene_rect *bg;
+static struct wlr_scene_rect *alarmrect; /* full-screen red blink on config errors */
+static struct wl_event_source *flashtimer;
+static int flashes; /* half-blinks left of the config error flash; odd = red */
 static struct wlr_output_layout *output_layout;
 static struct wlr_scene_output_layout *scene_layout;
 static struct wlr_xdg_shell *xdg_shell;
@@ -174,6 +182,8 @@ clientat(double x, double y, struct wlr_surface **surface, double *sx, double *s
 	struct wlr_scene_node *node = wlr_scene_node_at(&scene->tree.node, x, y, sx, sy);
 	struct wlr_scene_surface *ss;
 
+	if (node && node->type == WLR_SCENE_NODE_RECT)
+		return clientof(node); /* a border: the window, but no surface to send input to */
 	if (!node || node->type != WLR_SCENE_NODE_BUFFER
 	|| !(ss = wlr_scene_surface_try_from_buffer(wlr_scene_buffer_from_node(node))))
 		return NULL;
@@ -181,14 +191,13 @@ clientat(double x, double y, struct wlr_surface **surface, double *sx, double *s
 	return clientof(node);
 }
 
+static Client *clientfrom(struct wlr_surface *surface);
+static void restyle(Client *c);
+
 static Client *
 selclient(void)
 {
-	struct wlr_surface *s = seat->keyboard_state.focused_surface;
-	struct wlr_xdg_toplevel *t = s ? wlr_xdg_toplevel_try_from_wlr_surface(s) : NULL;
-	struct wlr_scene_tree *tree = t ? t->base->data : NULL;
-
-	return tree ? tree->node.data : NULL;
+	return clientfrom(seat->keyboard_state.focused_surface);
 }
 
 static Monitor *
@@ -212,8 +221,7 @@ clientbox(Client *c)
 {
 	struct wlr_box *geo = &c->toplevel->base->geometry;
 
-	return (struct wlr_box){ c->scene->node.x + geo->x, c->scene->node.y + geo->y,
-		geo->width, geo->height };
+	return (struct wlr_box){ c->scene->node.x, c->scene->node.y, geo->width, geo->height };
 }
 
 static void
@@ -221,10 +229,136 @@ resizeclient(Client *c, struct wlr_box b)
 {
 	/* shortcut: moves the window before the client has resized, so the
 	 * left/top edges jitter while resizing from them; wait for the commit */
-	struct wlr_box *geo = &c->toplevel->base->geometry;
-
-	wlr_scene_node_set_position(&c->scene->node, b.x - geo->x, b.y - geo->y);
+	wlr_scene_node_set_position(&c->scene->node, b.x, b.y);
 	wlr_xdg_toplevel_set_size(c->toplevel, MAX(b.width, 1), MAX(b.height, 1));
+}
+
+static struct wlr_box
+inset(Client *c, struct wlr_box b)
+{
+	/* the room left for the window once its borders fit inside b */
+	const Settings *s = &settings;
+	int e[4];
+
+	for (int i = 0; i < 4; i++)
+		e[i] = c->fullscreen ? 0 : s->border_width[i] + s->inner_border_width + s->border_gap;
+	return (struct wlr_box){ b.x + e[3], b.y + e[0], b.width - e[1] - e[3], b.height - e[0] - e[2] };
+}
+
+static void
+premul(const float in[4], float out[4])
+{
+	for (int i = 0; i < 3; i++)
+		out[i] = in[i] * in[3];
+	out[3] = in[3];
+}
+
+static void
+setring(struct wlr_scene_rect *r, struct wlr_box outer, struct wlr_box hole,
+	struct fx_corner_radii radii, int holeradius, const float color[4])
+{
+	float c[4];
+
+	premul(color, c);
+	wlr_scene_node_set_position(&r->node, outer.x, outer.y);
+	wlr_scene_rect_set_size(r, outer.width, outer.height);
+	wlr_scene_rect_set_corner_radii(r, radii);
+	/* the hole is cut out, so a translucent window never shows the border through it */
+	wlr_scene_rect_set_clipped_region(r, (struct clipped_region){
+		{ hole.x - outer.x, hole.y - outer.y, hole.width, hole.height },
+		corner_radii_all(holeradius) });
+	wlr_scene_rect_set_color(r, c);
+	wlr_scene_node_set_enabled(&r->node, outer.width > 0 && outer.height > 0);
+}
+
+static void
+stylebuffer(struct wlr_scene_buffer *buffer, int sx, int sy, void *data)
+{
+	Client *c = data;
+	struct wlr_scene_surface *ss = wlr_scene_surface_try_from_buffer(buffer);
+
+	wlr_scene_buffer_set_opacity(buffer, c->fullscreen ? 1 : c->style.opacity);
+	/* round only the main surface; popups and subsurfaces keep their shape */
+	if (ss && ss->surface == c->toplevel->base->surface)
+		wlr_scene_buffer_set_corner_radius(buffer, c->radius);
+}
+
+static void
+updateborders(Client *c)
+{
+	static const float red[4] = { 1, 0.2, 0.2, 1 };
+	const Settings *s = &settings;
+	struct wlr_box *geo = &c->toplevel->base->geometry, win = { 0, 0, geo->width, geo->height };
+	const float *outer = flashes % 2 ? red : c->style.border;
+	const float *inner = flashes % 2 ? red : c->style.inner_border;
+	const int *w = s->border_width, iw = s->inner_border_width, g = s->border_gap;
+	struct wlr_box in, gap, out;
+	int bare = c->fullscreen, R, L;
+
+	c->geom = *geo;
+	/* the surface draws its geometry at the root's origin */
+	wlr_scene_node_set_position(&c->surf->node, -geo->x, -geo->y);
+	/* square when maximized/fullscreen, and when the app draws its own shadows */
+	c->radius = c->maximized || c->fullscreen || geo->x || geo->y ? 0 : s->corner_radius;
+	R = c->radius;
+
+	/* from the window outwards: inner border, gap, outer border */
+	in = (struct wlr_box){ -iw, -iw, win.width + 2 * iw, win.height + 2 * iw };
+	gap = (struct wlr_box){ in.x - g, in.y - g, in.width + 2 * g, in.height + 2 * g };
+	out = (struct wlr_box){ gap.x - w[3], gap.y - w[0],
+		gap.width + w[1] + w[3], gap.height + w[0] + w[2] };
+
+	wlr_scene_node_set_enabled(&c->ring[1]->node, !bare && iw);
+	if (!bare && iw)
+		setring(c->ring[1], in, win, corner_radii_all(R ? R + iw : 0), R, inner);
+
+	wlr_scene_node_set_enabled(&c->ring[0]->node, !bare && !s->border_corners);
+	if (!bare && !s->border_corners)
+		setring(c->ring[0], out, gap, R ? corner_radii_new(R + iw + g + MAX(w[0], w[3]),
+			R + iw + g + MAX(w[0], w[1]), R + iw + g + MAX(w[2], w[1]),
+			R + iw + g + MAX(w[2], w[3])) : corner_radii_none(),
+			R ? R + iw + g : 0, outer);
+
+	/* corner brackets: a horizontal and a vertical arm at each corner */
+	L = MIN(s->border_corners, MIN(out.width, out.height) / 2);
+	struct wlr_box arms[8] = {
+		{ out.x, out.y, L, w[0] }, { out.x, out.y, w[3], L },
+		{ out.x + out.width - L, out.y, L, w[0] }, { out.x + out.width - w[1], out.y, w[1], L },
+		{ out.x, out.y + out.height - w[2], L, w[2] }, { out.x, out.y + out.height - L, w[3], L },
+		{ out.x + out.width - L, out.y + out.height - w[2], L, w[2] },
+		{ out.x + out.width - w[1], out.y + out.height - L, w[1], L },
+	};
+	for (int i = 0; i < 8; i++) {
+		wlr_scene_node_set_enabled(&c->arm[i]->node, !bare && s->border_corners);
+		if (!bare && s->border_corners)
+			setring(c->arm[i], arms[i], (struct wlr_box){ 0 }, corner_radii_none(), 0, outer);
+	}
+	wlr_scene_node_for_each_buffer(&c->surf->node, stylebuffer, c);
+}
+
+static void
+restyle(Client *c)
+{
+	/* the settings' look for this window, then whatever dfwc.style() says */
+	const Settings *s = &settings;
+	struct wlr_surface *f = seat->keyboard_state.focused_surface;
+	int focused = f == c->toplevel->base->surface;
+	WinInfo w = { c->toplevel->app_id, c->toplevel->title, focused, c->maximized, c->fullscreen };
+
+	memcpy(c->style.border, focused ? s->border_focused : s->border_unfocused, sizeof(float[4]));
+	memcpy(c->style.inner_border, focused ? s->inner_border_focused : s->inner_border_unfocused,
+		sizeof(float[4]));
+	c->style.opacity = s->opacity;
+	config_style(&w, &c->style);
+	updateborders(c);
+}
+
+static Client *
+clientfrom(struct wlr_surface *surface)
+{
+	struct wlr_xdg_toplevel *t = surface ? wlr_xdg_toplevel_try_from_wlr_surface(surface) : NULL;
+
+	return t && t->base->data ? ((struct wlr_scene_tree *)t->base->data)->node.data : NULL;
 }
 
 static Monitor *
@@ -241,9 +375,14 @@ static void
 kbfocus(struct wlr_surface *surface)
 {
 	struct wlr_keyboard *kb = wlr_seat_get_keyboard(seat);
+	Client *old = selclient(), *c;
 
 	wlr_seat_keyboard_notify_enter(seat, surface,
 		kb ? kb->keycodes : NULL, kb ? kb->num_keycodes : 0, kb ? &kb->modifiers : NULL);
+	if (old)
+		restyle(old);
+	if ((c = clientfrom(surface)))
+		restyle(c);
 }
 
 static void
@@ -275,6 +414,7 @@ focustop(void)
 
 	/* clear first so focusclient() doesn't deactivate a dying surface */
 	wlr_seat_keyboard_notify_clear_focus(seat);
+	/* shortcut: the cleared window isn't restyled; it's unmapping anyway */
 	if (!wl_list_empty(&clients))
 		focusclient(wl_container_of(clients.next, c, link), 0);
 }
@@ -343,8 +483,9 @@ setmaximized(Client *c, int on)
 	if (on != c->maximized && !c->fullscreen && m) {
 		if (on)
 			c->prev = clientbox(c);
-		resizeclient(c, on ? m->usable : c->prev);
 		c->maximized = on;
+		resizeclient(c, on ? inset(c, m->usable) : c->prev);
+		restyle(c);
 	}
 	wlr_xdg_toplevel_set_maximized(c->toplevel, c->maximized);
 }
@@ -359,8 +500,9 @@ setfullscreen(Client *c, int on)
 			c->prev = clientbox(c);
 		/* above bars, below overlays like lock screens */
 		wlr_scene_node_reparent(&c->scene->node, layers[on ? LyrFullscreen : LyrClients]);
-		resizeclient(c, on ? m->area : c->maximized ? m->usable : c->prev);
 		c->fullscreen = on;
+		resizeclient(c, on ? m->area : c->maximized ? inset(c, m->usable) : c->prev);
+		restyle(c);
 	}
 	wlr_xdg_toplevel_set_fullscreen(c->toplevel, c->fullscreen);
 }
@@ -617,15 +759,12 @@ static void
 motionnotify(uint32_t time)
 {
 	struct wlr_surface *surface = NULL;
-	struct wlr_box *geo;
 	double sx, sy;
 	Client *c;
 	int l, r, t, b, ex, ey;
 
 	if (cursor_mode == CurMove) {
-		geo = &grabc->toplevel->base->geometry;
-		wlr_scene_node_set_position(&grabc->scene->node,
-			cursor->x - grabx - geo->x, cursor->y - graby - geo->y);
+		wlr_scene_node_set_position(&grabc->scene->node, cursor->x - grabx, cursor->y - graby);
 		return;
 	}
 	if (cursor_mode == CurResize) {
@@ -680,7 +819,7 @@ buttonpress(struct wl_listener *listener, void *data)
 	struct wlr_surface *surface = NULL;
 	struct wlr_layer_surface_v1 *ls;
 	struct wlr_keyboard *kb;
-	struct wlr_box *geo;
+	struct wlr_box box;
 	double sx, sy, cx, cy;
 	Client *c;
 
@@ -694,9 +833,9 @@ buttonpress(struct wl_listener *listener, void *data)
 		if (c && kb && (wlr_keyboard_get_modifiers(kb) & MODMASK) == modkey
 		&& (event->button == BTN_LEFT || event->button == BTN_RIGHT)) {
 			/* Mod+left moves, Mod+right resizes from the nearest corner */
-			geo = &c->toplevel->base->geometry;
-			cx = c->scene->node.x + geo->x + geo->width / 2.0;
-			cy = c->scene->node.y + geo->y + geo->height / 2.0;
+			box = clientbox(c);
+			cx = box.x + box.width / 2.0;
+			cy = box.y + box.height / 2.0;
 			if (event->button == BTN_LEFT)
 				grab(c, CurMove, WLR_EDGE_NONE);
 			else
@@ -815,7 +954,7 @@ arrangelayers(Monitor *m)
 	m->usable = usable;
 	wl_list_for_each(c, &clients, link)
 		if (monof(c) == m && (c->maximized || c->fullscreen))
-			resizeclient(c, c->fullscreen ? m->area : m->usable);
+			resizeclient(c, c->fullscreen ? m->area : inset(c, m->usable));
 }
 
 static void
@@ -827,6 +966,8 @@ updatemons(struct wl_listener *listener, void *data)
 	wlr_output_layout_get_box(output_layout, NULL, &box);
 	wlr_scene_node_set_position(&bg->node, box.x, box.y);
 	wlr_scene_rect_set_size(bg, box.width, box.height);
+	wlr_scene_node_set_position(&alarmrect->node, box.x, box.y);
+	wlr_scene_rect_set_size(alarmrect, box.width, box.height);
 	wl_list_for_each(m, &mons, link) {
 		wlr_output_layout_get_box(output_layout, m->wlr, &m->area);
 		arrangelayers(m);
@@ -872,28 +1013,27 @@ static void
 mapnotify(struct wl_listener *listener, void *data)
 {
 	Client *c = wl_container_of(listener, c, map), *p;
-	struct wlr_box *geo = &c->toplevel->base->geometry, *pgeo, area, around;
+	struct wlr_box *geo = &c->toplevel->base->geometry, area, around;
 	int w, h;
 
 	wl_list_insert(&clients, &c->link);
+	wlr_scene_node_set_enabled(&c->scene->node, true);
 	outputbox(&area);
+	area = inset(c, area);
 	if (!wlr_box_empty(&area)) {
 		/* center on the screen, dialogs on their parent; shrink to fit */
 		around = area;
-		if (c->toplevel->parent) {
-			p = ((struct wlr_scene_tree *)c->toplevel->parent->base->data)->node.data;
-			pgeo = &p->toplevel->base->geometry;
-			around = (struct wlr_box){ p->scene->node.x + pgeo->x, p->scene->node.y + pgeo->y,
-				pgeo->width, pgeo->height };
-		}
+		if (c->toplevel->parent && (p = clientfrom(c->toplevel->parent->base->surface)))
+			around = clientbox(p);
 		w = MIN(geo->width, area.width);
 		h = MIN(geo->height, area.height);
 		if (w != geo->width || h != geo->height)
 			wlr_xdg_toplevel_set_size(c->toplevel, w, h);
 		wlr_scene_node_set_position(&c->scene->node,
-			MIN(MAX(around.x + (around.width - w) / 2, area.x), area.x + area.width - w) - geo->x,
-			MIN(MAX(around.y + (around.height - h) / 2, area.y), area.y + area.height - h) - geo->y);
+			MIN(MAX(around.x + (around.width - w) / 2, area.x), area.x + area.width - w),
+			MIN(MAX(around.y + (around.height - h) / 2, area.y), area.y + area.height - h));
 	}
+	restyle(c);
 	focusclient(c, 1);
 	if (c->toplevel->requested.fullscreen)
 		setfullscreen(c, 1);
@@ -910,6 +1050,7 @@ unmapnotify(struct wl_listener *listener, void *data)
 	/* an app that hides and shows its window starts over as a plain one */
 	c->maximized = c->fullscreen = 0;
 	wlr_scene_node_reparent(&c->scene->node, layers[LyrClients]);
+	wlr_scene_node_set_enabled(&c->scene->node, false);
 	if (c == grabc)
 		ungrab();
 	wl_list_remove(&c->link);
@@ -921,7 +1062,15 @@ static void
 commitnotify(struct wl_listener *listener, void *data)
 {
 	Client *c = wl_container_of(listener, c, commit);
+	struct wlr_box *geo = &c->toplevel->base->geometry;
 
+	if (c->toplevel->base->surface->mapped) {
+		if (!wlr_box_equal(geo, &c->geom))
+			updateborders(c);
+		else if (c->radius || c->style.opacity < 1)
+			wlr_scene_node_for_each_buffer(&c->surf->node, stylebuffer, c); /* new subsurfaces */
+		return;
+	}
 	if (!c->toplevel->base->initial_commit)
 		return;
 	/* 0x0 lets the client pick its own size */
@@ -984,11 +1133,32 @@ destroynotify(struct wl_listener *listener, void *data)
 	wl_list_remove(&c->request_resize.link);
 	wl_list_remove(&c->request_maximize.link);
 	wl_list_remove(&c->request_fullscreen.link);
+	wl_list_remove(&c->set_title.link);
+	wl_list_remove(&c->set_app_id.link);
+	wlr_scene_node_destroy(&c->scene->node);
 	if (c->deco) { /* its destroy fires after ours, when c is gone */
 		wl_list_remove(&c->deco_mode.link);
 		wl_list_remove(&c->deco_destroy.link);
 	}
 	free(c);
+}
+
+static void
+retitle(struct wl_listener *listener, void *data)
+{
+	Client *c = wl_container_of(listener, c, set_title);
+
+	if (c->toplevel->base->surface->mapped && config_hasstyle())
+		restyle(c);
+}
+
+static void
+reappid(struct wl_listener *listener, void *data)
+{
+	Client *c = wl_container_of(listener, c, set_app_id);
+
+	if (c->toplevel->base->surface->mapped && config_hasstyle())
+		restyle(c);
 }
 
 static void
@@ -1016,7 +1186,7 @@ static void
 createdeco(struct wl_listener *listener, void *data)
 {
 	struct wlr_xdg_toplevel_decoration_v1 *deco = data;
-	Client *c = ((struct wlr_scene_tree *)deco->toplevel->base->data)->node.data;
+	Client *c = clientfrom(deco->toplevel->base->surface);
 
 	c->deco = deco;
 	LISTEN(&deco->events.request_mode, &c->deco_mode, requestdecomode);
@@ -1028,10 +1198,10 @@ static void
 activate(struct wl_listener *listener, void *data)
 {
 	struct wlr_xdg_activation_v1_request_activate_event *event = data;
-	struct wlr_xdg_toplevel *t = wlr_xdg_toplevel_try_from_wlr_surface(event->surface);
+	Client *c = clientfrom(event->surface);
 
-	if (t && t->base->surface->mapped)
-		focusclient(((struct wlr_scene_tree *)t->base->data)->node.data, 1);
+	if (c && c->toplevel->base->surface->mapped)
+		focusclient(c, 1);
 }
 
 static void
@@ -1045,9 +1215,16 @@ createnotify(struct wl_listener *listener, void *data)
 		return;
 	}
 	c->toplevel = toplevel;
-	c->scene = wlr_scene_xdg_surface_create(layers[LyrClients], toplevel->base);
-	c->scene->node.data = c;
-	toplevel->base->data = c->scene;
+	c->scene = wlr_scene_tree_create(layers[LyrClients]);
+	wlr_scene_node_set_enabled(&c->scene->node, false); /* until mapped */
+	/* created first, so they sit below the surface */
+	for (size_t i = 0; i < LENGTH(c->ring); i++)
+		c->ring[i] = wlr_scene_rect_create(c->scene, 0, 0, (float[4]){ 0 });
+	for (size_t i = 0; i < LENGTH(c->arm); i++)
+		c->arm[i] = wlr_scene_rect_create(c->scene, 0, 0, (float[4]){ 0 });
+	c->surf = wlr_scene_xdg_surface_create(c->scene, toplevel->base);
+	c->scene->node.data = c->surf->node.data = c;
+	toplevel->base->data = c->surf;
 
 	LISTEN(&toplevel->base->surface->events.map, &c->map, mapnotify);
 	LISTEN(&toplevel->base->surface->events.unmap, &c->unmap, unmapnotify);
@@ -1057,6 +1234,8 @@ createnotify(struct wl_listener *listener, void *data)
 	LISTEN(&toplevel->events.request_resize, &c->request_resize, requestresize);
 	LISTEN(&toplevel->events.request_maximize, &c->request_maximize, requestmaximize);
 	LISTEN(&toplevel->events.request_fullscreen, &c->request_fullscreen, requestfullscreen);
+	LISTEN(&toplevel->events.set_title, &c->set_title, retitle);
+	LISTEN(&toplevel->events.set_app_id, &c->set_app_id, reappid);
 }
 
 static void
@@ -1072,8 +1251,8 @@ commitpopup(struct wl_listener *listener, void *data)
 	/* keep menus on screen; the box is relative to the toplevel's surface */
 	if ((c = clientof(&tree->node))) {
 		outputbox(&box);
-		box.x -= c->scene->node.x;
-		box.y -= c->scene->node.y;
+		box.x -= c->scene->node.x - c->toplevel->base->geometry.x;
+		box.y -= c->scene->node.y - c->toplevel->base->geometry.y;
 		wlr_xdg_popup_unconstrain_from_box(p->wlr, &box);
 	}
 	wlr_xdg_surface_schedule_configure(p->wlr->base);
@@ -1207,6 +1386,7 @@ applysettings(void)
 	Keyboard *kb;
 	Pointer *p;
 	Monitor *m;
+	Client *c;
 	char size[16];
 
 	modkey = s->modkey ? s->modkey : nested ? WLR_MODIFIER_ALT : WLR_MODIFIER_LOGO;
@@ -1241,14 +1421,40 @@ applysettings(void)
 		s->background[1] * s->background[3], s->background[2] * s->background[3], s->background[3] });
 
 	wl_list_for_each(m, &mons, link) {
-		if (m->wlr->scale == (float)s->scale)
-			continue;
-		wlr_output_state_init(&state);
-		wlr_output_state_set_scale(&state, s->scale);
-		wlr_output_commit_state(m->wlr, &state);
-		wlr_output_state_finish(&state);
+		if (m->wlr->scale != (float)s->scale) {
+			wlr_output_state_init(&state);
+			wlr_output_state_set_scale(&state, s->scale);
+			wlr_output_commit_state(m->wlr, &state);
+			wlr_output_state_finish(&state);
+		}
+		arrangelayers(m); /* border sizes change what maximized windows get */
 	}
+	wl_list_for_each(c, &clients, link)
+		restyle(c);
 	prev = *s;
+}
+
+static int
+flashstep(void *data)
+{
+	Client *c;
+
+	if (flashes > 0)
+		flashes--;
+	wl_list_for_each(c, &clients, link)
+		updateborders(c);
+	wlr_scene_node_set_enabled(&alarmrect->node, settings.error_alarm && flashes % 2);
+	if (flashes)
+		wl_event_source_timer_update(flashtimer, 150);
+	return 0;
+}
+
+void
+configerror(void)
+{
+	/* three red blinks of every border, plus the whole screen if error_alarm is set */
+	flashes = 6;
+	flashstep(NULL);
 }
 
 /* setup */
@@ -1288,6 +1494,7 @@ setup(void)
 	sigsrc[0] = wl_event_loop_add_signal(loop, SIGINT, quitsignal, NULL);
 	sigsrc[1] = wl_event_loop_add_signal(loop, SIGTERM, quitsignal, NULL);
 	rep.timer = wl_event_loop_add_timer(loop, repeatkey, NULL);
+	flashtimer = wl_event_loop_add_timer(loop, flashstep, NULL);
 
 	if (!(backend = wlr_backend_autocreate(loop, &session)))
 		die("couldn't create backend");
@@ -1300,6 +1507,9 @@ setup(void)
 	bg = wlr_scene_rect_create(&scene->tree, 0, 0, (float[4]){ 0 });
 	for (size_t i = 0; i < LENGTH(layers); i++)
 		layers[i] = wlr_scene_tree_create(&scene->tree);
+	alarmrect = wlr_scene_rect_create(layers[LyrOverlay], 0, 0, (float[4]){ 0.4, 0, 0, 0.4 });
+	alarmrect->accepts_input = false;
+	wlr_scene_node_set_enabled(&alarmrect->node, false);
 	/* dmabuf feedback lets fullscreen apps skip compositing (direct scanout) */
 	if (wlr_renderer_get_texture_formats(drw, WLR_BUFFER_CAP_DMABUF)) {
 		wlr_drm_create(dpy, drw);
@@ -1390,6 +1600,7 @@ cleanup(void)
 	for (size_t i = 0; i < LENGTH(sigsrc); i++)
 		wl_event_source_remove(sigsrc[i]);
 	wl_event_source_remove(rep.timer);
+	wl_event_source_remove(flashtimer);
 	for (size_t i = 0; i < LENGTH(listeners); i++)
 		wl_list_remove(&listeners[i]->link);
 	wlr_scene_node_destroy(&scene->tree.node);

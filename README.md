@@ -71,11 +71,33 @@ the bind while the key is held.
 | `touchpad_tap`, `touchpad_natural_scroll`, `touchpad_dwt` | true, false, true |
 | `touchpad_speed` | 0 (-1 to 1) |
 | `cursor_theme`, `cursor_size` | from `XCURSOR_THEME`, 24 |
-| `background` | `"#222222"` (`#rrggbb` or `#rrggbbaa`) |
+| `background` | `"#1d1f21"` (colors are `#rrggbb` or `#rrggbbaa`) |
 | `scale` | 1 (fractional works) |
 | `modkey` | `"auto"`: Super, or Alt when nested |
+| `border_width` | 2 (or `{ top, right, bottom, left }`) |
+| `border_focused`, `border_unfocused` | `"#81a2be"`, `"#373b41"` |
+| `inner_border_width` | 0: a second border hugging the window |
+| `inner_border_focused`, `inner_border_unfocused` | `"#1d1f21"` |
+| `border_gap` | 0: see-through space between window and border |
+| `border_corners` | 0: full border; N draws only N-pixel corner brackets |
+| `corner_radius` | 0: rounds windows and borders |
+| `opacity` | 1 (0.05 to 1) |
+| `error_alarm` | false: also blink the whole screen red on config errors |
 
-Every setting applies immediately when the file is saved.
+Every setting applies immediately when the file is saved. When a saved config has an
+error, all borders blink red three times.
+
+### Per-window looks
+
+    dfwc.style(function(win)
+        if win.app_id == "foot" then return { opacity = 0.85 } end
+        if not win.focused then return { border = "#444444" } end
+    end)
+
+The function gets `app_id`, `title`, `focused`, `maximized` and `fullscreen`, and may
+return `border`, `inner_border` and `opacity` to override the settings for that window.
+It runs only when one of those changes, never per frame. `dfwc.style(nil)` removes it.
+Fullscreen windows never get borders, rounding or transparency.
 
 ## Mouse
 

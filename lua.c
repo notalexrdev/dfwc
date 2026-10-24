@@ -34,10 +34,11 @@ typedef struct {
 	size_t nbinds;
 	char **autostart;
 	size_t nautostart;
+	int style; /* registry ref of the dfwc.style() function, or LUA_NOREF */
 	Settings settings;
 } Config;
 
-enum { Str, Int, Num, Bool, Color, Mod };
+enum { Str, Int, Num, Bool, Color, Mod, Sides };
 
 #define FIELD(N, T, MIN, MAX) { #N, T, offsetof(Settings, N), sizeof(((Settings *)0)->N), MIN, MAX }
 static const struct {
@@ -61,14 +62,34 @@ static const struct {
 	FIELD(background, Color, 0, 0),
 	FIELD(scale, Num, 0.25, 8),
 	FIELD(modkey, Mod, 0, 0),
+	FIELD(border_width, Sides, 0, 100),
+	FIELD(border_focused, Color, 0, 0),
+	FIELD(border_unfocused, Color, 0, 0),
+	FIELD(inner_border_width, Int, 0, 100),
+	FIELD(inner_border_focused, Color, 0, 0),
+	FIELD(inner_border_unfocused, Color, 0, 0),
+	FIELD(border_gap, Int, 0, 100),
+	FIELD(border_corners, Int, 0, 1000),
+	FIELD(corner_radius, Int, 0, 1000),
+	FIELD(opacity, Num, 0.05, 1),
+	FIELD(error_alarm, Bool, 0, 0),
 };
+
+#define HEX(C) { ((C) >> 16 & 0xff) / 255.0f, ((C) >> 8 & 0xff) / 255.0f, ((C) & 0xff) / 255.0f, 1 }
 
 static const Settings defaults = {
 	.repeat_rate = 25, .repeat_delay = 600,
 	.touchpad_tap = true, .touchpad_dwt = true,
 	.cursor_size = 24,
-	.background = { 0x22 / 255.0f, 0x22 / 255.0f, 0x22 / 255.0f, 1 },
+	/* dfwm's tomorrow-night colors */
+	.background = HEX(0x1d1f21),
 	.scale = 1,
+	.border_width = { 2, 2, 2, 2 },
+	.border_focused = HEX(0x81a2be),
+	.border_unfocused = HEX(0x373b41),
+	.inner_border_focused = HEX(0x1d1f21),
+	.inner_border_unfocused = HEX(0x1d1f21),
+	.opacity = 1,
 };
 
 static const struct { const char *name; uint32_t mask; } modnames[] = {
@@ -82,7 +103,7 @@ static const char defconfig[] = {
 #embed "init.lua"
 };
 
-static Config cur, load; /* running config, config being loaded */
+static Config cur = { .style = LUA_NOREF }, load = { .style = LUA_NOREF }; /* running, loading */
 static char dir[PATH_MAX], path[PATH_MAX + sizeof("/init.lua")];
 static struct wl_event_loop *evloop;
 static struct wl_event_source *pending; /* scheduled reload */
@@ -205,6 +226,22 @@ l_set(lua_State *L)
 		case Color:
 			ok = lua_type(L, -1) == LUA_TSTRING && parsecolor(lua_tostring(L, -1), p);
 			break;
+		case Sides: /* one width, or { top, right, bottom, left } */
+			if (lua_istable(L, -1)) {
+				for (int j = 0; ok && j < 4; j++) {
+					lua_rawgeti(L, -1, j + 1);
+					n = lua_tointegerx(L, -1, &ok);
+					ok = ok && n >= fields[i].min && n <= fields[i].max;
+					((int *)p)[j] = n;
+					lua_pop(L, 1);
+				}
+			} else {
+				n = lua_tointegerx(L, -1, &ok);
+				ok = ok && n >= fields[i].min && n <= fields[i].max;
+				for (int j = 0; ok && j < 4; j++)
+					((int *)p)[j] = n;
+			}
+			break;
 		case Mod:
 			str = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : "";
 			*(uint32_t *)p = 0;
@@ -261,6 +298,80 @@ l_autostart(lua_State *L)
 		return luaL_error(L, "out of memory");
 	load.autostart[load.nautostart++] = dup;
 	return 0;
+}
+
+static int
+l_style(lua_State *L)
+{
+	Config *c = L == load.L ? &load : &cur;
+
+	if (!lua_isnil(L, 1))
+		luaL_checktype(L, 1, LUA_TFUNCTION);
+	luaL_unref(L, LUA_REGISTRYINDEX, c->style);
+	lua_settop(L, 1);
+	c->style = lua_isnil(L, 1) ? LUA_NOREF : luaL_ref(L, LUA_REGISTRYINDEX);
+	if (c == &cur)
+		applysettings(); /* restyles every window */
+	return 0;
+}
+
+bool
+config_hasstyle(void)
+{
+	return cur.L && cur.style != LUA_NOREF;
+}
+
+void
+config_style(const WinInfo *w, Style *st)
+{
+	/* st holds the settings' look; the function's table overrides parts of it */
+	lua_State *L = cur.L;
+	const char *err = NULL;
+	double d;
+	int ok;
+
+	if (!config_hasstyle())
+		return;
+	lua_rawgeti(L, LUA_REGISTRYINDEX, cur.style);
+	lua_createtable(L, 0, 5);
+	lua_pushstring(L, w->app_id ? w->app_id : "");
+	lua_setfield(L, -2, "app_id");
+	lua_pushstring(L, w->title ? w->title : "");
+	lua_setfield(L, -2, "title");
+	lua_pushboolean(L, w->focused);
+	lua_setfield(L, -2, "focused");
+	lua_pushboolean(L, w->maximized);
+	lua_setfield(L, -2, "maximized");
+	lua_pushboolean(L, w->fullscreen);
+	lua_setfield(L, -2, "fullscreen");
+	if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+		wlr_log(WLR_ERROR, "config: style: %s", lua_tostring(L, -1));
+		lua_pop(L, 1);
+		return;
+	}
+	if (lua_istable(L, -1)) {
+		if (lua_getfield(L, -1, "border") != LUA_TNIL
+		&& (lua_type(L, -1) != LUA_TSTRING || !parsecolor(lua_tostring(L, -1), st->border)))
+			err = "border";
+		lua_pop(L, 1);
+		if (lua_getfield(L, -1, "inner_border") != LUA_TNIL
+		&& (lua_type(L, -1) != LUA_TSTRING || !parsecolor(lua_tostring(L, -1), st->inner_border)))
+			err = "inner_border";
+		lua_pop(L, 1);
+		if (lua_getfield(L, -1, "opacity") != LUA_TNIL) {
+			d = lua_tonumberx(L, -1, &ok);
+			if (ok && d >= 0.05 && d <= 1)
+				st->opacity = d;
+			else
+				err = "opacity";
+		}
+		lua_pop(L, 1);
+	} else if (!lua_isnil(L, -1)) {
+		err = "the result (should be a table)";
+	}
+	lua_pop(L, 1);
+	if (err)
+		wlr_log(WLR_ERROR, "config: style: bad %s", err);
 }
 
 static int
@@ -341,6 +452,7 @@ static const luaL_Reg api[] = {
 	{ "resize", l_resize },
 	{ "set", l_set },
 	{ "spawn", l_spawn },
+	{ "style", l_style },
 	{ NULL, NULL },
 };
 
@@ -353,7 +465,7 @@ freeconfig(Config *c)
 	for (size_t i = 0; i < c->nautostart; i++)
 		free(c->autostart[i]);
 	free(c->autostart);
-	*c = (Config){ 0 };
+	*c = (Config){ .style = LUA_NOREF };
 }
 
 static int
@@ -366,7 +478,7 @@ loadconfig(const char *file)
 		wlr_log(WLR_ERROR, "config: out of memory");
 		return 0;
 	}
-	load = (Config){ .L = L, .settings = defaults };
+	load = (Config){ .L = L, .style = LUA_NOREF, .settings = defaults };
 	luaL_openlibs(L);
 	luaL_newlib(L, api);
 	lua_setglobal(L, "dfwc");
@@ -383,11 +495,12 @@ loadconfig(const char *file)
 	|| lua_pcall(L, 0, 0, 0) != LUA_OK) {
 		wlr_log(WLR_ERROR, "config: %s", lua_tostring(L, -1));
 		freeconfig(&load);
+		configerror();
 		return 0;
 	}
 	freeconfig(&cur);
 	cur = load;
-	load = (Config){ 0 };
+	load = (Config){ .style = LUA_NOREF };
 	settings = cur.settings;
 	applysettings();
 	for (size_t i = 0; i < cur.nautostart; i++)

@@ -15,16 +15,36 @@ typedef struct {
 	double touchpad_speed;
 	char cursor_theme[64];
 	int cursor_size;
-	float background[4]; /* straight RGBA */
+	float background[4]; /* straight RGBA, like every color here */
 	double scale;
 	uint32_t modkey;     /* 0: Super, or Alt when nested */
+	int border_width[4]; /* top, right, bottom, left */
+	float border_focused[4], border_unfocused[4];
+	int inner_border_width, border_gap;
+	float inner_border_focused[4], inner_border_unfocused[4];
+	int border_corners;  /* 0: full border, else length of corner-only brackets */
+	int corner_radius;
+	double opacity;
+	bool error_alarm;
 } Settings;
+
+/* what a dfwc.style() function sees and may change */
+typedef struct {
+	const char *app_id, *title;
+	bool focused, maximized, fullscreen;
+} WinInfo;
+
+typedef struct {
+	float border[4], inner_border[4];
+	double opacity;
+} Style;
 
 enum { BindNone, BindDone, BindRepeat }; /* config_key() results */
 
 /* dfwc.c */
 extern uint32_t modkey;
 void applysettings(void);
+void configerror(void);
 void focusstack(int dir);
 void killclient(void);
 void moveresize(int dx, int dy, int dw, int dh);
@@ -39,3 +59,5 @@ void config_init(struct wl_event_loop *loop);
 int config_key(uint32_t mods, xkb_keysym_t sym);
 void config_reload(void);
 void config_finish(void);
+bool config_hasstyle(void);
+void config_style(const WinInfo *w, Style *st);
