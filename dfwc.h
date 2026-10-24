@@ -41,6 +41,10 @@ typedef struct {
 	bool smart_gaps;        /* a lone tiled window gets no gaps and no borders */
 	char tiled_drag[8];     /* moving a tiled window: "swap", "snap" or "float" */
 	char wallpaper[256];    /* built-in name ("girl", "matrix", "hands"), a PNG path, or "" */
+	int shadow_size;        /* blur radius of the shadow under floating windows; 0: none */
+	float shadow_color[4];
+	bool blur;              /* blur the wallpaper behind see-through windows */
+	int blur_radius, blur_passes;
 } Settings;
 
 /* what a dfwc.style() function sees and may change */

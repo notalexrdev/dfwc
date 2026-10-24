@@ -86,6 +86,8 @@ typedef struct {
 	int associated;      /* the X11 window has its Wayland surface (and listeners on it) */
 	struct wlr_scene_tree *scene;   /* at the window geometry's top-left: borders, then surf */
 	struct wlr_scene_tree *surf;    /* the app's surfaces; wlroots offsets them by its geometry */
+	struct wlr_scene_shadow *shadow; /* under floating windows */
+	struct wlr_scene_blur *blur;     /* the blurred wallpaper behind the window */
 	struct wlr_scene_rect *ring[2]; /* outer and inner border */
 	struct wlr_scene_rect *arm[8];  /* corner brackets, for border_corners */
 	struct wlr_xdg_toplevel_decoration_v1 *deco;
@@ -177,6 +179,7 @@ static struct {
 } menu = { .fd = -1 }; /* restore menu being read */
 static struct fcft_font *font;
 static struct wlr_scene_tree *walltree; /* above the background color, below layer-shell wallpapers */
+static struct wlr_scene_optimized_blur *optblur; /* the wallpaper, blurred once and cached */
 static pixman_image_t *wallimg; /* decoded wallpaper PNG */
 static struct wlr_output_layout *output_layout;
 static struct wlr_scene_output_layout *scene_layout;
@@ -523,7 +526,8 @@ updateborders(Client *c)
 	const float *inner = flashes % 2 ? red : c->style.inner_border;
 	const int *w = s->border_width, iw = s->inner_border_width, g = s->border_gap;
 	struct wlr_box in, gap, out;
-	int bare = c->fullscreen || c->smart, R, L;
+	float color[4];
+	int bare = c->fullscreen || c->smart, R, L, sh;
 
 	/* wlroots already offsets surf by the app's geometry, so the window's
 	 * visible part starts at the root's origin */
@@ -537,6 +541,25 @@ updateborders(Client *c)
 	gap = (struct wlr_box){ in.x - g, in.y - g, in.width + 2 * g, in.height + 2 * g };
 	out = (struct wlr_box){ gap.x - w[3], gap.y - w[0],
 		gap.width + w[1] + w[3], gap.height + w[0] + w[2] };
+
+	/* a shadow under floating windows, cut out under the window itself so a
+	 * see-through window never shows it */
+	sh = s->shadow_size;
+	wlr_scene_node_set_enabled(&c->shadow->node, sh && !bare && !c->tiled && !c->maximized);
+	if (sh && !bare && !c->tiled && !c->maximized) {
+		premul(s->shadow_color, color);
+		wlr_scene_node_set_position(&c->shadow->node, out.x - sh, out.y - sh);
+		wlr_scene_shadow_set_size(c->shadow, out.width + 2 * sh, out.height + 2 * sh);
+		wlr_scene_shadow_set_blur_sigma(c->shadow, sh / 2.0f);
+		wlr_scene_shadow_set_corner_radius(c->shadow, R ? R + iw + g + w[0] : 0);
+		wlr_scene_shadow_set_color(c->shadow, color);
+		wlr_scene_shadow_set_clipped_region(c->shadow, (struct clipped_region){
+			{ sh, sh, out.width, out.height }, corner_radii_all(R ? R + iw + g + w[0] : 0) });
+	}
+	/* blur only shows through see-through windows; opaque ones hide it for free */
+	wlr_scene_node_set_enabled(&c->blur->node, s->blur && !c->fullscreen);
+	wlr_scene_blur_set_size(c->blur, win.width, win.height);
+	wlr_scene_blur_set_corner_radius(c->blur, R);
 
 	wlr_scene_node_set_enabled(&c->ring[1]->node, !bare && iw);
 	if (!bare && iw)
@@ -1675,11 +1698,10 @@ tile(Monitor *m)
 	wl_list_for_each(c, &tiles, tlink) {
 		if (!istiled(c) || monof(c) != m)
 			continue;
-		if (!c->tiled) {
-			c->floatbox = clientbox(c);
+		if (!c->tiled || c->smart != smart) { /* borders, shadow and corners change */
+			if (!c->tiled)
+				c->floatbox = clientbox(c);
 			c->tiled = 1;
-		}
-		if (c->smart != smart) {
 			c->smart = smart;
 			restyle(c);
 		}
@@ -1766,6 +1788,8 @@ updatemons(struct wl_listener *listener, void *data)
 	wlr_scene_rect_set_size(bg, box.width, box.height);
 	wlr_scene_node_set_position(&alarmrect->node, box.x, box.y);
 	wlr_scene_rect_set_size(alarmrect, box.width, box.height);
+	wlr_scene_node_set_position(&optblur->node, box.x, box.y);
+	wlr_scene_optimized_blur_set_size(optblur, box.width, box.height);
 	wl_list_for_each(m, &mons, link) {
 		wlr_output_layout_get_box(output_layout, m->wlr, &m->area);
 		arrangelayers(m);
@@ -2051,6 +2075,12 @@ clientscene(Client *c, int layer, int framed)
 	c->scene = wlr_scene_tree_create(layers[layer]);
 	c->scene->node.data = c;
 	wlr_scene_node_set_enabled(&c->scene->node, false);
+	if (framed) {
+		c->shadow = wlr_scene_shadow_create(c->scene, 0, 0, 0, 0, (float[4]){ 0 });
+		c->blur = wlr_scene_blur_create(c->scene, 0, 0);
+		/* sample the cached wallpaper blur instead of blurring live: nearly free */
+		wlr_scene_blur_set_should_only_blur_bottom_layer(c->blur, true);
+	}
 	for (size_t i = 0; framed && i < LENGTH(c->ring); i++)
 		c->ring[i] = wlr_scene_rect_create(c->scene, 0, 0, (float[4]){ 0 });
 	for (size_t i = 0; framed && i < LENGTH(c->arm); i++)
@@ -2346,6 +2376,9 @@ commitlayer(struct wl_listener *listener, void *data)
 	struct wlr_layer_surface_v1 *ls = l->wlr;
 	struct wlr_layer_surface_v1_state old;
 
+	/* a new wallpaper frame (swaybg and friends): the blur cache is stale */
+	if (ls->current.layer == ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND)
+		wlr_scene_optimized_blur_mark_dirty(optblur);
 	if (ls->initial_commit) {
 		/* the first configure must fit the state the client asked for */
 		old = ls->current;
@@ -2445,6 +2478,10 @@ applysettings(void)
 	if (strcmp(s->wallpaper, prev.wallpaper))
 		wl_list_for_each(m, &mons, link)
 			drawwallpaper(m);
+	wlr_scene_set_blur_data(scene, s->blur_passes, s->blur_radius, 0.02, 0.9, 0.9, 1.1);
+	wlr_scene_node_set_enabled(&optblur->node, s->blur);
+	if (memcmp(s->background, prev.background, sizeof(s->background)))
+		wlr_scene_optimized_blur_mark_dirty(optblur);
 
 	wl_list_for_each(m, &mons, link) {
 		if (m->wlr->scale != (float)s->scale) {
@@ -2621,6 +2658,7 @@ drawwallpaper(Monitor *m)
 		wlr_scene_node_set_position(&m->wall->node, m->area.x, m->area.y);
 	}
 	wlr_buffer_drop(&t->base);
+	wlr_scene_optimized_blur_mark_dirty(optblur);
 }
 
 static void
@@ -2743,6 +2781,8 @@ setup(void)
 	draw.rect = wlr_scene_rect_create(layers[LyrTop], 0, 0, (float[4]){ 0 });
 	draw.rect->accepts_input = false;
 	wlr_scene_node_set_enabled(&draw.rect->node, false);
+	optblur = wlr_scene_optimized_blur_create(layers[LyrBottom], 0, 0);
+	wlr_scene_node_lower_to_bottom(&optblur->node); /* right above every wallpaper */
 	alarmrect = wlr_scene_rect_create(layers[LyrOverlay], 0, 0, (float[4]){ 0.4, 0, 0, 0.4 });
 	alarmrect->accepts_input = false;
 	wlr_scene_node_set_enabled(&alarmrect->node, false);

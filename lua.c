@@ -92,6 +92,11 @@ static const struct {
 	FIELD(smart_gaps, Bool, 0, 0),
 	CHOICE(tiled_drag, "swap", "snap", "float"),
 	FIELD(wallpaper, Wall, 0, 0),
+	FIELD(shadow_size, Int, 0, 200),
+	FIELD(shadow_color, Color, 0, 0),
+	FIELD(blur, Bool, 0, 0),
+	FIELD(blur_radius, Int, 1, 64),
+	FIELD(blur_passes, Int, 1, 10),
 };
 
 /* runtime changes to these survive a save, unless the config's value for them changed */
@@ -128,6 +133,11 @@ static const Settings defaults = {
 	.nmaster = 1,
 	.tiled_drag = "swap",
 	.wallpaper = "girl",
+	.shadow_size = 20,
+	.shadow_color = { 0, 0, 0, 0.6f },
+	.blur = true,
+	.blur_radius = 5,
+	.blur_passes = 3,
 };
 
 static const struct { const char *name; uint32_t mask; } modnames[] = {

@@ -121,12 +121,18 @@ the bind while the key is held.
 | `restore_menu` | `wmenu -i -p restore` in ink colors: gets `id title` lines, prints the picked one |
 | `box_timeout` | 5000 ms a drawn box waits for its window |
 | `snap` | 10 px: moved windows snap to screen and window edges (0 turns it off) |
+| `shadow_size`, `shadow_color` | 20 px, `"#00000099"`: soft shadow under floating windows (0: none) |
+| `blur` | true: the wallpaper shows blurred through see-through windows |
+| `blur_radius`, `blur_passes` | 5, 3: how strong the blur is |
 | `tiling` | false |
 | `layout` | `"tile"` |
 | `mfact`, `nmaster` | 0.55, 1 |
 | `gaps_inner`, `gaps_outer` | 0, 0 |
 | `smart_gaps` | false: a lone tiled window gets no gaps, borders or rounding |
 | `tiled_drag` | `"swap"`: dragging a tiled window onto another swaps them; `"snap"` puts it back in its tile; `"float"` makes it float |
+
+Blur samples a blurred copy of the wallpaper made once, so it costs next to nothing; what's
+behind a see-through window is the wallpaper, not other windows. Opaque windows hide it entirely.
 
 Every setting applies immediately when the file is saved. When a saved config has an
 error, all borders blink red three times and a black box at the top of the screen shows
