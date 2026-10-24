@@ -15,7 +15,11 @@ Pick **dfwc** on the login screen, or run `dfwc-session` from a TTY.
 The log goes to `~/.local/state/dfwc/log`; `dfwc-session -d` logs debug output.
 
 Recommended companions: `foot` (terminal), `wmenu` (launcher), `swaybg` (wallpaper),
-`xdg-desktop-portal-wlr` (screen sharing).
+`xdg-desktop-portal-wlr` (screen sharing), `mako` (notifications).
+
+Run a notification daemon: without one, apps that send a notification wait 25 s for
+KDE's or GNOME's to start, and Electron apps open that much slower.
+Screen sharing asks which screen to share through wmenu.
 
 Try it in a window inside your current desktop first: `./dfwc -s foot`.
 Nested, the modifier is Alt instead of Super.

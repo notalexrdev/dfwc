@@ -4,6 +4,7 @@ VERSION = 0.1
 # paths; most login screens only look in /usr/share for sessions
 PREFIX = /usr/local
 SESSIONDIR = /usr/share/wayland-sessions
+SYSCONFDIR = /etc
 
 # scenefx must come before wlroots so its wlr_scene_* symbols win
 PKGS = scenefx-0.5 wlroots-0.20 wayland-server wayland-protocols xkbcommon libinput lua pixman-1 libdrm
