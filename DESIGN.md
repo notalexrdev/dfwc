@@ -134,7 +134,7 @@ Successor to dfwm (X11 dwm fork in `~/Projekte/dfwm-ste/dwm`). Planning confirme
 
 ## Milestones
 
-1. **Usable floating desktop.**
+1. **Usable floating desktop.** Done 2026-10-24, all features tested nested in KDE; not yet run from a TTY.
    - Windows: drag-to-open, centered fallback, focus follows the mouse, move/resize by mouse and keys, maximize/fullscreen, snapping, always on top, minimize.
    - Config: Lua with reload on save and safety keys.
    - Protocols: those listed in round 1, plus portals.
