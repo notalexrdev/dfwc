@@ -2252,7 +2252,8 @@ mapnotify(struct wl_listener *listener, void *data)
 	focusclient(c, 1);
 	if (c->xs ? c->xs->fullscreen : c->toplevel->requested.fullscreen)
 		setfullscreen(c, 1);
-	else if (c->xs ? c->xs->maximized_vert && c->xs->maximized_horz : c->toplevel->requested.maximized)
+	else if (!claimed /* a drawn box beats the app's saved "maximized" */
+	&& (c->xs ? c->xs->maximized_vert && c->xs->maximized_horz : c->toplevel->requested.maximized))
 		setmaximized(c, 1);
 	arrange();
 }
@@ -2319,6 +2320,11 @@ commitnotify(struct wl_listener *listener, void *data)
 		/* 0x0 lets the client pick its own size */
 		wlr_xdg_toplevel_set_size(c->toplevel, 0, 0);
 	}
+	/* "tiled" on every edge: GTK apps like Firefox drop their rounded corners
+	 * and shadow margin, and take the size they're given over their saved one */
+	if (wl_resource_get_version(c->toplevel->resource) >= XDG_TOPLEVEL_STATE_TILED_TOP_SINCE_VERSION)
+		wlr_xdg_toplevel_set_tiled(c->toplevel,
+			WLR_EDGE_TOP | WLR_EDGE_BOTTOM | WLR_EDGE_LEFT | WLR_EDGE_RIGHT);
 	if (c->deco)
 		wlr_xdg_toplevel_decoration_v1_set_mode(c->deco,
 			WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
