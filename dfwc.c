@@ -7,6 +7,7 @@
 #include <drm_fourcc.h>
 #include <errno.h>
 #include <fcft/fcft.h>
+#include <png.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <limits.h>
@@ -171,6 +172,7 @@ static struct {
 static struct fcft_font *font;
 static struct fcft_font *bigfont; /* the wallpaper's mark */
 static struct wlr_scene_tree *walltree; /* above the background color, below layer-shell wallpapers */
+static pixman_image_t *wallimg; /* decoded wallpaper PNG */
 static struct wlr_output_layout *output_layout;
 static struct wlr_scene_output_layout *scene_layout;
 static struct wlr_xdg_shell *xdg_shell;
@@ -2094,7 +2096,7 @@ applysettings(void)
 
 	wlr_scene_rect_set_color(bg, (float[4]){ s->background[0] * s->background[3],
 		s->background[1] * s->background[3], s->background[2] * s->background[3], s->background[3] });
-	if (s->wallpaper != prev.wallpaper || memcmp(s->background, prev.background, sizeof(s->background))
+	if (strcmp(s->wallpaper, prev.wallpaper) || memcmp(s->background, prev.background, sizeof(s->background))
 	|| memcmp(s->border_focused, prev.border_focused, sizeof(s->border_focused)))
 		wl_list_for_each(m, &mons, link)
 			drawwallpaper(m);
@@ -2171,13 +2173,59 @@ pixcolor(const float c[4], float alpha)
 	return (pixman_color_t){ c[0] * a * 0xffff, c[1] * a * 0xffff, c[2] * a * 0xffff, a * 0xffff };
 }
 
+static pixman_image_t *
+wallimage(void)
+{
+	/* the wallpaper's PNG, decoded once and kept until the setting changes */
+	static char loaded[sizeof(settings.wallpaper) + 64];
+	char path[sizeof(loaded)];
+	png_image png = { .version = PNG_IMAGE_VERSION };
+	uint32_t *px;
+	int alpha;
+
+	if (strchr(settings.wallpaper, '/'))
+		snprintf(path, sizeof(path), "%s", settings.wallpaper);
+	else
+		snprintf(path, sizeof(path), PREFIX "/share/dfwc/wallpapers/%s.png", settings.wallpaper);
+	if (wallimg && !strcmp(path, loaded))
+		return wallimg;
+	if (wallimg)
+		pixman_image_unref(wallimg);
+	wallimg = NULL;
+	snprintf(loaded, sizeof(loaded), "%s", path);
+	if (!png_image_begin_read_from_file(&png, path)) {
+		wlr_log(WLR_ERROR, "wallpaper %s: %s", path, png.message);
+		return NULL;
+	}
+	alpha = png.format & PNG_FORMAT_FLAG_ALPHA;
+	png.format = PNG_FORMAT_BGRA; /* byte order of little-endian a8r8g8b8 */
+	if (!(wallimg = pixman_image_create_bits(PIXMAN_a8r8g8b8, png.width, png.height, NULL, 0))
+	|| !png_image_finish_read(&png, NULL, pixman_image_get_data(wallimg), pixman_image_get_stride(wallimg), NULL)) {
+		wlr_log(WLR_ERROR, "wallpaper %s: %s", path, png.message);
+		png_image_free(&png);
+		if (wallimg)
+			pixman_image_unref(wallimg);
+		return wallimg = NULL;
+	}
+	if (alpha) /* pixman wants premultiplied color */
+		for (px = pixman_image_get_data(wallimg); px < pixman_image_get_data(wallimg) + png.width * png.height; px++) {
+			uint32_t a = *px >> 24;
+			*px = a << 24 | ((*px >> 16 & 0xff) * a / 255) << 16 | ((*px >> 8 & 0xff) * a / 255) << 8
+				| (*px & 0xff) * a / 255;
+		}
+	return wallimg;
+}
+
 static void
 drawwallpaper(Monitor *m)
 {
-	/* a soft glow of the focus color over the background color and a faint
-	 * mark, drawn once per screen size; swaybg and friends draw over it */
+	/* a PNG scaled to cover the screen, or "glow": a soft glow of the focus
+	 * color with a faint mark; drawn once per screen size, swaybg draws over it */
 	const Settings *s = &settings;
 	int w = m->wlr->width, h = m->wlr->height, x;
+	pixman_image_t *src;
+	pixman_transform_t tr;
+	double sc;
 	float tint[4];
 	pixman_gradient_stop_t stops[2];
 	static const char mark[] = "dfwc";
@@ -2193,11 +2241,22 @@ drawwallpaper(Monitor *m)
 		m->wall = NULL;
 	}
 	m->wallbox = m->area;
-	if (!s->wallpaper || w <= 0 || h <= 0 || !(t = calloc(1, sizeof(*t))))
+	if (!*s->wallpaper || w <= 0 || h <= 0 || !(t = calloc(1, sizeof(*t))))
 		return;
 	if (!(t->img = pixman_image_create_bits(PIXMAN_a8r8g8b8, w, h, NULL, 0))) {
 		free(t);
 		return;
+	}
+	if (strcmp(s->wallpaper, "glow") && (src = wallimage())) {
+		/* cover: fill the screen, crop what sticks out, keep it centered */
+		sc = MAX((double)w / pixman_image_get_width(src), (double)h / pixman_image_get_height(src));
+		pixman_transform_init_scale(&tr, pixman_double_to_fixed(1 / sc), pixman_double_to_fixed(1 / sc));
+		pixman_image_set_transform(src, &tr);
+		pixman_image_set_filter(src, PIXMAN_FILTER_GOOD, NULL, 0);
+		pixman_image_composite32(PIXMAN_OP_SRC, src, NULL, t->img,
+			(pixman_image_get_width(src) * sc - w) / 2, (pixman_image_get_height(src) * sc - h) / 2,
+			0, 0, 0, 0, w, h);
+		goto done;
 	}
 	for (int i = 0; i < 4; i++)
 		tint[i] = s->background[i] + (s->border_focused[i] - s->background[i]) * 0.2f;
@@ -2229,6 +2288,7 @@ drawwallpaper(Monitor *m)
 		}
 		pixman_image_unref(fg);
 	}
+done:
 	wlr_buffer_init(&t->base, &textbufimpl, w, h);
 	if ((m->wall = wlr_scene_buffer_create(walltree, &t->base))) {
 		wlr_scene_buffer_set_dest_size(m->wall, m->area.width, m->area.height);
@@ -2473,6 +2533,7 @@ cleanup(void)
 		&cursor_motion, &cursor_motion_absolute, &cursor_button, &cursor_axis, &cursor_frame,
 		&request_cursor, &request_sel, &request_psel, &request_shape, &layout_change,
 		&new_layer, &new_deco, &request_activate };
+	Monitor *m;
 
 	wl_display_destroy_clients(dpy);
 	config_finish();
@@ -2489,9 +2550,14 @@ cleanup(void)
 		wlr_scene_node_destroy(&errbox->node);
 	fcft_destroy(font);
 	fcft_destroy(bigfont);
+	if (wallimg)
+		pixman_image_unref(wallimg);
 	fcft_fini();
 	for (size_t i = 0; i < LENGTH(listeners); i++)
 		wl_list_remove(&listeners[i]->link);
+	/* the scene takes the wallpapers with it; destroymon must not free them again */
+	wl_list_for_each(m, &mons, link)
+		m->wall = NULL;
 	wlr_scene_node_destroy(&scene->tree.node);
 	wlr_xcursor_manager_destroy(cursor_mgr);
 	wlr_cursor_destroy(cursor);

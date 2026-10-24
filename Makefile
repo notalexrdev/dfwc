@@ -31,13 +31,15 @@ install: all
 		$(DESTDIR)$(SYSCONFDIR)/xdg/xdg-desktop-portal-wlr
 	cp -f dfwc dfwc-session $(DESTDIR)$(PREFIX)/bin
 	cp -f init.lua $(DESTDIR)$(PREFIX)/share/dfwc/init.lua
+	mkdir -p $(DESTDIR)$(PREFIX)/share/dfwc/wallpapers
+	cp -f wallpapers/*.png $(DESTDIR)$(PREFIX)/share/dfwc/wallpapers
 	cp -f dfwc-portals.conf $(DESTDIR)$(PREFIX)/share/xdg-desktop-portal
 	sed 's|PREFIX|$(PREFIX)|' dfwc.desktop > $(DESTDIR)$(SESSIONDIR)/dfwc.desktop
 	cp -f xdpw.conf $(DESTDIR)$(SYSCONFDIR)/xdg/xdg-desktop-portal-wlr/dfwc
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/dfwc $(DESTDIR)$(PREFIX)/bin/dfwc-session \
-		$(DESTDIR)$(PREFIX)/share/dfwc/init.lua \
+		$(DESTDIR)$(PREFIX)/share/dfwc/init.lua $(DESTDIR)$(PREFIX)/share/dfwc/wallpapers/*.png \
 		$(DESTDIR)$(PREFIX)/share/xdg-desktop-portal/dfwc-portals.conf \
 		$(DESTDIR)$(SESSIONDIR)/dfwc.desktop \
 		$(DESTDIR)$(SYSCONFDIR)/xdg/xdg-desktop-portal-wlr/dfwc

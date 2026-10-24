@@ -39,7 +39,7 @@ typedef struct {
 	Settings settings;
 } Config;
 
-enum { Str, Int, Num, Bool, Color, Mod, Sides };
+enum { Str, Int, Num, Bool, Color, Mod, Sides, Wall };
 
 #define FIELD(N, T, MIN, MAX) { #N, T, offsetof(Settings, N), sizeof(((Settings *)0)->N), MIN, MAX, NULL }
 #define CHOICE(N, ...) { #N, Str, offsetof(Settings, N), sizeof(((Settings *)0)->N), 0, 0, \
@@ -89,7 +89,7 @@ static const struct {
 	FIELD(gaps_outer, Int, 0, 200),
 	FIELD(smart_gaps, Bool, 0, 0),
 	CHOICE(tiled_drag, "swap", "snap", "float"),
-	FIELD(wallpaper, Bool, 0, 0),
+	FIELD(wallpaper, Wall, 0, 0),
 };
 
 /* runtime changes to these survive a save, unless the config's value for them changed */
@@ -125,7 +125,7 @@ static const Settings defaults = {
 	.mfact = 0.55,
 	.nmaster = 1,
 	.tiled_drag = "swap",
-	.wallpaper = true,
+	.wallpaper = "girl",
 };
 
 static const struct { const char *name; uint32_t mask; } modnames[] = {
@@ -296,6 +296,24 @@ l_set(lua_State *L)
 				for (int j = 0; ok && j < 4; j++)
 					((int *)p)[j] = n;
 			}
+			break;
+		case Wall: /* true: the default, false: none, a built-in name, or a PNG path */
+			if (lua_isboolean(L, -1)) {
+				snprintf(p, fields[i].size, "%s", lua_toboolean(L, -1) ? defaults.wallpaper : "");
+				break;
+			}
+			if (!(ok = lua_type(L, -1) == LUA_TSTRING))
+				break;
+			str = lua_tostring(L, -1);
+			if (!strcmp(str, "girl") || !strcmp(str, "matrix") || !strcmp(str, "hands") || !strcmp(str, "glow")) {
+				snprintf(p, fields[i].size, "%s", str);
+				break;
+			}
+			if (snprintf(p, fields[i].size, "%s%s", strncmp(str, "~/", 2) ? "" : getenv("HOME"),
+					str + (strncmp(str, "~/", 2) ? 0 : 1)) >= (int)fields[i].size)
+				return luaL_error(L, "%s: path too long", key);
+			if (access(p, R_OK))
+				return luaL_error(L, "%s: can't read %s (built-ins: girl, matrix, hands, glow)", key, (char *)p);
 			break;
 		case Mod:
 			str = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : "";

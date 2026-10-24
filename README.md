@@ -6,7 +6,7 @@ which reloads every time you save it.
 
 ## Build and install
 
-Needs `wlroots0.20 scenefx lua libinput fcft wayland-protocols` and a C23 compiler (`#embed`).
+Needs `wlroots0.20 scenefx lua libinput fcft libpng wayland-protocols` and a C23 compiler (`#embed`).
 
     make
     sudo make install
@@ -89,7 +89,7 @@ the bind while the key is held.
 | `touchpad_speed` | 0 (-1 to 1) |
 | `cursor_theme`, `cursor_size` | from `XCURSOR_THEME`, 24 |
 | `background` | `"#1d1f21"` (colors are `#rrggbb` or `#rrggbbaa`) |
-| `wallpaper` | true: a built-in wallpaper (a soft glow and a faint dfwc mark); false: plain `background` |
+| `wallpaper` | `"girl"`; built-ins `"girl"`, `"matrix"`, `"hands"`, `"glow"`, or a path to your own PNG; `false` for plain `background` |
 | `scale` | 1 (fractional works) |
 | `modkey` | `"auto"`: Super, or Alt when nested |
 | `border_width` | 2 (or `{ top, right, bottom, left }`) |
