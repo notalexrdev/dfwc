@@ -89,15 +89,16 @@ the bind while the key is held.
 | `touchpad_speed` | 0 (-1 to 1) |
 | `cursor_theme`, `cursor_size` | from `XCURSOR_THEME`, 24 |
 | `background` | `"#1d1f21"` (colors are `#rrggbb` or `#rrggbbaa`) |
+| `wallpaper` | true: a built-in wallpaper (a soft glow and a faint dfwc mark); false: plain `background` |
 | `scale` | 1 (fractional works) |
 | `modkey` | `"auto"`: Super, or Alt when nested |
 | `border_width` | 2 (or `{ top, right, bottom, left }`) |
-| `border_focused`, `border_unfocused` | `"#81a2be"`, `"#373b41"` |
+| `border_focused`, `border_unfocused` | `"#9a9ea3"`, `"#3c3f43"` (greys) |
 | `inner_border_width` | 0: a second border hugging the window |
 | `inner_border_focused`, `inner_border_unfocused` | `"#1d1f21"` |
 | `border_gap` | 0: see-through space between window and border |
 | `border_corners` | 0: full border; N draws only N-pixel corner brackets |
-| `corner_radius` | 2: rounds windows and borders (0 is square) |
+| `corner_radius` | 0: square; N rounds windows and borders |
 | `opacity` | 1 (0.05 to 1) |
 | `error_alarm_fullscreen` | false: also blink the whole screen red on config errors |
 | `launcher` | `"wmenu-run"`: runs after you draw a box |

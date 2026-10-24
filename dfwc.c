@@ -116,6 +116,8 @@ typedef struct {
 	struct wlr_output *wlr;
 	struct wlr_box area, usable; /* layout coords; usable leaves out bars' exclusive zones */
 	struct wl_list layers[4];    /* LayerSurface, indexed by zwlr_layer_shell_v1_layer */
+	struct wlr_scene_buffer *wall; /* built-in wallpaper */
+	struct wlr_box wallbox;        /* area it was drawn for */
 	struct wl_listener frame, request_state, destroy;
 } Monitor;
 
@@ -167,6 +169,8 @@ static struct {
 	size_t len;
 } menu = { .fd = -1 }; /* restore menu being read */
 static struct fcft_font *font;
+static struct fcft_font *bigfont; /* the wallpaper's mark */
+static struct wlr_scene_tree *walltree; /* above the background color, below layer-shell wallpapers */
 static struct wlr_output_layout *output_layout;
 static struct wlr_scene_output_layout *scene_layout;
 static struct wlr_xdg_shell *xdg_shell;
@@ -237,6 +241,7 @@ clientat(double x, double y, struct wlr_surface **surface, double *sx, double *s
 static Client *clientfrom(struct wlr_surface *surface);
 static void restyle(Client *c);
 static void placeerror(void);
+static void drawwallpaper(Monitor *m);
 static void snap(Client *c, int *x, int *y, int dx, int dy);
 static void floatout(Client *c);
 static int istiled(Client *c);
@@ -1360,6 +1365,8 @@ destroymon(struct wl_listener *listener, void *data)
 	Monitor *m = wl_container_of(listener, m, destroy);
 	LayerSurface *l, *tmp;
 
+	if (m->wall)
+		wlr_scene_node_destroy(&m->wall->node);
 	for (size_t i = 0; i < LENGTH(m->layers); i++)
 		wl_list_for_each_safe(l, tmp, &m->layers[i], link)
 			wlr_layer_surface_v1_destroy(l->wlr);
@@ -1588,6 +1595,8 @@ updatemons(struct wl_listener *listener, void *data)
 	wl_list_for_each(m, &mons, link) {
 		wlr_output_layout_get_box(output_layout, m->wlr, &m->area);
 		arrangelayers(m);
+		if (!wlr_box_equal(&m->area, &m->wallbox))
+			drawwallpaper(m);
 	}
 	placeerror();
 }
@@ -2085,6 +2094,10 @@ applysettings(void)
 
 	wlr_scene_rect_set_color(bg, (float[4]){ s->background[0] * s->background[3],
 		s->background[1] * s->background[3], s->background[2] * s->background[3], s->background[3] });
+	if (s->wallpaper != prev.wallpaper || memcmp(s->background, prev.background, sizeof(s->background))
+	|| memcmp(s->border_focused, prev.border_focused, sizeof(s->border_focused)))
+		wl_list_for_each(m, &mons, link)
+			drawwallpaper(m);
 
 	wl_list_for_each(m, &mons, link) {
 		if (m->wlr->scale != (float)s->scale) {
@@ -2148,6 +2161,81 @@ static const struct wlr_buffer_impl textbufimpl = {
 	.begin_data_ptr_access = textbufaccess,
 	.end_data_ptr_access = textbufend,
 };
+
+static pixman_color_t
+pixcolor(const float c[4], float alpha)
+{
+	/* premultiplied, 16 bits per channel */
+	float a = c[3] * alpha;
+
+	return (pixman_color_t){ c[0] * a * 0xffff, c[1] * a * 0xffff, c[2] * a * 0xffff, a * 0xffff };
+}
+
+static void
+drawwallpaper(Monitor *m)
+{
+	/* a soft glow of the focus color over the background color and a faint
+	 * mark, drawn once per screen size; swaybg and friends draw over it */
+	const Settings *s = &settings;
+	int w = m->wlr->width, h = m->wlr->height, x;
+	float tint[4];
+	pixman_gradient_stop_t stops[2];
+	static const char mark[] = "dfwc";
+	pixman_point_fixed_t center;
+	pixman_color_t markcolor;
+	pixman_image_t *glow, *fg;
+	const struct fcft_glyph *g;
+	char name[64];
+	TextBuffer *t;
+
+	if (m->wall) {
+		wlr_scene_node_destroy(&m->wall->node);
+		m->wall = NULL;
+	}
+	m->wallbox = m->area;
+	if (!s->wallpaper || w <= 0 || h <= 0 || !(t = calloc(1, sizeof(*t))))
+		return;
+	if (!(t->img = pixman_image_create_bits(PIXMAN_a8r8g8b8, w, h, NULL, 0))) {
+		free(t);
+		return;
+	}
+	for (int i = 0; i < 4; i++)
+		tint[i] = s->background[i] + (s->border_focused[i] - s->background[i]) * 0.2f;
+	stops[0] = (pixman_gradient_stop_t){ 0, pixcolor(tint, 1) };
+	stops[1] = (pixman_gradient_stop_t){ pixman_int_to_fixed(1), pixcolor(s->background, 1) };
+	center = (pixman_point_fixed_t){ pixman_double_to_fixed(w * 0.28), pixman_double_to_fixed(h * 0.22) };
+	if ((glow = pixman_image_create_radial_gradient(&center, &center, 0,
+			pixman_double_to_fixed(hypot(w, h) * 0.8), stops, 2))) {
+		pixman_image_set_dither(t->img, PIXMAN_DITHER_GOOD); /* no banding in the dark tones */
+		pixman_image_composite32(PIXMAN_OP_SRC, glow, NULL, t->img, 0, 0, 0, 0, 0, 0, w, h);
+		pixman_image_unref(glow);
+	}
+	/* the mark, bottom right */
+	snprintf(name, sizeof(name), "monospace:pixelsize=%d:weight=bold", MAX(h / 7, 24));
+	if (!bigfont || bigfont->height < h / 9 || bigfont->height > h / 5)
+		bigfont = (fcft_destroy(bigfont), fcft_from_name(1, (const char *[]){ name }, NULL));
+	markcolor = pixcolor(s->border_focused, 0.07f); /* a watermark, not a label */
+	if (bigfont && (fg = pixman_image_create_solid_fill(&markcolor))) {
+		x = w - bigfont->height / 2;
+		for (const char *p = mark; *p; p++) /* right-aligned to the margin */
+			if ((g = fcft_rasterize_char_utf32(bigfont, *p, FCFT_SUBPIXEL_NONE)))
+				x -= g->advance.x;
+		for (const char *p = mark; *p; p++) {
+			if (!(g = fcft_rasterize_char_utf32(bigfont, *p, FCFT_SUBPIXEL_NONE)))
+				continue;
+			pixman_image_composite32(PIXMAN_OP_OVER, fg, g->pix, t->img, 0, 0, 0, 0,
+				x + g->x, h - bigfont->height * 5 / 4 + bigfont->ascent - g->y, g->width, g->height);
+			x += g->advance.x;
+		}
+		pixman_image_unref(fg);
+	}
+	wlr_buffer_init(&t->base, &textbufimpl, w, h);
+	if ((m->wall = wlr_scene_buffer_create(walltree, &t->base))) {
+		wlr_scene_buffer_set_dest_size(m->wall, m->area.width, m->area.height);
+		wlr_scene_node_set_position(&m->wall->node, m->area.x, m->area.y);
+	}
+	wlr_buffer_drop(&t->base);
+}
 
 static void
 placeerror(void)
@@ -2285,6 +2373,7 @@ setup(void)
 
 	scene = wlr_scene_create();
 	bg = wlr_scene_rect_create(&scene->tree, 0, 0, (float[4]){ 0 });
+	walltree = wlr_scene_tree_create(&scene->tree);
 	for (size_t i = 0; i < LENGTH(layers); i++)
 		layers[i] = wlr_scene_tree_create(&scene->tree);
 	draw.rect = wlr_scene_rect_create(layers[LyrTop], 0, 0, (float[4]){ 0 });
@@ -2399,6 +2488,7 @@ cleanup(void)
 	if (errbox)
 		wlr_scene_node_destroy(&errbox->node);
 	fcft_destroy(font);
+	fcft_destroy(bigfont);
 	fcft_fini();
 	for (size_t i = 0; i < LENGTH(listeners); i++)
 		wl_list_remove(&listeners[i]->link);

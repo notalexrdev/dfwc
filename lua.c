@@ -89,6 +89,7 @@ static const struct {
 	FIELD(gaps_outer, Int, 0, 200),
 	FIELD(smart_gaps, Bool, 0, 0),
 	CHOICE(tiled_drag, "swap", "snap", "float"),
+	FIELD(wallpaper, Bool, 0, 0),
 };
 
 /* runtime changes to these survive a save, unless the config's value for them changed */
@@ -111,9 +112,8 @@ static const Settings defaults = {
 	.background = HEX(0x1d1f21),
 	.scale = 1,
 	.border_width = { 2, 2, 2, 2 },
-	.corner_radius = 2,
-	.border_focused = HEX(0x81a2be),
-	.border_unfocused = HEX(0x373b41),
+	.border_focused = HEX(0x9a9ea3),
+	.border_unfocused = HEX(0x3c3f43),
 	.inner_border_focused = HEX(0x1d1f21),
 	.inner_border_unfocused = HEX(0x1d1f21),
 	.opacity = 1,
@@ -125,6 +125,7 @@ static const Settings defaults = {
 	.mfact = 0.55,
 	.nmaster = 1,
 	.tiled_drag = "swap",
+	.wallpaper = true,
 };
 
 static const struct { const char *name; uint32_t mask; } modnames[] = {
