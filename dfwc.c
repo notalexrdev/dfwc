@@ -85,6 +85,8 @@ typedef struct {
 	struct wlr_box geom; /* geometry the borders were last drawn for */
 	Style style;         /* last dfwc.style() result, applied on top of settings */
 	int maximized, fullscreen, ontop, minimized, radius;
+	uint32_t anchor;     /* edges a mouse resize grows, so the opposite ones stay put */
+	int ax, ay;          /* right and bottom edges to keep while anchored */
 	unsigned int id;     /* names the window in the restore menu */
 	struct wl_listener map, unmap, commit, destroy, set_title, set_app_id;
 	struct wl_listener request_move, request_resize, request_maximize, request_fullscreen;
@@ -265,6 +267,7 @@ resizeclient(Client *c, struct wlr_box b)
 	/* shortcut: moves before the app has redrawn at the new size, so a window
 	 * growing left/up shows a frame of misplaced content; fine for jumps
 	 * like maximize, mouse resizes go through commitnotify instead */
+	c->anchor = 0;
 	wlr_scene_node_set_position(&c->scene->node, b.x, b.y);
 	wlr_xdg_toplevel_set_size(c->toplevel, MAX(b.width, 1), MAX(b.height, 1));
 }
@@ -492,6 +495,7 @@ grab(Client *c, int mode, uint32_t edges)
 		c->maximized = 0;
 		wlr_xdg_toplevel_set_maximized(c->toplevel, false);
 	}
+	c->anchor = 0;
 	grabc = c;
 	cursor_mode = mode;
 	grabedges = edges;
@@ -1071,6 +1075,9 @@ motionnotify(uint32_t time)
 			b = MAX(ey, t + 1);
 		/* only ask for the size; commitnotify moves the window once the app
 		 * has drawn it, keeping the opposite edges still */
+		grabc->anchor = grabedges & (WLR_EDGE_LEFT | WLR_EDGE_TOP);
+		grabc->ax = grabgeo.x + grabgeo.width;
+		grabc->ay = grabgeo.y + grabgeo.height;
 		wlr_xdg_toplevel_set_size(grabc->toplevel, r - l, b - t);
 		return;
 	}
@@ -1385,10 +1392,15 @@ commitnotify(struct wl_listener *listener, void *data)
 	struct wlr_box *geo = &c->toplevel->base->geometry, box;
 
 	if (c->toplevel->base->surface->mapped) {
-		if (c == grabc && cursor_mode == CurResize && (grabedges & (WLR_EDGE_LEFT | WLR_EDGE_TOP)))
+		if (c->anchor) {
 			wlr_scene_node_set_position(&c->scene->node,
-				grabedges & WLR_EDGE_LEFT ? grabgeo.x + grabgeo.width - geo->width : c->scene->node.x,
-				grabedges & WLR_EDGE_TOP ? grabgeo.y + grabgeo.height - geo->height : c->scene->node.y);
+				c->anchor & WLR_EDGE_LEFT ? c->ax - geo->width : c->scene->node.x,
+				c->anchor & WLR_EDGE_TOP ? c->ay - geo->height : c->scene->node.y);
+			/* the drag is over and the app reached the last size asked for */
+			if (c != grabc && geo->width == c->toplevel->scheduled.width
+			&& geo->height == c->toplevel->scheduled.height)
+				c->anchor = 0;
+		}
 		if (!wlr_box_equal(geo, &c->geom))
 			updateborders(c);
 		else if (c->radius || c->style.opacity < 1)
