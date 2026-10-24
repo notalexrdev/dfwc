@@ -176,7 +176,6 @@ static struct {
 	size_t len;
 } menu = { .fd = -1 }; /* restore menu being read */
 static struct fcft_font *font;
-static struct fcft_font *bigfont; /* the wallpaper's mark */
 static struct wlr_scene_tree *walltree; /* above the background color, below layer-shell wallpapers */
 static pixman_image_t *wallimg; /* decoded wallpaper PNG */
 static struct wlr_output_layout *output_layout;
@@ -2429,8 +2428,7 @@ applysettings(void)
 
 	wlr_scene_rect_set_color(bg, (float[4]){ s->background[0] * s->background[3],
 		s->background[1] * s->background[3], s->background[2] * s->background[3], s->background[3] });
-	if (strcmp(s->wallpaper, prev.wallpaper) || memcmp(s->background, prev.background, sizeof(s->background))
-	|| memcmp(s->border_focused, prev.border_focused, sizeof(s->border_focused)))
+	if (strcmp(s->wallpaper, prev.wallpaper))
 		wl_list_for_each(m, &mons, link)
 			drawwallpaper(m);
 
@@ -2531,15 +2529,6 @@ drawtext(pixman_image_t *dst, struct fcft_font *f, const char *str, int x, int y
 	return w;
 }
 
-static pixman_color_t
-pixcolor(const float c[4], float alpha)
-{
-	/* premultiplied, 16 bits per channel */
-	float a = c[3] * alpha;
-
-	return (pixman_color_t){ c[0] * a * 0xffff, c[1] * a * 0xffff, c[2] * a * 0xffff, a * 0xffff };
-}
-
 static pixman_image_t *
 wallimage(void)
 {
@@ -2586,64 +2575,32 @@ wallimage(void)
 static void
 drawwallpaper(Monitor *m)
 {
-	/* a PNG scaled to cover the screen, or "glow": a soft glow of the focus
-	 * color with a faint mark; drawn once per screen size, swaybg draws over it */
-	const Settings *s = &settings;
+	/* the PNG scaled to cover the screen, cropped evenly, drawn once per
+	 * screen size; without one the background color shows, swaybg draws over it */
 	int w = m->wlr->width, h = m->wlr->height;
 	pixman_image_t *src;
 	pixman_transform_t tr;
-	double sc;
-	float tint[4];
-	pixman_gradient_stop_t stops[2];
-	pixman_point_fixed_t center;
-	pixman_color_t markcolor;
-	pixman_image_t *glow;
-	char name[64];
 	TextBuffer *t;
+	double sc;
 
 	if (m->wall) {
 		wlr_scene_node_destroy(&m->wall->node);
 		m->wall = NULL;
 	}
 	m->wallbox = m->area;
-	if (!*s->wallpaper || w <= 0 || h <= 0 || !(t = calloc(1, sizeof(*t))))
+	if (!*settings.wallpaper || w <= 0 || h <= 0 || !(src = wallimage()) || !(t = calloc(1, sizeof(*t))))
 		return;
 	if (!(t->img = pixman_image_create_bits(PIXMAN_a8r8g8b8, w, h, NULL, 0))) {
 		free(t);
 		return;
 	}
-	if (strcmp(s->wallpaper, "glow") && (src = wallimage())) {
-		/* cover: fill the screen, crop what sticks out, keep it centered */
-		sc = MAX((double)w / pixman_image_get_width(src), (double)h / pixman_image_get_height(src));
-		pixman_transform_init_scale(&tr, pixman_double_to_fixed(1 / sc), pixman_double_to_fixed(1 / sc));
-		pixman_image_set_transform(src, &tr);
-		pixman_image_set_filter(src, PIXMAN_FILTER_GOOD, NULL, 0);
-		pixman_image_composite32(PIXMAN_OP_SRC, src, NULL, t->img,
-			(pixman_image_get_width(src) * sc - w) / 2, (pixman_image_get_height(src) * sc - h) / 2,
-			0, 0, 0, 0, w, h);
-		goto done;
-	}
-	for (int i = 0; i < 4; i++)
-		tint[i] = s->background[i] + (s->border_focused[i] - s->background[i]) * 0.2f;
-	stops[0] = (pixman_gradient_stop_t){ 0, pixcolor(tint, 1) };
-	stops[1] = (pixman_gradient_stop_t){ pixman_int_to_fixed(1), pixcolor(s->background, 1) };
-	center = (pixman_point_fixed_t){ pixman_double_to_fixed(w * 0.28), pixman_double_to_fixed(h * 0.22) };
-	if ((glow = pixman_image_create_radial_gradient(&center, &center, 0,
-			pixman_double_to_fixed(hypot(w, h) * 0.8), stops, 2))) {
-		pixman_image_set_dither(t->img, PIXMAN_DITHER_GOOD); /* no banding in the dark tones */
-		pixman_image_composite32(PIXMAN_OP_SRC, glow, NULL, t->img, 0, 0, 0, 0, 0, 0, w, h);
-		pixman_image_unref(glow);
-	}
-	/* the mark, bottom right */
-	snprintf(name, sizeof(name), "monospace:pixelsize=%d:weight=bold", MAX(h / 7, 24));
-	if (!bigfont || bigfont->height < h / 9 || bigfont->height > h / 5)
-		bigfont = (fcft_destroy(bigfont), fcft_from_name(1, (const char *[]){ name }, NULL));
-	markcolor = pixcolor(s->border_focused, 0.07f); /* a watermark, not a label */
-	if (bigfont) /* right-aligned to the margin */
-		drawtext(t->img, bigfont, "dfwc",
-			w - bigfont->height / 2 - drawtext(NULL, bigfont, "dfwc", 0, 0, NULL, 0),
-			h - bigfont->height * 5 / 4, &markcolor, 0);
-done:
+	sc = MAX((double)w / pixman_image_get_width(src), (double)h / pixman_image_get_height(src));
+	pixman_transform_init_scale(&tr, pixman_double_to_fixed(1 / sc), pixman_double_to_fixed(1 / sc));
+	pixman_image_set_transform(src, &tr);
+	pixman_image_set_filter(src, PIXMAN_FILTER_GOOD, NULL, 0);
+	pixman_image_composite32(PIXMAN_OP_SRC, src, NULL, t->img,
+		(pixman_image_get_width(src) * sc - w) / 2, (pixman_image_get_height(src) * sc - h) / 2,
+		0, 0, 0, 0, w, h);
 	wlr_buffer_init(&t->base, &textbufimpl, w, h);
 	if ((m->wall = wlr_scene_buffer_create(walltree, &t->base))) {
 		wlr_scene_buffer_set_dest_size(m->wall, m->area.width, m->area.height);
@@ -2897,7 +2854,6 @@ cleanup(void)
 	if (errbox)
 		wlr_scene_node_destroy(&errbox->node);
 	fcft_destroy(font);
-	fcft_destroy(bigfont);
 	if (wallimg)
 		pixman_image_unref(wallimg);
 	fcft_fini();

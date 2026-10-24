@@ -306,7 +306,7 @@ l_set(lua_State *L)
 			if (!(ok = lua_type(L, -1) == LUA_TSTRING))
 				break;
 			str = lua_tostring(L, -1);
-			if (!strcmp(str, "girl") || !strcmp(str, "matrix") || !strcmp(str, "hands") || !strcmp(str, "glow")) {
+			if (!strcmp(str, "girl") || !strcmp(str, "matrix") || !strcmp(str, "hands")) {
 				snprintf(p, fields[i].size, "%s", str);
 				break;
 			}
@@ -314,7 +314,7 @@ l_set(lua_State *L)
 					str + (strncmp(str, "~/", 2) ? 0 : 1)) >= (int)fields[i].size)
 				return luaL_error(L, "%s: path too long", key);
 			if (access(p, R_OK))
-				return luaL_error(L, "%s: can't read %s (built-ins: girl, matrix, hands, glow)", key, (char *)p);
+				return luaL_error(L, "%s: can't read %s (built-ins: girl, matrix, hands)", key, (char *)p);
 			break;
 		case Mod:
 			str = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : "";

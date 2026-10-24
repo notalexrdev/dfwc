@@ -105,7 +105,7 @@ the bind while the key is held.
 | `touchpad_speed` | 0 (-1 to 1) |
 | `cursor_theme`, `cursor_size` | from `XCURSOR_THEME`, 24 |
 | `background` | `"#000000"` (colors are `#rrggbb` or `#rrggbbaa`) |
-| `wallpaper` | `"girl"`; built-ins `"girl"`, `"matrix"`, `"hands"`, `"glow"`, or a path to your own PNG; `false` for plain `background` |
+| `wallpaper` | `"girl"`; built-ins `"girl"`, `"matrix"`, `"hands"`, or a path to your own PNG; `false` for plain `background` |
 | `scale` | 1 (fractional works) |
 | `modkey` | `"auto"`: Super, or Alt when nested |
 | `border_width` | 2 (or `{ top, right, bottom, left }`) |

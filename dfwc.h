@@ -40,7 +40,7 @@ typedef struct {
 	int gaps_inner, gaps_outer;
 	bool smart_gaps;        /* a lone tiled window gets no gaps and no borders */
 	char tiled_drag[8];     /* moving a tiled window: "swap", "snap" or "float" */
-	char wallpaper[256];    /* built-in name ("girl", "matrix", "hands", "glow"), a PNG path, or "" */
+	char wallpaper[256];    /* built-in name ("girl", "matrix", "hands"), a PNG path, or "" */
 } Settings;
 
 /* what a dfwc.style() function sees and may change */
