@@ -175,6 +175,7 @@ static struct wl_list keyboards;
 static struct wl_list pointers; /* libinput pointers, for touchpad settings */
 static LayerSurface *exclusive; /* layer surface holding the keyboard, e.g. wmenu */
 static int cycling; /* focus is walking the stack; the order commits when Mod is released */
+static int repeating; /* the running bind comes from a held key */
 static struct {
 	struct wl_event_source *timer;
 	uint32_t mods, keycode;
@@ -794,13 +795,14 @@ tinybox(void)
 }
 
 static int
-snapok(int v, int step)
+snapok(int v, int step, int hold)
 {
 	/* mouse (no step): edges within settings.snap pull the window in.
-	 * keys: the window stops at an edge it would cross, and passes it next press */
+	 * keys: the window stops at an edge it would cross; with hold it also
+	 * stays there (v == -step: already flush), else the next move passes it */
 	if (!step)
 		return abs(v) <= settings.snap;
-	return v * step < 0 && abs(v) < abs(step);
+	return v * step < 0 && (hold ? abs(v) <= abs(step) : abs(v) < abs(step));
 }
 
 static void
@@ -813,28 +815,29 @@ snap(Client *c, int *x, int *y, int dx, int dy)
 	int bx = INT_MAX, by = INT_MAX;
 	Client *t;
 
-#define TRYX(v) do { if (snapok(v, dx) && abs(v) < abs(bx)) bx = (v); } while (0)
-#define TRYY(v) do { if (snapok(v, dy) && abs(v) < abs(by)) by = (v); } while (0)
+#define TRYX(v, hold) do { if (snapok(v, dx, hold) && abs(v) < abs(bx)) bx = (v); } while (0)
+#define TRYY(v, hold) do { if (snapok(v, dy, hold) && abs(v) < abs(by)) by = (v); } while (0)
 	if (!settings.snap)
 		return;
+	/* keys never push a window off the screen; a held key also stops at windows */
 	if (m) {
 		o = m->usable;
-		TRYX(o.x - me.x);
-		TRYX(o.x + o.width - me.x - me.width);
-		TRYY(o.y - me.y);
-		TRYY(o.y + o.height - me.y - me.height);
+		TRYX(o.x - me.x, 1);
+		TRYX(o.x + o.width - me.x - me.width, 1);
+		TRYY(o.y - me.y, 1);
+		TRYY(o.y + o.height - me.y - me.height, 1);
 	}
 	wl_list_for_each(t, &clients, link) {
 		if (t == c || t->minimized)
 			continue;
 		o = outset(t, clientbox(t));
 		if (me.y < o.y + o.height && o.y < me.y + me.height) { /* side by side */
-			TRYX(o.x + o.width - me.x);
-			TRYX(o.x - me.x - me.width);
+			TRYX(o.x + o.width - me.x, repeating);
+			TRYX(o.x - me.x - me.width, repeating);
 		}
 		if (me.x < o.x + o.width && o.x < me.x + me.width) { /* stacked */
-			TRYY(o.y + o.height - me.y);
-			TRYY(o.y - me.y - me.height);
+			TRYY(o.y + o.height - me.y, repeating);
+			TRYY(o.y - me.y - me.height, repeating);
 		}
 	}
 #undef TRYX
@@ -893,7 +896,12 @@ repeatkey(void *data)
 {
 	struct wlr_keyboard *kb = wlr_seat_get_keyboard(seat);
 
-	if (kb && kb->repeat_info.rate > 0 && config_key(rep.mods, rep.sym))
+	int bound;
+
+	repeating = 1;
+	bound = kb && kb->repeat_info.rate > 0 && config_key(rep.mods, rep.sym);
+	repeating = 0;
+	if (bound)
 		wl_event_source_timer_update(rep.timer, 1000 / kb->repeat_info.rate);
 	return 0;
 }
