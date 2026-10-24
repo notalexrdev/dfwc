@@ -108,17 +108,17 @@ static const Settings defaults = {
 	.repeat_rate = 25, .repeat_delay = 600,
 	.touchpad_tap = true, .touchpad_dwt = true,
 	.cursor_size = 24,
-	/* dfwm's tomorrow-night colors */
-	.background = HEX(0x1d1f21),
+	/* "ink": black, greys, one bright line for the focused window */
+	.background = HEX(0x000000),
 	.scale = 1,
 	.border_width = { 2, 2, 2, 2 },
-	.border_focused = HEX(0x9a9ea3),
-	.border_unfocused = HEX(0x3c3f43),
-	.inner_border_focused = HEX(0x1d1f21),
-	.inner_border_unfocused = HEX(0x1d1f21),
+	.border_focused = HEX(0xa3a3a3),
+	.border_unfocused = HEX(0x262626),
+	.inner_border_focused = HEX(0x000000),
+	.inner_border_unfocused = HEX(0x000000),
 	.opacity = 1,
-	.launcher = "wmenu-run",
-	.restore_menu = "wmenu -p restore",
+	.launcher = "wmenu-run -f \"monospace 11\" -N 000000 -n 8a8a8a -M 000000 -m ededed -S d4d4d4 -s 000000",
+	.restore_menu = "wmenu -i -p restore -f \"monospace 11\" -N 000000 -n 8a8a8a -M 000000 -m ededed -S d4d4d4 -s 000000",
 	.box_timeout = 5000,
 	.snap = 10,
 	.layout = "tile",
@@ -670,6 +670,13 @@ l_restore(lua_State *L)
 }
 
 static int
+l_launch(lua_State *L)
+{
+	spawn(settings.launcher);
+	return 0;
+}
+
+static int
 l_spawn(lua_State *L)
 {
 	spawn(luaL_checkstring(L, 1));
@@ -705,6 +712,7 @@ static const luaL_Reg api[] = {
 	{ "float", l_float },
 	{ "focus", l_focus },
 	{ "fullscreen", l_fullscreen },
+	{ "launch", l_launch },
 	{ "layout", l_layout },
 	{ "maximize", l_maximize },
 	{ "mfact", l_mfact },
@@ -751,6 +759,8 @@ loadconfig(const char *file)
 	load.layouts = luaL_ref(L, LUA_REGISTRYINDEX);
 	luaL_openlibs(L);
 	luaL_newlib(L, api);
+	lua_pushstring(L, PREFIX "/share/dfwc");
+	lua_setfield(L, -2, "datadir"); /* themes and the default config live here */
 	lua_setglobal(L, "dfwc");
 	/* let init.lua require() files next to it */
 	lua_getglobal(L, "package");

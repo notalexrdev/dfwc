@@ -1,0 +1,17 @@
+# dfwc "ink" theme for mako notifications.
+# dfwc's default config uses this when you have no ~/.config/mako/config.
+
+font=monospace 10
+background-color=#000000e6
+text-color=#d4d4d4
+border-color=#3a3a3a
+border-size=1
+border-radius=0
+padding=12
+margin=12
+width=360
+default-timeout=5000
+
+[urgency=high]
+border-color=#d77c79
+default-timeout=0

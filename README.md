@@ -20,9 +20,16 @@ The log goes to `~/.local/state/dfwc/log`; `dfwc-session -d` logs debug output.
 Recommended companions: `foot` (terminal), `wmenu` (launcher), `swaybg` (wallpaper),
 `xdg-desktop-portal-wlr` (screen sharing), `mako` (notifications).
 
-Run a notification daemon: without one, apps that send a notification wait 25 s for
-KDE's or GNOME's to start, and Electron apps open that much slower.
+The default config starts mako when it's installed: without a notification daemon, apps
+that send a notification wait 25 s for KDE's or GNOME's to start.
 Screen sharing asks which screen to share through wmenu.
+
+## Look
+
+dfwc ships one theme, "ink": black, greys, and soft colors in the terminal. It covers
+dfwc itself, wmenu (launcher, restore list, screen-share picker), and foot and mako
+when you have no `~/.config/foot/foot.ini` or `~/.config/mako/config` of your own.
+To keep it in your own foot config, add `include=/usr/local/share/dfwc/foot.ini`.
 
 Try it in a window inside your current desktop first: `./dfwc -s foot`.
 Nested, the modifier is Alt instead of Super.
@@ -57,6 +64,8 @@ the bind while the key is held.
 | Function | Does |
 |---|---|
 | `dfwc.spawn(cmd)` | run a shell command |
+| `dfwc.launch()` | run the `launcher` (Super+p and drawn boxes use the same one) |
+| `dfwc.datadir` | where dfwc's themes and wallpapers are installed |
 | `dfwc.autostart(cmd)` | run a command once per session (saving never restarts it) |
 | `dfwc.close()` | close the focused window |
 | `dfwc.focus("next")` / `("prev")` | cycle focus, most recent first; the order sticks when Mod is released |
@@ -88,21 +97,21 @@ the bind while the key is held.
 | `touchpad_tap`, `touchpad_natural_scroll`, `touchpad_dwt` | true, false, true |
 | `touchpad_speed` | 0 (-1 to 1) |
 | `cursor_theme`, `cursor_size` | from `XCURSOR_THEME`, 24 |
-| `background` | `"#1d1f21"` (colors are `#rrggbb` or `#rrggbbaa`) |
+| `background` | `"#000000"` (colors are `#rrggbb` or `#rrggbbaa`) |
 | `wallpaper` | `"girl"`; built-ins `"girl"`, `"matrix"`, `"hands"`, `"glow"`, or a path to your own PNG; `false` for plain `background` |
 | `scale` | 1 (fractional works) |
 | `modkey` | `"auto"`: Super, or Alt when nested |
 | `border_width` | 2 (or `{ top, right, bottom, left }`) |
-| `border_focused`, `border_unfocused` | `"#9a9ea3"`, `"#3c3f43"` (greys) |
+| `border_focused`, `border_unfocused` | `"#a3a3a3"`, `"#262626"` |
 | `inner_border_width` | 0: a second border hugging the window |
-| `inner_border_focused`, `inner_border_unfocused` | `"#1d1f21"` |
+| `inner_border_focused`, `inner_border_unfocused` | `"#000000"` |
 | `border_gap` | 0: see-through space between window and border |
 | `border_corners` | 0: full border; N draws only N-pixel corner brackets |
 | `corner_radius` | 0: square; N rounds windows and borders |
 | `opacity` | 1 (0.05 to 1) |
 | `error_alarm_fullscreen` | false: also blink the whole screen red on config errors |
-| `launcher` | `"wmenu-run"`: runs after you draw a box |
-| `restore_menu` | `"wmenu -p restore"`: gets `id title` lines, prints the picked one |
+| `launcher` | `wmenu-run` in ink colors: Super+p and drawn boxes run it |
+| `restore_menu` | `wmenu -i -p restore` in ink colors: gets `id title` lines, prints the picked one |
 | `box_timeout` | 5000 ms a drawn box waits for its window |
 | `snap` | 10 px: moved windows snap to screen and window edges (0 turns it off) |
 | `tiling` | false |
