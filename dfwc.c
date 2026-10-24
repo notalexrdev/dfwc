@@ -78,6 +78,10 @@ enum { CurNormal, CurMove, CurResize, CurDraw };
 enum { LyrBg, LyrBottom, LyrClients, LyrOnTop, LyrTop, LyrFullscreen, LyrX11Menus, LyrOverlay, NumLayers };
 
 typedef struct {
+	uint32_t start, dur; /* ms; dur 0: not running */
+} Anim;
+
+typedef struct {
 	struct wl_list link; /* in clients, most recently focused first */
 	struct wl_list tlink; /* in tiles: tiling order, newest first */
 	struct wlr_xdg_toplevel *toplevel;      /* a Wayland app, or */
@@ -94,6 +98,12 @@ typedef struct {
 	struct wlr_box prev; /* geometry to restore after maximize/fullscreen */
 	struct wlr_box geom; /* geometry the borders were last drawn for */
 	Style style;         /* last dfwc.style() result, applied on top of settings */
+	float shown[2][4];   /* border colors on screen: style's, or on their way there */
+	float colfrom[2][4];
+	float fade;          /* 0..1 while opening */
+	int styled;          /* has been styled since it mapped */
+	Anim open, col, mv;
+	int fx, fy, tx, ty;  /* where a glide starts and ends */
 	int maximized, fullscreen, ontop, minimized, radius;
 	int floating;        /* stays floating while the rest tile */
 	int tiled;           /* placed by tiling since it last floated; floatbox is valid */
@@ -107,6 +117,18 @@ typedef struct {
 	struct wl_listener deco_mode, deco_destroy;
 	struct wl_listener associate, dissociate, configure, request_activate, set_geometry; /* X11 */
 } Client;
+
+typedef struct {
+	struct wl_list link;
+	struct wlr_scene_tree *tree;
+	Anim a;
+	float opacity;
+	struct wlr_scene_rect *rect[10]; /* copies of the borders, with their colors */
+	float color[10][4];
+	size_t nrects;
+	struct wlr_scene_shadow *shadow;
+	float shadowcolor[4];
+} Ghost; /* a closing window's last frame, fading out */
 
 typedef struct {
 	struct wl_list link;
@@ -201,6 +223,8 @@ static struct wl_list pointers; /* libinput pointers, for touchpad settings */
 static LayerSurface *exclusive; /* layer surface holding the keyboard, e.g. wmenu */
 static int cycling; /* focus is walking the stack; the order commits when Mod is released */
 static int repeating; /* the running bind comes from a held key */
+static int animating; /* frames keep coming until every animation is done */
+static struct wl_list ghosts;
 static int tileddrag; /* the window being moved is tiled and stays tiled */
 static struct {
 	struct wl_event_source *timer;
@@ -228,6 +252,61 @@ unlisten(struct wl_listener *l, ...)
 	for (; l; l = va_arg(ap, struct wl_listener *))
 		wl_list_remove(&l->link);
 	va_end(ap);
+}
+
+/* animations: driven by output frames, so nothing runs while nothing moves */
+
+static uint32_t
+msec(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static double
+ease(double t)
+{
+	/* anim_curve as a CSS cubic-bezier: find u with x(u) = t, return y(u) */
+	const float *p = settings.anim_curve;
+	double u = t, x, dx;
+
+	if (t <= 0 || t >= 1)
+		return t <= 0 ? 0 : 1;
+	for (int i = 0; i < 8; i++) { /* Newton; a few steps are plenty at screen precision */
+		x = 3 * (1 - u) * (1 - u) * u * p[0] + 3 * (1 - u) * u * u * p[2] + u * u * u - t;
+		dx = 3 * (1 - u) * (1 - u) * p[0] + 6 * (1 - u) * u * (p[2] - p[0]) + 3 * u * u * (1 - p[2]);
+		if (fabs(x) < 1e-4 || fabs(dx) < 1e-6)
+			break;
+		u = MIN(MAX(u - x / dx, 0), 1);
+	}
+	return 3 * (1 - u) * (1 - u) * u * p[1] + 3 * (1 - u) * u * u * p[3] + u * u * u;
+}
+
+static void
+startanim(Anim *a, int dur)
+{
+	Monitor *m;
+
+	a->start = msec();
+	a->dur = dur;
+	if (animating++)
+		return;
+	wl_list_for_each(m, &mons, link) /* wake the frame loop */
+		wlr_output_schedule_frame(m->wlr);
+}
+
+static int
+step(Anim *a, uint32_t now, double *e)
+{
+	/* eased progress in *e; returns whether it's still running */
+	double p = a->dur ? (double)(now - a->start) / a->dur : 1;
+
+	*e = ease(MIN(p, 1));
+	if (p >= 1)
+		a->dur = 0;
+	return a->dur != 0;
 }
 
 static void
@@ -265,6 +344,7 @@ clientat(double x, double y, struct wlr_surface **surface, double *sx, double *s
 }
 
 static Client *clientfrom(struct wlr_surface *surface);
+static void updateborders(Client *c);
 static void restyle(Client *c);
 static void placeerror(void);
 static void drawwallpaper(Monitor *m);
@@ -330,6 +410,7 @@ cmove(Client *c, int x, int y)
 {
 	struct wlr_box g = cgeom(c);
 
+	c->mv.dur = 0; /* a direct move ends any glide */
 	wlr_scene_node_set_position(&c->scene->node, x, y);
 	if (c->xs)
 		wlr_xwayland_surface_configure(c->xs, x, y, g.width, g.height);
@@ -428,7 +509,9 @@ clientbox(Client *c)
 {
 	struct wlr_box g = cgeom(c);
 
-	return (struct wlr_box){ c->scene->node.x, c->scene->node.y, g.width, g.height };
+	/* while gliding, where it's going is where it is */
+	return c->mv.dur ? (struct wlr_box){ c->tx, c->ty, g.width, g.height }
+		: (struct wlr_box){ c->scene->node.x, c->scene->node.y, g.width, g.height };
 }
 
 static void
@@ -438,7 +521,16 @@ resizeclient(Client *c, struct wlr_box b)
 	 * growing left/up shows a frame of misplaced content; fine for jumps
 	 * like maximize, mouse resizes go through commitnotify instead */
 	c->anchor = 0;
-	wlr_scene_node_set_position(&c->scene->node, b.x, b.y);
+	if (settings.anim_move && cmapped(c) && (b.x != clientbox(c).x || b.y != clientbox(c).y)) {
+		/* glide from wherever it is on screen now */
+		c->fx = c->scene->node.x;
+		c->fy = c->scene->node.y;
+		c->tx = b.x;
+		c->ty = b.y;
+		startanim(&c->mv, settings.anim_move);
+	} else if (!c->mv.dur) {
+		wlr_scene_node_set_position(&c->scene->node, b.x, b.y);
+	}
 	cconfigure(c, b.x, b.y, b.width, b.height);
 }
 
@@ -510,7 +602,7 @@ stylebuffer(struct wlr_scene_buffer *buffer, int sx, int sy, void *data)
 	Client *c = data;
 	struct wlr_scene_surface *ss = wlr_scene_surface_try_from_buffer(buffer);
 
-	wlr_scene_buffer_set_opacity(buffer, c->fullscreen ? 1 : c->style.opacity);
+	wlr_scene_buffer_set_opacity(buffer, (c->fullscreen ? 1 : c->style.opacity) * c->fade);
 	/* round only the main surface; popups and subsurfaces keep their shape */
 	if (ss && ss->surface == csurface(c))
 		wlr_scene_buffer_set_corner_radius(buffer, c->radius);
@@ -522,12 +614,18 @@ updateborders(Client *c)
 	static const float red[4] = { 1, 0.2, 0.2, 1 };
 	const Settings *s = &settings;
 	struct wlr_box cg = cgeom(c), *geo = &cg, win = { 0, 0, geo->width, geo->height };
-	const float *outer = flashes % 2 ? red : c->style.border;
-	const float *inner = flashes % 2 ? red : c->style.inner_border;
+	float fo[4], fi[4];
+	const float *outer = fo, *inner = fi;
 	const int *w = s->border_width, iw = s->inner_border_width, g = s->border_gap;
 	struct wlr_box in, gap, out;
 	float color[4];
 	int bare = c->fullscreen || c->smart, R, L, sh;
+
+	/* the colors on screen, faded in while the window opens */
+	memcpy(fo, flashes % 2 ? red : c->shown[0], sizeof(fo));
+	memcpy(fi, flashes % 2 ? red : c->shown[1], sizeof(fi));
+	fo[3] *= c->fade;
+	fi[3] *= c->fade;
 
 	/* wlroots already offsets surf by the app's geometry, so the window's
 	 * visible part starts at the root's origin */
@@ -548,6 +646,8 @@ updateborders(Client *c)
 	wlr_scene_node_set_enabled(&c->shadow->node, sh && !bare && !c->tiled && !c->maximized);
 	if (sh && !bare && !c->tiled && !c->maximized) {
 		premul(s->shadow_color, color);
+		for (int i = 0; i < 4; i++)
+			color[i] *= c->fade;
 		wlr_scene_node_set_position(&c->shadow->node, out.x - sh, out.y - sh);
 		wlr_scene_shadow_set_size(c->shadow, out.width + 2 * sh, out.height + 2 * sh);
 		wlr_scene_shadow_set_blur_sigma(c->shadow, sh / 2.0f);
@@ -606,7 +706,136 @@ restyle(Client *c)
 		sizeof(float[4]));
 	c->style.opacity = s->opacity;
 	config_style(&w, &c->style);
+	if (s->anim_focus && c->styled && memcmp(c->shown[0], c->style.border, sizeof(c->shown[0]))) {
+		memcpy(c->colfrom, c->shown, sizeof(c->colfrom)); /* blend from what's on screen */
+		startanim(&c->col, s->anim_focus);
+	} else if (!c->col.dur) {
+		memcpy(c->shown[0], c->style.border, sizeof(c->shown[0]));
+		memcpy(c->shown[1], c->style.inner_border, sizeof(c->shown[1]));
+	}
+	c->styled = 1;
 	updateborders(c);
+}
+
+static void
+ghostnode(Ghost *g, struct wlr_scene_node *n, int x, int y)
+{
+	/* copy every buffer under n, hidden or not: unmapping already hid them */
+	struct wlr_scene_buffer *b, *copy;
+	struct wlr_scene_node *child;
+
+	x += n->x;
+	y += n->y;
+	if (n->type == WLR_SCENE_NODE_TREE) {
+		wl_list_for_each(child, &wlr_scene_tree_from_node(n)->children, link)
+			ghostnode(g, child, x, y);
+		return;
+	}
+	if (n->type != WLR_SCENE_NODE_BUFFER || !(b = wlr_scene_buffer_from_node(n))->buffer
+	|| !(copy = wlr_scene_buffer_create(g->tree, b->buffer)))
+		return;
+	wlr_scene_node_set_position(&copy->node, x, y);
+	wlr_scene_buffer_set_dest_size(copy, b->dst_width, b->dst_height);
+	wlr_scene_buffer_set_source_box(copy, &b->src_box);
+	wlr_scene_buffer_set_transform(copy, b->transform);
+	wlr_scene_buffer_set_opacity(copy, g->opacity);
+}
+
+static void
+ghost(Client *c)
+{
+	/* the window's last frame, kept to fade out after the app has let go */
+	struct wlr_scene_rect *rects[LENGTH(c->ring) + LENGTH(c->arm)], *r;
+	Ghost *g;
+
+	if (!settings.anim_close || !c->scene->node.enabled || c->minimized || !(g = calloc(1, sizeof(*g))))
+		return;
+	g->tree = wlr_scene_tree_create(c->scene->node.parent);
+	wlr_scene_node_place_above(&g->tree->node, &c->scene->node);
+	wlr_scene_node_set_position(&g->tree->node, c->scene->node.x, c->scene->node.y);
+	if (c->shadow->node.enabled) {
+		memcpy(g->shadowcolor, c->shadow->color, sizeof(g->shadowcolor));
+		g->shadow = wlr_scene_shadow_create(g->tree, c->shadow->width, c->shadow->height,
+			c->shadow->corner_radius, c->shadow->blur_sigma, g->shadowcolor);
+		wlr_scene_node_set_position(&g->shadow->node, c->shadow->node.x, c->shadow->node.y);
+		wlr_scene_shadow_set_clipped_region(g->shadow, c->shadow->clipped_region);
+	}
+	memcpy(rects, c->ring, sizeof(c->ring));
+	memcpy(rects + LENGTH(c->ring), c->arm, sizeof(c->arm));
+	for (size_t i = 0; i < LENGTH(rects); i++) {
+		if (!rects[i]->node.enabled)
+			continue;
+		memcpy(g->color[g->nrects], rects[i]->color, sizeof(g->color[0]));
+		r = g->rect[g->nrects++] = wlr_scene_rect_create(g->tree, rects[i]->width,
+			rects[i]->height, rects[i]->color);
+		wlr_scene_node_set_position(&r->node, rects[i]->node.x, rects[i]->node.y);
+		wlr_scene_rect_set_corner_radii(r, rects[i]->corners);
+		wlr_scene_rect_set_clipped_region(r, rects[i]->clipped_region);
+	}
+	g->opacity = (c->fullscreen ? 1 : c->style.opacity) * c->fade;
+	ghostnode(g, &c->surf->node, 0, 0);
+	wl_list_insert(&ghosts, &g->link);
+	startanim(&g->a, settings.anim_close);
+}
+
+static int
+animate(void)
+{
+	/* one frame of every running animation; returns whether any still runs */
+	uint32_t now = msec();
+	struct wlr_scene_node *n;
+	Ghost *g, *tmp;
+	float color[4];
+	int busy = 0, upd;
+	double e;
+	Client *c;
+
+	wl_list_for_each(c, &clients, link) {
+		upd = 0;
+		if (c->open.dur) {
+			busy |= step(&c->open, now, &e);
+			c->fade = e;
+			upd = 1;
+		}
+		if (c->col.dur) {
+			busy |= step(&c->col, now, &e);
+			for (int i = 0; i < 4; i++) {
+				c->shown[0][i] = c->colfrom[0][i] + (c->style.border[i] - c->colfrom[0][i]) * e;
+				c->shown[1][i] = c->colfrom[1][i] + (c->style.inner_border[i] - c->colfrom[1][i]) * e;
+			}
+			upd = 1;
+		}
+		if (c->mv.dur) {
+			busy |= step(&c->mv, now, &e);
+			wlr_scene_node_set_position(&c->scene->node,
+				c->fx + (c->tx - c->fx) * e, c->fy + (c->ty - c->fy) * e);
+		}
+		if (upd)
+			updateborders(c);
+	}
+	wl_list_for_each_safe(g, tmp, &ghosts, link) {
+		if (!step(&g->a, now, &e)) {
+			wlr_scene_node_destroy(&g->tree->node);
+			wl_list_remove(&g->link);
+			free(g);
+			continue;
+		}
+		busy = 1;
+		for (size_t i = 0; i < g->nrects; i++) {
+			for (int j = 0; j < 4; j++)
+				color[j] = g->color[i][j] * (1 - e);
+			wlr_scene_rect_set_color(g->rect[i], color);
+		}
+		if (g->shadow) {
+			for (int j = 0; j < 4; j++)
+				color[j] = g->shadowcolor[j] * (1 - e);
+			wlr_scene_shadow_set_color(g->shadow, color);
+		}
+		wl_list_for_each(n, &g->tree->children, link)
+			if (n->type == WLR_SCENE_NODE_BUFFER)
+				wlr_scene_buffer_set_opacity(wlr_scene_buffer_from_node(n), g->opacity * (1 - e));
+	}
+	return busy;
 }
 
 static Client *
@@ -716,6 +945,7 @@ grab(Client *c, int mode, uint32_t edges)
 		cmaximize(c, 0);
 	}
 	c->anchor = 0;
+	c->mv.dur = 0;
 	grabc = c;
 	cursor_mode = mode;
 	grabedges = edges;
@@ -1544,6 +1774,8 @@ rendermon(struct wl_listener *listener, void *data)
 	struct wlr_scene_output *so = wlr_scene_get_scene_output(scene, m->wlr);
 	struct timespec now;
 
+	if (animating && (animating = animate()))
+		wlr_output_schedule_frame(m->wlr); /* until the last animation ends */
 	wlr_scene_output_commit(so, NULL);
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	wlr_scene_output_send_frame_done(so, &now);
@@ -1878,6 +2110,9 @@ mapnotify(struct wl_listener *listener, void *data)
 			cconfigure(c, box.x, box.y, w, h);
 		cmove(c, box.x, box.y);
 	}
+	c->fade = settings.anim_open ? 0 : 1;
+	if (settings.anim_open)
+		startanim(&c->open, settings.anim_open);
 	restyle(c);
 	focusclient(c, 1);
 	if (c->xs ? c->xs->fullscreen : c->toplevel->requested.fullscreen)
@@ -1893,6 +2128,9 @@ unmapnotify(struct wl_listener *listener, void *data)
 	Client *c = wl_container_of(listener, c, unmap);
 	int focused = selclient() == c;
 
+	ghost(c);
+	c->open.dur = c->col.dur = c->mv.dur = 0;
+	c->styled = 0;
 	/* an app that hides and shows its window starts over as a plain one */
 	c->maximized = c->fullscreen = c->minimized = c->tiled = c->smart = 0;
 	wl_list_remove(&c->tlink);
@@ -2074,6 +2312,7 @@ clientscene(Client *c, int layer, int framed)
 	 * first so they sit below the surface added later */
 	c->scene = wlr_scene_tree_create(layers[layer]);
 	c->scene->node.data = c;
+	c->fade = 1;
 	wlr_scene_node_set_enabled(&c->scene->node, false);
 	if (framed) {
 		c->shadow = wlr_scene_shadow_create(c->scene, 0, 0, 0, 0, (float[4]){ 0 });
@@ -2821,6 +3060,7 @@ setup(void)
 
 	wl_list_init(&clients);
 	wl_list_init(&tiles);
+	wl_list_init(&ghosts);
 	xdg_shell = wlr_xdg_shell_create(dpy, 6);
 	wl_signal_add(&xdg_shell->events.new_toplevel, &new_toplevel);
 	wl_signal_add(&xdg_shell->events.new_popup, &new_popup);
@@ -2888,6 +3128,7 @@ cleanup(void)
 		&request_cursor, &request_sel, &request_psel, &request_shape, &layout_change,
 		&new_layer, &new_deco, &request_activate };
 	Monitor *m;
+	Ghost *g, *gtmp;
 
 	wl_display_destroy_clients(dpy);
 	if (xwayland) {
@@ -2913,6 +3154,8 @@ cleanup(void)
 	fcft_fini();
 	for (size_t i = 0; i < LENGTH(listeners); i++)
 		wl_list_remove(&listeners[i]->link);
+	wl_list_for_each_safe(g, gtmp, &ghosts, link) /* their trees go with the scene */
+		free(g);
 	/* the scene takes the wallpapers with it; destroymon must not free them again */
 	wl_list_for_each(m, &mons, link)
 		m->wall = NULL;

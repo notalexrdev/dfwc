@@ -124,12 +124,19 @@ the bind while the key is held.
 | `shadow_size`, `shadow_color` | 20 px, `"#00000099"`: soft shadow under floating windows (0: none) |
 | `blur` | true: the wallpaper shows blurred through see-through windows |
 | `blur_radius`, `blur_passes` | 5, 3: how strong the blur is |
+| `anim_open`, `anim_close` | 180, 140 ms: windows fade in and out (0: off) |
+| `anim_focus` | 150 ms: border colors blend when focus moves |
+| `anim_move` | 200 ms: tiling, maximize and zoom glide windows into place |
+| `anim_curve` | `{ 0.2, 0.9, 0.3, 1 }`: the easing of all of them, as a CSS cubic-bezier |
 | `tiling` | false |
 | `layout` | `"tile"` |
 | `mfact`, `nmaster` | 0.55, 1 |
 | `gaps_inner`, `gaps_outer` | 0, 0 |
 | `smart_gaps` | false: a lone tiled window gets no gaps, borders or rounding |
 | `tiled_drag` | `"swap"`: dragging a tiled window onto another swaps them; `"snap"` puts it back in its tile; `"float"` makes it float |
+
+Animations run on the screen's own frames and only while something moves: an idle desktop
+costs nothing. Windows glide but aren't stretched; apps redraw at their new size once.
 
 Blur samples a blurred copy of the wallpaper made once, so it costs next to nothing; what's
 behind a see-through window is the wallpaper, not other windows. Opaque windows hide it entirely.

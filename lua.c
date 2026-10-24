@@ -41,7 +41,7 @@ typedef struct {
 	Settings own;      /* what the file itself set, before runtime changes were kept */
 } Config;
 
-enum { Str, Int, Num, Bool, Color, Mod, Sides, Wall };
+enum { Str, Int, Num, Bool, Color, Mod, Sides, Wall, Curve };
 
 #define FIELD(N, T, MIN, MAX) { #N, T, offsetof(Settings, N), sizeof(((Settings *)0)->N), MIN, MAX, NULL }
 #define CHOICE(N, ...) { #N, Str, offsetof(Settings, N), sizeof(((Settings *)0)->N), 0, 0, \
@@ -97,6 +97,11 @@ static const struct {
 	FIELD(blur, Bool, 0, 0),
 	FIELD(blur_radius, Int, 1, 64),
 	FIELD(blur_passes, Int, 1, 10),
+	FIELD(anim_open, Int, 0, 2000),
+	FIELD(anim_close, Int, 0, 2000),
+	FIELD(anim_focus, Int, 0, 2000),
+	FIELD(anim_move, Int, 0, 2000),
+	FIELD(anim_curve, Curve, 0, 0),
 };
 
 /* runtime changes to these survive a save, unless the config's value for them changed */
@@ -138,6 +143,12 @@ static const Settings defaults = {
 	.blur = true,
 	.blur_radius = 5,
 	.blur_passes = 3,
+	/* "a little riced": quick fades and glides */
+	.anim_open = 180,
+	.anim_close = 140,
+	.anim_focus = 150,
+	.anim_move = 200,
+	.anim_curve = { 0.2f, 0.9f, 0.3f, 1 }, /* fast start, soft landing */
 };
 
 static const struct { const char *name; uint32_t mask; } modnames[] = {
@@ -326,6 +337,17 @@ l_set(lua_State *L)
 				return luaL_error(L, "%s: path too long", key);
 			if (access(p, R_OK))
 				return luaL_error(L, "%s: can't read %s (built-ins: girl, matrix, hands)", key, (char *)p);
+			break;
+		case Curve: /* { x1, y1, x2, y2 }; x must stay in 0..1 */
+			for (int j = 0; (ok = lua_istable(L, -1)) && j < 4; j++) {
+				lua_rawgeti(L, -1, j + 1);
+				d = lua_tonumberx(L, -1, &ok);
+				ok = ok && (j % 2 || (d >= 0 && d <= 1));
+				((float *)p)[j] = d;
+				lua_pop(L, 1);
+				if (!ok)
+					break;
+			}
 			break;
 		case Mod:
 			str = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : "";
