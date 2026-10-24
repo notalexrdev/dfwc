@@ -262,8 +262,9 @@ clientbox(Client *c)
 static void
 resizeclient(Client *c, struct wlr_box b)
 {
-	/* shortcut: moves the window before the client has resized, so the
-	 * left/top edges jitter while resizing from them; wait for the commit */
+	/* shortcut: moves before the app has redrawn at the new size, so a window
+	 * growing left/up shows a frame of misplaced content; fine for jumps
+	 * like maximize, mouse resizes go through commitnotify instead */
 	wlr_scene_node_set_position(&c->scene->node, b.x, b.y);
 	wlr_xdg_toplevel_set_size(c->toplevel, MAX(b.width, 1), MAX(b.height, 1));
 }
@@ -1068,7 +1069,9 @@ motionnotify(uint32_t time)
 			t = MIN(ey, b - 1);
 		else if (grabedges & WLR_EDGE_BOTTOM)
 			b = MAX(ey, t + 1);
-		resizeclient(grabc, (struct wlr_box){ l, t, r - l, b - t });
+		/* only ask for the size; commitnotify moves the window once the app
+		 * has drawn it, keeping the opposite edges still */
+		wlr_xdg_toplevel_set_size(grabc->toplevel, r - l, b - t);
 		return;
 	}
 
@@ -1382,6 +1385,10 @@ commitnotify(struct wl_listener *listener, void *data)
 	struct wlr_box *geo = &c->toplevel->base->geometry, box;
 
 	if (c->toplevel->base->surface->mapped) {
+		if (c == grabc && cursor_mode == CurResize && (grabedges & (WLR_EDGE_LEFT | WLR_EDGE_TOP)))
+			wlr_scene_node_set_position(&c->scene->node,
+				grabedges & WLR_EDGE_LEFT ? grabgeo.x + grabgeo.width - geo->width : c->scene->node.x,
+				grabedges & WLR_EDGE_TOP ? grabgeo.y + grabgeo.height - geo->height : c->scene->node.y);
 		if (!wlr_box_equal(geo, &c->geom))
 			updateborders(c);
 		else if (c->radius || c->style.opacity < 1)
