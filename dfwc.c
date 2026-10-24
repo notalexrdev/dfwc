@@ -1559,7 +1559,7 @@ mapnotify(struct wl_listener *listener, void *data)
 	wl_list_insert(&clients, &c->link);
 	wl_list_insert(&tiles, &c->tlink);
 	/* dialogs, fixed-size windows and drawn boxes float even while tiling */
-	c->floating = c->toplevel->parent || draw.claim == c
+	c->floating = c->toplevel->parent || (draw.claim == c && settings.tiling)
 		|| (c->toplevel->current.min_width && c->toplevel->current.min_width == c->toplevel->current.max_width
 		&& c->toplevel->current.min_height && c->toplevel->current.min_height == c->toplevel->current.max_height);
 	wlr_scene_node_set_enabled(&c->scene->node, true);

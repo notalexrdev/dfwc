@@ -4,6 +4,9 @@
 [ -z "$DBUS_SESSION_BUS_ADDRESS" ] && command -v dbus-run-session >/dev/null &&
 	exec dbus-run-session -- "$0" "$@"
 export XDG_CURRENT_DESKTOP=dfwc XDG_SESSION_DESKTOP=dfwc XDG_SESSION_TYPE=wayland
+# environment variables for this session only (driver tweaks, WLR_* debug switches)
+env="${XDG_CONFIG_HOME:-$HOME/.config}/dfwc/env"
+[ -f "$env" ] && . "$env"
 state="${XDG_STATE_HOME:-$HOME/.local/state}/dfwc"
 mkdir -p "$state"
 [ -f "$state/log" ] && mv -f "$state/log" "$state/log.old"

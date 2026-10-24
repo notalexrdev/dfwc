@@ -14,6 +14,7 @@ Needs `wlroots0.20 scenefx lua libinput fcft wayland-protocols` and a C23 compil
 On Alpine (edge only; stable lacks wlroots 0.20 and gcc 15): `make LUA=lua5.5`.
 
 Pick **dfwc** on the login screen, or run `dfwc-session` from a TTY.
+`dfwc-session` reads shell `export` lines from `~/.config/dfwc/env` first.
 The log goes to `~/.local/state/dfwc/log`; `dfwc-session -d` logs debug output.
 
 Recommended companions: `foot` (terminal), `wmenu` (launcher), `swaybg` (wallpaper),
@@ -120,7 +121,7 @@ saving the config keeps those changes unless you edited that setting's line.
 
 Layouts: `tile` (master left, stack right), `bstack` (master on top), `spiral`, `dwindle`,
 `centeredmaster`, `grid`, `monocle`. Switching tiling off puts every window back where it
-floated. Dialogs, fixed-size windows and windows opened into a drawn box keep floating,
+floated. Dialogs, fixed-size windows and windows drawn into a box while tiling keep floating,
 and dragging or keyboard-moving a tiled window makes it float.
 
 Your own layout gets the window count, the area and `{ mfact, nmaster, gap }`, and
