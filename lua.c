@@ -42,7 +42,7 @@ typedef struct {
 	Settings own;      /* what the file itself set, before runtime changes were kept */
 } Config;
 
-enum { Str, Int, Num, Bool, Color, Mod, Sides, Wall, Curve, Pair };
+enum { Str, Int, Num, Bool, Color, Grad, Mod, Sides, Wall, Curve, Pair };
 
 #define FIELD(N, T, MIN, MAX) { #N, T, offsetof(Settings, N), sizeof(((Settings *)0)->N), MIN, MAX, NULL }
 #define CHOICE(N, ...) { #N, Str, offsetof(Settings, N), sizeof(((Settings *)0)->N), 0, 0, \
@@ -70,8 +70,9 @@ static const struct {
 	FIELD(scale, Num, 0.25, 8),
 	FIELD(modkey, Mod, 0, 0),
 	FIELD(border_width, Sides, 0, 100),
-	FIELD(border_focused, Color, 0, 0),
-	FIELD(border_unfocused, Color, 0, 0),
+	FIELD(border_focused, Grad, 0, 0),
+	FIELD(border_unfocused, Grad, 0, 0),
+	FIELD(border_angle, Int, 0, 359),
 	FIELD(inner_border_width, Int, 0, 100),
 	FIELD(inner_border_focused, Color, 0, 0),
 	FIELD(inner_border_unfocused, Color, 0, 0),
@@ -127,8 +128,9 @@ static const Settings defaults = {
 	.background = HEX(0x000000),
 	.scale = 1,
 	.border_width = { 2, 2, 2, 2 },
-	.border_focused = HEX(0xa3a3a3),
-	.border_unfocused = HEX(0x262626),
+	.border_focused = { HEX(0xa3a3a3), HEX(0xa3a3a3) },
+	.border_unfocused = { HEX(0x262626), HEX(0x262626) },
+	.border_angle = 45,
 	.inner_border_focused = HEX(0x000000),
 	.inner_border_unfocused = HEX(0x000000),
 	.opacity = 1,
@@ -242,6 +244,28 @@ parsecolor(const char *s, float c[4])
 }
 
 static int
+parsegrad(lua_State *L, int idx, float g[2][4])
+{
+	/* "#color" is solid, { "#from", "#to" } a gradient */
+	int ok = 1;
+
+	idx = lua_absindex(L, idx);
+	if (lua_type(L, idx) == LUA_TSTRING) {
+		ok = parsecolor(lua_tostring(L, idx), g[0]);
+		memcpy(g[1], g[0], sizeof(g[0]));
+		return ok;
+	}
+	for (int j = 0; (ok = lua_istable(L, idx)) && j < 2; j++) {
+		lua_rawgeti(L, idx, j + 1);
+		ok = lua_type(L, -1) == LUA_TSTRING && parsecolor(lua_tostring(L, -1), g[j]);
+		lua_pop(L, 1);
+		if (!ok)
+			break;
+	}
+	return ok;
+}
+
+static int
 l_set(lua_State *L)
 {
 	/* settings made by a running callback apply right away */
@@ -307,6 +331,9 @@ l_set(lua_State *L)
 			break;
 		case Color:
 			ok = lua_type(L, -1) == LUA_TSTRING && parsecolor(lua_tostring(L, -1), p);
+			break;
+		case Grad:
+			ok = parsegrad(L, -1, p);
 			break;
 		case Sides: /* one width, or { top, right, bottom, left } */
 			if (lua_istable(L, -1)) {
@@ -628,8 +655,7 @@ config_style(const WinInfo *w, Style *st)
 		return;
 	}
 	if (lua_istable(L, -1)) {
-		if (lua_getfield(L, -1, "border") != LUA_TNIL
-		&& (lua_type(L, -1) != LUA_TSTRING || !parsecolor(lua_tostring(L, -1), st->border)))
+		if (lua_getfield(L, -1, "border") != LUA_TNIL && !parsegrad(L, -1, st->border))
 			err = "border";
 		lua_pop(L, 1);
 		if (lua_getfield(L, -1, "inner_border") != LUA_TNIL

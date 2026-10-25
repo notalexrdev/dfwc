@@ -20,7 +20,8 @@ typedef struct {
 	double scale;
 	uint32_t modkey;     /* 0: Super, or Alt when nested */
 	int border_width[4]; /* top, right, bottom, left */
-	float border_focused[4], border_unfocused[4];
+	float border_focused[2][4], border_unfocused[2][4]; /* from, to: the same when solid */
+	int border_angle;    /* gradient direction in degrees: 0 left to right, 90 top down */
 	int inner_border_width, border_gap;
 	float inner_border_focused[4], inner_border_unfocused[4];
 	int border_corners;  /* 0: full border, else length of corner-only brackets */
@@ -58,7 +59,7 @@ typedef struct {
 } WinInfo;
 
 typedef struct {
-	float border[4], inner_border[4];
+	float border[2][4], inner_border[4];
 	double opacity;
 } Style;
 

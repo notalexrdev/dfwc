@@ -123,7 +123,8 @@ the bind while the key is held.
 | `scale` | 1 (fractional works) |
 | `modkey` | `"auto"`: Super, or Alt when nested |
 | `border_width` | 2 (or `{ top, right, bottom, left }`) |
-| `border_focused`, `border_unfocused` | `"#a3a3a3"`, `"#262626"` |
+| `border_focused`, `border_unfocused` | `"#a3a3a3"`, `"#262626"`; two colors make a gradient: `{ "#89b4fa", "#f5c2e7" }` |
+| `border_angle` | 45: gradient direction in degrees (0 left to right, 90 top down) |
 | `inner_border_width` | 0: a second border hugging the window |
 | `inner_border_focused`, `inner_border_unfocused` | `"#000000"` |
 | `border_gap` | 0: see-through space between window and border |
@@ -195,7 +196,7 @@ It runs only when windows come, go or the layout changes; if it errors, dfwc use
     end)
 
 The function gets `app_id`, `title`, `focused`, `maximized`, `fullscreen` and `ontop`, and may
-return `border`, `inner_border` and `opacity` to override the settings for that window.
+return `border` (one color or a `{ from, to }` gradient), `inner_border` and `opacity` to override the settings for that window.
 It runs only when one of those changes, never per frame. `dfwc.style(nil)` removes it.
 Fullscreen windows never get borders, rounding or transparency.
 

@@ -89,6 +89,12 @@ typedef struct {
 } Anim;
 
 typedef struct {
+	struct wlr_box out, hole;
+	int ro[4], ri[4], angle;
+	float col[2][4];
+} GradKey; /* everything a gradient border's look depends on */
+
+typedef struct {
 	struct wl_list link; /* in clients, most recently focused first */
 	struct wl_list tlink; /* in tiles: tiling order, newest first */
 	struct wlr_xdg_toplevel *toplevel;      /* a Wayland app, or */
@@ -101,12 +107,14 @@ typedef struct {
 	struct wlr_scene_blur *blur;     /* the blurred wallpaper behind the window */
 	struct wlr_scene_rect *ring[2]; /* outer and inner border */
 	struct wlr_scene_rect *arm[8];  /* corner brackets, for border_corners */
+	struct wlr_scene_buffer *grad[4]; /* a gradient border instead of ring[0]: top, bottom, left, right */
+	GradKey gradkey;     /* what grad[] was last drawn for */
 	struct wlr_xdg_toplevel_decoration_v1 *deco;
 	struct wlr_box prev; /* geometry to restore after maximize/fullscreen */
 	struct wlr_box geom; /* geometry the borders were last drawn for */
 	Style style;         /* last dfwc.style() result, applied on top of settings */
-	float shown[2][4];   /* border colors on screen: style's, or on their way there */
-	float colfrom[2][4];
+	float shown[3][4];   /* border colors on screen (from, inner, to): style's, or on their way there */
+	float colfrom[3][4];
 	float fade;          /* 0..1 while opening */
 	int styled;          /* has been styled since it mapped */
 	Anim open, col, mv;
@@ -363,10 +371,12 @@ clientat(double x, double y, struct wlr_surface **surface, double *sx, double *s
 	struct wlr_scene_surface *ss;
 	Client *c;
 
-	if (node && node->type == WLR_SCENE_NODE_RECT)
+	if (!node)
+		return NULL;
+	if (node->type == WLR_SCENE_NODE_RECT || (node->type == WLR_SCENE_NODE_BUFFER
+	&& !(ss = wlr_scene_surface_try_from_buffer(wlr_scene_buffer_from_node(node)))))
 		return clientof(node); /* a border: the window, but no surface to send input to */
-	if (!node || node->type != WLR_SCENE_NODE_BUFFER
-	|| !(ss = wlr_scene_surface_try_from_buffer(wlr_scene_buffer_from_node(node))))
+	if (node->type != WLR_SCENE_NODE_BUFFER)
 		return NULL;
 	*surface = ss->surface;
 	c = clientof(node);
@@ -380,6 +390,7 @@ static void placeerror(void);
 static void drawwallpaper(Monitor *m);
 static void snap(Client *c, int *x, int *y, int dx, int dy);
 static void showmorph(double e);
+static const struct wlr_buffer_impl textbufimpl;
 static void constrain(struct wlr_pointer_constraint_v1 *con);
 static void floatout(Client *c);
 static int istiled(Client *c);
@@ -640,14 +651,73 @@ stylebuffer(struct wlr_scene_buffer *buffer, int sx, int sy, void *data)
 		wlr_scene_buffer_set_corner_radius(buffer, c->radius);
 }
 
+static double
+sdbox(double x, double y, struct wlr_box b, const int r[4])
+{
+	/* signed distance from x, y to a box with rounded corners (top-left,
+	 * top-right, bottom-right, bottom-left): negative inside */
+	double cx = b.x + b.width / 2.0, cy = b.y + b.height / 2.0;
+	int rad = r[x < cx ? (y < cy ? 0 : 3) : (y < cy ? 1 : 2)];
+	double qx = fabs(x - cx) - b.width / 2.0 + rad, qy = fabs(y - cy) - b.height / 2.0 + rad;
+
+	return hypot(MAX(qx, 0), MAX(qy, 0)) + MIN(MAX(qx, qy), 0) - rad;
+}
+
+static void
+gradstrip(struct wlr_scene_buffer *n, struct wlr_box s, const GradKey *k)
+{
+	/* one side of a gradient border, drawn on the CPU: the ring between k->out
+	 * and k->hole, antialiased, colored along k->angle */
+	double a = k->angle * M_PI / 180, dx = cos(a), dy = sin(a);
+	double cx = k->out.x + k->out.width / 2.0, cy = k->out.y + k->out.height / 2.0;
+	double half = fabs(k->out.width / 2.0 * dx) + fabs(k->out.height / 2.0 * dy);
+	double x, y, cov, t;
+	TextBuffer *b;
+	uint32_t *px, v;
+	int stride;
+	float al;
+
+	wlr_scene_node_set_enabled(&n->node, false);
+	if (s.width <= 0 || s.height <= 0 || !(b = calloc(1, sizeof(*b))))
+		return;
+	if (!(b->img = pixman_image_create_bits(PIXMAN_a8r8g8b8, s.width, s.height, NULL, 0))) {
+		free(b);
+		return;
+	}
+	px = pixman_image_get_data(b->img);
+	stride = pixman_image_get_stride(b->img) / 4;
+	for (int j = 0; j < s.height; j++) {
+		for (int i = 0; i < s.width; i++) {
+			x = s.x + i + 0.5;
+			y = s.y + j + 0.5;
+			cov = MIN(MAX(0.5 - sdbox(x, y, k->out, k->ro), 0), 1)
+				* MIN(MAX(0.5 + sdbox(x, y, k->hole, k->ri), 0), 1);
+			t = half ? MIN(MAX(((x - cx) * dx + (y - cy) * dy) / (2 * half) + 0.5, 0), 1) : 0;
+			al = (k->col[0][3] + (k->col[1][3] - k->col[0][3]) * t) * cov;
+			v = (uint32_t)(al * 255 + 0.5f) << 24; /* premultiplied ARGB */
+			for (int ch = 0; ch < 3; ch++)
+				v |= (uint32_t)((k->col[0][ch] + (k->col[1][ch] - k->col[0][ch]) * t) * al * 255 + 0.5f)
+					<< (16 - 8 * ch);
+			px[j * stride + i] = v;
+		}
+	}
+	wlr_buffer_init(&b->base, &textbufimpl, s.width, s.height);
+	wlr_scene_buffer_set_buffer(n, &b->base);
+	wlr_buffer_drop(&b->base);
+	wlr_scene_node_set_position(&n->node, s.x, s.y);
+	wlr_scene_node_set_enabled(&n->node, true);
+}
+
 static void
 updateborders(Client *c)
 {
 	static const float red[4] = { 1, 0.2, 0.2, 1 };
 	const Settings *s = &settings;
 	struct wlr_box cg = cgeom(c), *geo = &cg, win = { 0, 0, geo->width, geo->height };
-	float fo[4], fi[4];
+	float fo[4], fi[4], fe[4];
 	const float *outer = fo, *inner = fi;
+	GradKey k;
+	int grad, ri, bot, right;
 	const int *w = s->border_width, iw = s->inner_border_width, g = s->border_gap;
 	struct wlr_box in, gap, out;
 	float color[4];
@@ -656,6 +726,7 @@ updateborders(Client *c)
 	/* the colors on screen, faded in while the window opens */
 	memcpy(fo, flashes % 2 ? red : c->shown[0], sizeof(fo));
 	memcpy(fi, flashes % 2 ? red : c->shown[1], sizeof(fi));
+	memcpy(fe, flashes % 2 ? red : c->shown[2], sizeof(fe));
 	fo[3] *= c->fade;
 	fi[3] *= c->fade;
 
@@ -700,12 +771,38 @@ updateborders(Client *c)
 	if (!bare && iw)
 		setring(c->ring[1], in, win, corner_radii_all(R ? R + iw : 0), R, inner);
 
-	wlr_scene_node_set_enabled(&c->ring[0]->node, !bare && !s->border_corners);
-	if (!bare && !s->border_corners)
-		setring(c->ring[0], out, gap, R ? corner_radii_new(R + iw + g + MAX(w[0], w[3]),
-			R + iw + g + MAX(w[0], w[1]), R + iw + g + MAX(w[2], w[1]),
-			R + iw + g + MAX(w[2], w[3])) : corner_radii_none(),
-			R ? R + iw + g : 0, outer);
+	/* a two-color border is drawn into four strips; a solid one stays a rect */
+	k = (GradKey){ .out = out, .hole = gap, .angle = s->border_angle };
+	for (int i = 0; R && i < 4; i++) {
+		k.ri[i] = R + iw + g;
+		k.ro[i] = k.ri[i] + MAX(w[i < 2 ? 0 : 2], w[i == 0 || i == 3 ? 3 : 1]);
+	}
+	/* unfaded: the strips fade by opacity, not by redrawing */
+	memcpy(k.col[0], flashes % 2 ? red : c->shown[0], sizeof(k.col[0]));
+	memcpy(k.col[1], fe, sizeof(fe));
+	grad = !bare && !s->border_corners && memcmp(k.col[0], k.col[1], sizeof(k.col[0]));
+	wlr_scene_node_set_enabled(&c->ring[0]->node, !bare && !s->border_corners && !grad);
+	if (!bare && !s->border_corners && !grad)
+		setring(c->ring[0], out, gap, R ? corner_radii_new(k.ro[0], k.ro[1], k.ro[2], k.ro[3])
+			: corner_radii_none(), k.ri[0], outer);
+	if (grad && memcmp(&k, &c->gradkey, sizeof(k))) {
+		ri = k.ri[0];
+		bot = gap.y + gap.height - ri;
+		right = gap.x + gap.width;
+		gradstrip(c->grad[0], (struct wlr_box){ out.x, out.y, out.width, gap.y + ri - out.y }, &k);
+		gradstrip(c->grad[1], (struct wlr_box){ out.x, bot, out.width, out.y + out.height - bot }, &k);
+		gradstrip(c->grad[2], (struct wlr_box){ out.x, gap.y + ri, gap.x - out.x, gap.height - 2 * ri }, &k);
+		gradstrip(c->grad[3], (struct wlr_box){ right, gap.y + ri, out.x + out.width - right,
+			gap.height - 2 * ri }, &k);
+		c->gradkey = k;
+	}
+	for (int i = 0; i < 4; i++) {
+		if (!grad)
+			wlr_scene_node_set_enabled(&c->grad[i]->node, false);
+		wlr_scene_buffer_set_opacity(c->grad[i], c->fade);
+	}
+	if (!grad)
+		c->gradkey = (GradKey){ 0 };
 
 	/* corner brackets: a horizontal and a vertical arm at each corner */
 	L = MIN(s->border_corners, MIN(out.width, out.height) / 2);
@@ -736,17 +833,19 @@ restyle(Client *c)
 	if (c->unmanaged)
 		return;
 
-	memcpy(c->style.border, focused ? s->border_focused : s->border_unfocused, sizeof(float[4]));
+	memcpy(c->style.border, focused ? s->border_focused : s->border_unfocused, sizeof(c->style.border));
 	memcpy(c->style.inner_border, focused ? s->inner_border_focused : s->inner_border_unfocused,
 		sizeof(float[4]));
 	c->style.opacity = s->opacity;
 	config_style(&w, &c->style);
-	if (s->anim_focus && c->styled && memcmp(c->shown[0], c->style.border, sizeof(c->shown[0]))) {
+	if (s->anim_focus && c->styled && (memcmp(c->shown[0], c->style.border[0], sizeof(c->shown[0]))
+	|| memcmp(c->shown[2], c->style.border[1], sizeof(c->shown[2])))) {
 		memcpy(c->colfrom, c->shown, sizeof(c->colfrom)); /* blend from what's on screen */
 		startanim(&c->col, s->anim_focus);
 	} else if (!c->col.dur) {
-		memcpy(c->shown[0], c->style.border, sizeof(c->shown[0]));
+		memcpy(c->shown[0], c->style.border[0], sizeof(c->shown[0]));
 		memcpy(c->shown[1], c->style.inner_border, sizeof(c->shown[1]));
+		memcpy(c->shown[2], c->style.border[1], sizeof(c->shown[2]));
 	}
 	c->styled = 1;
 	updateborders(c);
@@ -808,6 +907,9 @@ ghost(Client *c)
 		wlr_scene_rect_set_clipped_region(r, rects[i]->clipped_region);
 	}
 	g->opacity = (c->fullscreen ? 1 : c->style.opacity) * c->fade;
+	for (size_t i = 0; i < LENGTH(c->grad); i++)
+		if (c->grad[i]->node.enabled)
+			ghostnode(g, &c->grad[i]->node, 0, 0);
 	ghostnode(g, &c->surf->node, 0, 0);
 	wl_list_insert(&ghosts, &g->link);
 	startanim(&g->a, settings.anim_close);
@@ -835,8 +937,9 @@ animate(void)
 		if (c->col.dur) {
 			busy |= step(&c->col, now, &e);
 			for (int i = 0; i < 4; i++) {
-				c->shown[0][i] = c->colfrom[0][i] + (c->style.border[i] - c->colfrom[0][i]) * e;
+				c->shown[0][i] = c->colfrom[0][i] + (c->style.border[0][i] - c->colfrom[0][i]) * e;
 				c->shown[1][i] = c->colfrom[1][i] + (c->style.inner_border[i] - c->colfrom[1][i]) * e;
+				c->shown[2][i] = c->colfrom[2][i] + (c->style.border[1][i] - c->colfrom[2][i]) * e;
 			}
 			upd = 1;
 		}
@@ -1390,7 +1493,7 @@ showbox(void)
 	struct wlr_box b = draw.box;
 
 	setring(draw.rect, b, (struct wlr_box){ b.x + 2, b.y + 2, b.width - 4, b.height - 4 },
-		corner_radii_none(), 0, settings.border_focused);
+		corner_radii_none(), 0, settings.border_focused[0]);
 }
 
 static void
@@ -1405,7 +1508,7 @@ showmorph(double e)
 	};
 	float color[4];
 
-	memcpy(color, settings.border_focused, sizeof(color));
+	memcpy(color, settings.border_focused[0], sizeof(color));
 	color[3] *= MAX(1 - e, 0);
 	setring(morph.rect, b, (struct wlr_box){ b.x + 2, b.y + 2, b.width - 4, b.height - 4 },
 		corner_radii_none(), 0, color);
@@ -2508,6 +2611,8 @@ clientscene(Client *c, int layer, int framed)
 	}
 	for (size_t i = 0; framed && i < LENGTH(c->ring); i++)
 		c->ring[i] = wlr_scene_rect_create(c->scene, 0, 0, (float[4]){ 0 });
+	for (size_t i = 0; framed && i < LENGTH(c->grad); i++)
+		c->grad[i] = wlr_scene_buffer_create(c->scene, NULL);
 	for (size_t i = 0; framed && i < LENGTH(c->arm); i++)
 		c->arm[i] = wlr_scene_rect_create(c->scene, 0, 0, (float[4]){ 0 });
 }
