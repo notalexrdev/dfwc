@@ -163,6 +163,8 @@ the base fits them.
     presets like ink and paper).
   - **Saving:** to `~/.config/dfwc/rice.lua`, loaded after `init.lua`. dfwc rewrites only that
     file and never touches the hand-written config.
+  - Done 2026-10-25: changes run through `dfwc.set()` (so the config's checks apply) and are
+    saved at once; rice.lua holds only the settings the menu or rice.lua itself set.
 - **Workspaces (decided 2026-10-25):** dynamic, like GNOME/niri.
   - There is always one empty workspace after the last used one; empty ones in the middle vanish
     when you leave them.
