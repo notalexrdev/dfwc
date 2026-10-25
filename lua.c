@@ -523,6 +523,13 @@ l_canvas(lua_State *L)
 }
 
 static int
+l_magnify(lua_State *L)
+{
+	magnify(luaL_checknumber(L, 1));
+	return 0;
+}
+
+static int
 l_pan(lua_State *L)
 {
 	panby(luaL_checkinteger(L, 1), luaL_checkinteger(L, 2));
@@ -853,6 +860,7 @@ ACTION(fullscreen, togglefullscreen())
 ACTION(launch, spawn(settings.launcher))
 ACTION(maximize, togglemaximize())
 ACTION(minimize, minimize())
+ACTION(overview, overview())
 ACTION(ontop, toggleontop())
 ACTION(quit, quit())
 ACTION(reload, config_reload())
@@ -880,6 +888,8 @@ static const luaL_Reg api[] = {
 	{ "reload", l_reload },
 	{ "resize", l_resize },
 	{ "restore", l_restore },
+	{ "magnify", l_magnify },
+	{ "overview", l_overview },
 	{ "pan", l_pan },
 	{ "rule", l_rule },
 	{ "send", l_send },

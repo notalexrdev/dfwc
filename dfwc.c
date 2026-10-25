@@ -189,6 +189,9 @@ struct Workspace {
 	struct wlr_scene_tree *tree[3]; /* its windows, under LyrClients, LyrOnTop, LyrFullscreen */
 	Mode mode;
 	int cx, cy; /* a canvas's view: the screen's top-left, in canvas coordinates */
+	double zoom;   /* a canvas's zoom, applied as the screen's scale */
+	double ovzoom; /* the zoom to go back to from the overview; 0: not in it */
+	int ovx, ovy;  /* and the view */
 };
 
 typedef struct {
@@ -726,6 +729,7 @@ wsnew(Monitor *m)
 	/* a new workspace starts as the config says */
 	w->mode = (Mode){ .tiling = own->tiling, .canvas = own->canvas, .mfact = own->mfact,
 		.nmaster = own->nmaster };
+	w->zoom = 1;
 	memcpy(w->mode.layout, own->layout, sizeof(w->mode.layout));
 	wl_list_insert(m->spaces.prev, &w->link);
 	return w;
@@ -763,6 +767,51 @@ pan(Workspace *w, int x, int y)
 			wlr_xwayland_surface_configure(c->xs, b.x, b.y, b.width, b.height);
 		}
 	}
+}
+
+static void
+applyscale(Monitor *m)
+{
+	/* a canvas's zoom is the screen's scale: windows stay live and sharp, and
+	 * input maps through it for free */
+	struct wlr_output_state state;
+	float s = settings.scale * (m->ws && m->ws->mode.canvas ? m->ws->zoom : 1);
+
+	if (m->wlr->scale == s)
+		return;
+	wlr_output_state_init(&state);
+	wlr_output_state_set_scale(&state, s);
+	wlr_output_commit_state(m->wlr, &state);
+	wlr_output_state_finish(&state);
+	wlr_output_layout_get_box(output_layout, m->wlr, &m->area);
+}
+
+static void
+zoomat(Workspace *w, double z, double x, double y)
+{
+	/* the canvas point at layout x, y stays on the same spot of the screen */
+	Monitor *m = w->m;
+	double old = w->zoom, ax = m->area.x, ay = m->area.y, nx, ny;
+	int atcursor = x == cursor->x && y == cursor->y;
+
+	if ((z = MIN(MAX(z, 0.05), 4)) == old || m->ws != w)
+		return;
+	w->zoom = z;
+	applyscale(m);
+	nx = m->area.x + (x - ax) * old / z;
+	ny = m->area.y + (y - ay) * old / z;
+	pan(w, w->cx + x - nx, w->cy + y - ny);
+	if (atcursor) /* the pointer stays where it is on the glass */
+		wlr_cursor_warp(cursor, NULL, nx, ny);
+}
+
+static void
+lookat(Workspace *w, double x, double y)
+{
+	/* the canvas point x, y in the middle of the screen */
+	Monitor *m = w->m;
+
+	pan(w, x - m->area.x - m->area.width / 2.0, y - m->area.y - m->area.height / 2.0);
 }
 
 static void
@@ -2157,9 +2206,23 @@ buttonpress(struct wl_listener *listener, void *data)
 	struct wlr_keyboard *kb;
 	struct wlr_box box;
 	double sx, sy, cx, cy;
+	Workspace *w;
 	Client *c;
 
 	wlr_idle_notifier_v1_notify_activity(idlenotifier, seat);
+	if (event->state == WL_POINTER_BUTTON_STATE_PRESSED && (w = curws()) && w->ovzoom && !locked) {
+		/* a click in the overview zooms back in there, on the window clicked */
+		struct wlr_box b = { cursor->x + w->cx, cursor->y + w->cy, 0, 0 };
+		if ((c = clientat(cursor->x, cursor->y, &surface, &sx, &sy)))
+			b = clientbox(c);
+		w->zoom = w->ovzoom;
+		w->ovzoom = 0;
+		applyscale(w->m);
+		lookat(w, b.x + b.width / 2.0, b.y + b.height / 2.0);
+		focusclient(c, 1);
+		motionnotify(event->time_msec);
+		return;
+	}
 	if (locked) { /* only the locker sees clicks; one gives its surface the keyboard */
 		if (event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
 			clientat(cursor->x, cursor->y, &surface, &sx, &sy);
@@ -2225,8 +2288,15 @@ static void
 axisnotify(struct wl_listener *listener, void *data)
 {
 	struct wlr_pointer_axis_event *event = data;
+	struct wlr_keyboard *kb = wlr_seat_get_keyboard(seat);
+	Workspace *w;
 
 	wlr_idle_notifier_v1_notify_activity(idlenotifier, seat);
+	if (kb && (wlr_keyboard_get_modifiers(kb) & MODMASK) == modkey && !locked
+	&& event->orientation == WL_POINTER_AXIS_VERTICAL_SCROLL && (w = curws()) && w->mode.canvas) {
+		magnify(pow(1.1, -event->delta / 15)); /* Mod+scroll zooms a canvas, a notch 10% */
+		return;
+	}
 	wlr_seat_pointer_notify_axis(seat, event->time_msec, event->orientation, event->delta,
 		event->delta_discrete, event->source, event->relative_direction);
 }
@@ -2519,9 +2589,14 @@ arrange(void)
 	}
 	wl_list_for_each(m, &mons, link) {
 		prune(m);
-		wl_list_for_each(w, &m->spaces, link)
-			if (!w->mode.canvas && (w->cx || w->cy))
+		wl_list_for_each(w, &m->spaces, link) {
+			if (!w->mode.canvas && (w->cx || w->cy || w->zoom != 1)) {
 				unpan(w);
+				w->zoom = 1;
+				w->ovzoom = 0;
+			}
+		}
+		applyscale(m);
 	}
 	/* tiling turned off: everything back where it floated */
 	wl_list_for_each(c, &tiles, tlink) {
@@ -2562,6 +2637,7 @@ view(Workspace *w)
 	if (m->slidefrom) /* a slide still running ends where it was going */
 		wsshow(m->slidefrom, 0, 0);
 	m->ws = w;
+	applyscale(m); /* a zoomed canvas has its own scale */
 	m->slidefrom = NULL;
 	if (settings.anim_move) {
 		/* the old one slides out and the new one in, up or down by their order */
@@ -2586,6 +2662,27 @@ panby(int dx, int dy)
 		pan(w, w->cx + dx, w->cy + dy);
 }
 
+static double pinched; /* the pinch's scale so far */
+
+static void
+pinchstart(struct wl_listener *listener, void *data)
+{
+	pinched = 1;
+}
+
+static void
+pinch(struct wl_listener *listener, void *data)
+{
+	/* two fingers spreading or closing zoom a canvas */
+	struct wlr_pointer_pinch_update_event *event = data;
+
+	wlr_idle_notifier_v1_notify_activity(idlenotifier, seat);
+	if (locked || event->scale <= 0)
+		return;
+	magnify(event->scale / pinched);
+	pinched = event->scale;
+}
+
 static void
 swipe(struct wl_listener *listener, void *data)
 {
@@ -2601,6 +2698,54 @@ swipe(struct wl_listener *listener, void *data)
 	panby(rx, ry);
 	rx -= (int)rx;
 	ry -= (int)ry;
+}
+
+void
+magnify(double f)
+{
+	Workspace *w = curws();
+
+	if (w && w->mode.canvas && f > 0)
+		zoomat(w, w->zoom * f, cursor->x, cursor->y);
+}
+
+void
+overview(void)
+{
+	/* zoomed out to fit every window, never in; again goes back */
+	Workspace *w = curws();
+	int x0 = INT_MAX, y0 = INT_MAX, x1 = INT_MIN, y1 = INT_MIN, pw, ph;
+	struct wlr_box b;
+	Client *c;
+
+	if (!w || !w->mode.canvas)
+		return;
+	if (w->ovzoom) {
+		w->zoom = w->ovzoom;
+		w->ovzoom = 0;
+		applyscale(w->m);
+		pan(w, w->ovx, w->ovy);
+		return;
+	}
+	wl_list_for_each(c, &clients, link) {
+		if (c->ws != w || c->minimized)
+			continue;
+		b = outset(c, clientbox(c));
+		x0 = MIN(x0, b.x);
+		y0 = MIN(y0, b.y);
+		x1 = MAX(x1, b.x + b.width);
+		y1 = MAX(y1, b.y + b.height);
+	}
+	if (x0 >= x1 || y0 >= y1)
+		return;
+	w->ovzoom = w->zoom;
+	w->ovx = w->cx;
+	w->ovy = w->cy;
+	wlr_output_transformed_resolution(w->m->wlr, &pw, &ph);
+	w->zoom = MIN(MAX(0.9 * MIN(pw / (settings.scale * (x1 - x0)), ph / (settings.scale * (y1 - y0))),
+		0.05), w->ovzoom);
+	applyscale(w->m);
+	lookat(w, (x0 + x1) / 2.0, (y0 + y1) / 2.0);
 }
 
 void
@@ -2692,8 +2837,18 @@ updatemons(struct wl_listener *listener, void *data)
 	wl_list_for_each(m, &mons, link) {
 		wlr_output_layout_get_box(output_layout, m->wlr, &m->area);
 		arrangelayers(m);
-		if (!wlr_box_equal(&m->area, &m->wallbox))
+		if (wlr_box_equal(&m->area, &m->wallbox))
+			continue;
+		if (m->wall && m->wall->buffer && m->wall->buffer->width == m->wlr->width
+		&& m->wall->buffer->height == m->wlr->height) {
+			/* same pixels, new logical size (a canvas zoom): no redraw */
+			wlr_scene_buffer_set_dest_size(m->wall, m->area.width, m->area.height);
+			wlr_scene_node_set_position(&m->wall->node, m->area.x, m->area.y);
+			wlr_scene_optimized_blur_mark_dirty(optblur);
+			m->wallbox = m->area;
+		} else {
 			drawwallpaper(m);
+		}
 	}
 	placeerror();
 }
@@ -3413,7 +3568,6 @@ applysettings(void)
 {
 	static Settings prev = { .cursor_size = -1 }; /* -1 forces the first cursor setup */
 	const Settings *s = &settings;
-	struct wlr_output_state state;
 	struct xkb_keymap *km;
 	Keyboard *kb;
 	Pointer *p;
@@ -3460,12 +3614,7 @@ applysettings(void)
 		wlr_scene_optimized_blur_mark_dirty(optblur);
 
 	wl_list_for_each(m, &mons, link) {
-		if (m->wlr->scale != (float)s->scale) {
-			wlr_output_state_init(&state);
-			wlr_output_state_set_scale(&state, s->scale);
-			wlr_output_commit_state(m->wlr, &state);
-			wlr_output_state_finish(&state);
-		}
+		applyscale(m);
 		arrangelayers(m); /* border sizes change what maximized windows get */
 	}
 	wl_list_for_each(c, &clients, link)
@@ -3710,6 +3859,8 @@ static struct wl_listener cursor_button = { .notify = buttonpress };
 static struct wl_listener cursor_axis = { .notify = axisnotify };
 static struct wl_listener cursor_frame = { .notify = framenotify };
 static struct wl_listener cursor_swipe = { .notify = swipe };
+static struct wl_listener cursor_pinchstart = { .notify = pinchstart };
+static struct wl_listener cursor_pinch = { .notify = pinch };
 static struct wl_listener request_cursor = { .notify = setcursor };
 static struct wl_listener request_sel = { .notify = setsel };
 static struct wl_listener request_psel = { .notify = setpsel };
@@ -3930,6 +4081,8 @@ setup(void)
 	wl_signal_add(&cursor->events.axis, &cursor_axis);
 	wl_signal_add(&cursor->events.frame, &cursor_frame);
 	wl_signal_add(&cursor->events.swipe_update, &cursor_swipe);
+	wl_signal_add(&cursor->events.pinch_begin, &cursor_pinchstart);
+	wl_signal_add(&cursor->events.pinch_update, &cursor_pinch);
 	cursor_shape_mgr = wlr_cursor_shape_manager_v1_create(dpy, 1);
 	wl_signal_add(&cursor_shape_mgr->events.request_set_shape, &request_shape);
 
@@ -3981,6 +4134,7 @@ cleanup(void)
 	/* wlroots asserts that no listeners are left when it destroys these */
 	struct wl_listener *listeners[] = { &new_output, &new_input, &new_toplevel, &new_popup,
 		&cursor_motion, &cursor_motion_absolute, &cursor_button, &cursor_axis, &cursor_frame, &cursor_swipe,
+		&cursor_pinchstart, &cursor_pinch,
 		&request_cursor, &request_sel, &request_psel, &request_shape, &layout_change,
 		&new_layer, &new_deco, &request_activate, &new_constraint, &new_lock, &new_inhibitor };
 	Monitor *m;

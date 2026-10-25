@@ -94,6 +94,8 @@ void toggleontop(void);
 void viewws(int n, int dir);              /* the n-th workspace, or dir steps from the shown one */
 void sendws(int n, int dir, int follow);  /* the focused window there, maybe following it */
 void panby(int dx, int dy);               /* move a canvas workspace's view */
+void magnify(double f);                   /* zoom a canvas by f around the pointer */
+void overview(void);                      /* a canvas zoomed out to fit every window, or back */
 
 /* lua.c */
 extern Settings settings;

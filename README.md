@@ -101,6 +101,8 @@ the bind while the key is held.
 | `dfwc.workspace(n)` | show the n-th workspace, or `"next"` / `"prev"` |
 | `dfwc.canvas()` | make this workspace a canvas or not (`true`/`false` to set) |
 | `dfwc.pan(dx, dy)` | move a canvas's view by that many pixels |
+| `dfwc.magnify(f)` | zoom a canvas by f (2: twice as big) around the pointer |
+| `dfwc.overview()` | zoom a canvas out to fit every window; again (or a click) goes back |
 | `dfwc.send(n, follow)` | move the focused window to workspace n (or `"next"`/`"prev"`); `true` goes along |
 | `dfwc.layout(name)` | pick a tiling layout |
 | `dfwc.float()` | let the focused window float while the rest tile |
@@ -188,6 +190,11 @@ you move the view instead. Pan with Mod+Alt+arrows, Mod+right-drag on empty spac
 three fingers on the touchpad. New windows open in the middle of the view; maximize and
 fullscreen fill the screen wherever you are. Canvas wins over tiling; turning it off
 leaves every window where it is on screen. `canvas = true` makes new workspaces canvases.
+
+Zoom with Mod+Alt+i/o, Mod+scroll or a touchpad pinch; windows stay live and you keep
+working at any zoom. Mod+o zooms out to fit everything; a click zooms back in there, on the
+window you clicked. Zoom is the screen's scale, so apps redraw sharp at the new size, and
+bars and the cursor zoom along on that workspace.
 
 ### Tiling
 

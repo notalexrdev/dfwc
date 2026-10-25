@@ -151,7 +151,10 @@ the base fits them.
   - Panning done 2026-10-25: each workspace has a view offset that moves its scene trees (one
     move however many windows); window coordinates are canvas coordinates, converted only
     where screen coordinates come in (placement, maximize/fullscreen, popups, X11 positions,
-    the drawn box); leaving canvas mode bakes the offset into the windows. Zoom is next.
+    the drawn box); leaving canvas mode bakes the offset into the windows.
+  - Zoom done 2026-10-25, overview and free zoom both: a canvas's zoom is the monitor's output
+    scale (times `scale`), so windows stay live, sharp and clickable with no per-window
+    scaling code. Cost: each zoom step makes apps redraw, and bars and the cursor zoom along.
 - **Rice menu:** a key opens a panel dfwc draws itself in the ink style: sliders, color
   swatches, toggles, keyboard and mouse. Changes apply live.
   - **Covers:** borders and colors (widths, focused/unfocused, gradients, angle, spin, corners,

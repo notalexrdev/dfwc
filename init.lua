@@ -39,8 +39,12 @@ for i = 1, 9 do
 end
 
 -- canvas: Mod+c makes this workspace an endless plane; pan with Mod+Alt+arrows,
--- Mod+right-drag on empty space, or three fingers on the touchpad
+-- Mod+right-drag on empty space, or three fingers on the touchpad; zoom with
+-- Mod+Alt+i/o, Mod+scroll or a pinch; Mod+o shows everything, a click goes back
 dfwc.bind("Mod+c", dfwc.canvas)
+dfwc.bind("Mod+o", dfwc.overview)
+dfwc.bind("Mod+Alt+i", function() dfwc.magnify(1.25) end, { repeats = true })
+dfwc.bind("Mod+Alt+o", function() dfwc.magnify(0.8) end, { repeats = true })
 for key, d in pairs{ Left = { -80, 0 }, Right = { 80, 0 }, Up = { 0, -80 }, Down = { 0, 80 } } do
 	dfwc.bind("Mod+Alt+" .. key, function() dfwc.pan(d[1], d[2]) end, { repeats = true })
 end
