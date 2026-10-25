@@ -323,16 +323,22 @@ ease(double t)
 }
 
 static void
-startanim(Anim *a, int dur)
+wake(void)
 {
 	Monitor *m;
 
-	a->start = msec();
-	a->dur = dur;
 	if (animating++)
 		return;
-	wl_list_for_each(m, &mons, link) /* wake the frame loop */
+	wl_list_for_each(m, &mons, link) /* start the frame loop */
 		wlr_output_schedule_frame(m->wlr);
+}
+
+static void
+startanim(Anim *a, int dur)
+{
+	a->start = msec();
+	a->dur = dur;
+	wake();
 }
 
 static int
@@ -773,6 +779,9 @@ updateborders(Client *c)
 
 	/* a two-color border is drawn into four strips; a solid one stays a rect */
 	k = (GradKey){ .out = out, .hole = gap, .angle = s->border_angle };
+	if (s->border_spin > 0) /* turned by the clock, so every window spins in step */
+		k.angle = (k.angle + (int)(msec() % (uint32_t)(s->border_spin * 1000) * 360
+			/ (s->border_spin * 1000))) % 360;
 	for (int i = 0; R && i < 4; i++) {
 		k.ri[i] = R + iw + g;
 		k.ro[i] = k.ri[i] + MAX(w[i < 2 ? 0 : 2], w[i == 0 || i == 3 ? 3 : 1]);
@@ -803,6 +812,8 @@ updateborders(Client *c)
 	}
 	if (!grad)
 		c->gradkey = (GradKey){ 0 };
+	else if (s->border_spin > 0)
+		wake(); /* animate() keeps turning it */
 
 	/* corner brackets: a horizontal and a vertical arm at each corner */
 	L = MIN(s->border_corners, MIN(out.width, out.height) / 2);
@@ -943,6 +954,8 @@ animate(void)
 			}
 			upd = 1;
 		}
+		if (settings.border_spin > 0 && c->gradkey.out.width)
+			busy = upd = 1; /* a spinning gradient border */
 		if (c->mv.dur) {
 			busy |= step(&c->mv, now, &e);
 			wlr_scene_node_set_position(&c->scene->node,

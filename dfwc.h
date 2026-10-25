@@ -22,6 +22,7 @@ typedef struct {
 	int border_width[4]; /* top, right, bottom, left */
 	float border_focused[2][4], border_unfocused[2][4]; /* from, to: the same when solid */
 	int border_angle;    /* gradient direction in degrees: 0 left to right, 90 top down */
+	double border_spin;  /* seconds per turn of a gradient border; 0: still */
 	int inner_border_width, border_gap;
 	float inner_border_focused[4], inner_border_unfocused[4];
 	int border_corners;  /* 0: full border, else length of corner-only brackets */

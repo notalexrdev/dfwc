@@ -125,6 +125,7 @@ the bind while the key is held.
 | `border_width` | 2 (or `{ top, right, bottom, left }`) |
 | `border_focused`, `border_unfocused` | `"#a3a3a3"`, `"#262626"`; two colors make a gradient: `{ "#89b4fa", "#f5c2e7" }` |
 | `border_angle` | 45: gradient direction in degrees (0 left to right, 90 top down) |
+| `border_spin` | 0: seconds per turn of a spinning gradient border (costs a little CPU while one is visible) |
 | `inner_border_width` | 0: a second border hugging the window |
 | `inner_border_focused`, `inner_border_unfocused` | `"#000000"` |
 | `border_gap` | 0: see-through space between window and border |

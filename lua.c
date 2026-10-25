@@ -73,6 +73,7 @@ static const struct {
 	FIELD(border_focused, Grad, 0, 0),
 	FIELD(border_unfocused, Grad, 0, 0),
 	FIELD(border_angle, Int, 0, 359),
+	FIELD(border_spin, Num, 0, 600),
 	FIELD(inner_border_width, Int, 0, 100),
 	FIELD(inner_border_focused, Color, 0, 0),
 	FIELD(inner_border_unfocused, Color, 0, 0),
