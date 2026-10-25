@@ -294,6 +294,21 @@ static struct wl_list ghosts;
 static struct wl_list orphans; /* workspaces waiting for a screen after the last one went */
 static Workspace *selws;       /* the workspace whose Mode settings holds */
 static Workspace *panws;       /* the canvas being dragged */
+typedef struct {
+	struct wlr_scene_node *n;      /* a copy of a window's buffer, border or shadow */
+	double x, y, w, h;             /* where the original was, layout coords */
+	struct wlr_box clip;           /* rects and shadows: the cut-out, relative */
+	struct fx_corner_radii radii, clipradii;
+	float sigma;
+	int radius;
+} ZNode;
+static struct {
+	struct wlr_scene_tree *tree;   /* NULL unless a zoom is gliding */
+	Workspace *ws;
+	ZNode *n;
+	size_t len, cap;
+	double from, z, ax, ay;        /* zoom at the start, zoom shown now, the point it's around */
+} zsnap; /* a canvas zoom glides on copies, so apps and blur redraw once, at the end */
 static struct {
 	struct wlr_scene_buffer *node; /* NULL while closed */
 	struct wlr_box box;            /* on screen, layout coordinates */
@@ -822,6 +837,144 @@ zoomat(Workspace *w, double z, double x, double y)
 }
 
 static void
+zcopy(struct wlr_scene_node *n, int x, int y)
+{
+	/* copy what's shown under n: buffers, border rects, shadows; blur is skipped */
+	struct wlr_scene_node *child;
+	struct wlr_scene_buffer *b, *cb;
+	struct wlr_scene_rect *rc, *cr;
+	struct wlr_scene_shadow *sh, *cs;
+	ZNode z = { 0 }, *grown;
+
+	if (!n->enabled)
+		return;
+	x += n->x;
+	y += n->y;
+	if (n->type == WLR_SCENE_NODE_TREE) {
+		wl_list_for_each(child, &wlr_scene_tree_from_node(n)->children, link)
+			zcopy(child, x, y);
+		return;
+	}
+	if (zsnap.len == zsnap.cap) {
+		if (!(grown = realloc(zsnap.n, (zsnap.cap * 2 + 64) * sizeof(*grown))))
+			return;
+		zsnap.n = grown;
+		zsnap.cap = zsnap.cap * 2 + 64;
+	}
+	z.x = x;
+	z.y = y;
+	if (n->type == WLR_SCENE_NODE_BUFFER && (b = wlr_scene_buffer_from_node(n))->buffer
+	&& (cb = wlr_scene_buffer_create(zsnap.tree, b->buffer))) {
+		z.n = &cb->node;
+		z.w = b->dst_width ? b->dst_width : b->buffer->width;
+		z.h = b->dst_height ? b->dst_height : b->buffer->height;
+		z.radii = b->corners;
+		wlr_scene_buffer_set_source_box(cb, &b->src_box);
+		wlr_scene_buffer_set_transform(cb, b->transform);
+		wlr_scene_buffer_set_opacity(cb, b->opacity);
+	} else if (n->type == WLR_SCENE_NODE_RECT && (rc = wlr_scene_rect_from_node(n))
+	&& (cr = wlr_scene_rect_create(zsnap.tree, rc->width, rc->height, rc->color))) {
+		z.n = &cr->node;
+		z.w = rc->width;
+		z.h = rc->height;
+		z.radii = rc->corners;
+		z.clip = rc->clipped_region.area;
+		z.clipradii = rc->clipped_region.corners;
+	} else if (n->type == WLR_SCENE_NODE_SHADOW && (sh = wlr_scene_shadow_from_node(n))
+	&& (cs = wlr_scene_shadow_create(zsnap.tree, sh->width, sh->height, sh->corner_radius,
+			sh->blur_sigma, sh->color))) {
+		z.n = &cs->node;
+		z.w = sh->width;
+		z.h = sh->height;
+		z.radius = sh->corner_radius;
+		z.sigma = sh->blur_sigma;
+		z.clip = sh->clipped_region.area;
+		z.clipradii = sh->clipped_region.corners;
+	} else {
+		return;
+	}
+	zsnap.n[zsnap.len++] = z;
+}
+
+static struct fx_corner_radii
+zradii(struct fx_corner_radii c, double k)
+{
+	return corner_radii_new(c.top_left * k, c.top_right * k, c.bottom_right * k, c.bottom_left * k);
+}
+
+static void
+zshow(double zoom)
+{
+	/* every copy scaled around the anchor, as the real zoom will put it */
+	double k = zoom / zsnap.from;
+	struct wlr_box clip;
+	ZNode *z;
+
+	for (size_t i = 0; i < zsnap.len; i++) {
+		z = &zsnap.n[i];
+		wlr_scene_node_set_position(z->n, zsnap.ax + (z->x - zsnap.ax) * k, zsnap.ay + (z->y - zsnap.ay) * k);
+		clip = (struct wlr_box){ z->clip.x * k, z->clip.y * k, z->clip.width * k, z->clip.height * k };
+		switch (z->n->type) {
+		case WLR_SCENE_NODE_BUFFER:
+			wlr_scene_buffer_set_dest_size(wlr_scene_buffer_from_node(z->n), MAX(z->w * k, 1), MAX(z->h * k, 1));
+			wlr_scene_buffer_set_corner_radii(wlr_scene_buffer_from_node(z->n), zradii(z->radii, k));
+			break;
+		case WLR_SCENE_NODE_RECT:
+			wlr_scene_rect_set_size(wlr_scene_rect_from_node(z->n), z->w * k, z->h * k);
+			wlr_scene_rect_set_corner_radii(wlr_scene_rect_from_node(z->n), zradii(z->radii, k));
+			wlr_scene_rect_set_clipped_region(wlr_scene_rect_from_node(z->n),
+				(struct clipped_region){ clip, zradii(z->clipradii, k) });
+			break;
+		case WLR_SCENE_NODE_SHADOW:
+			wlr_scene_shadow_set_size(wlr_scene_shadow_from_node(z->n), z->w * k, z->h * k);
+			wlr_scene_shadow_set_corner_radius(wlr_scene_shadow_from_node(z->n), z->radius * k);
+			wlr_scene_shadow_set_blur_sigma(wlr_scene_shadow_from_node(z->n), z->sigma * k);
+			wlr_scene_shadow_set_clipped_region(wlr_scene_shadow_from_node(z->n),
+				(struct clipped_region){ clip, zradii(z->clipradii, k) });
+			break;
+		default:
+			break;
+		}
+	}
+}
+
+static void
+zstart(Workspace *w)
+{
+	/* the shown windows copied once; the real ones hide until the zoom lands */
+	if (zsnap.tree || w->m->ws != w)
+		return;
+	zsnap.tree = wlr_scene_tree_create(layers[LyrClients]);
+	zsnap.ws = w;
+	zsnap.from = zsnap.z = w->zoom;
+	zsnap.ax = cursor->x;
+	zsnap.ay = cursor->y;
+	zsnap.len = 0;
+	for (int i = 0; i < 3; i++) {
+		zcopy(&w->tree[i]->node, 0, 0);
+		wlr_scene_node_set_enabled(&w->tree[i]->node, false);
+	}
+}
+
+static void
+zend(void)
+{
+	/* the copies go and the real zoom happens, once */
+	Workspace *w = zsnap.ws;
+
+	if (!zsnap.tree)
+		return;
+	wlr_scene_node_destroy(&zsnap.tree->node);
+	zsnap.tree = NULL;
+	zsnap.ws = NULL;
+	for (int i = 0; i < 3; i++)
+		wlr_scene_node_set_enabled(&w->tree[i]->node, true);
+	if (w->ztarget)
+		zoomat(w, w->ztarget, zsnap.ax, zsnap.ay);
+	w->ztarget = 0;
+}
+
+static void
 lookat(Workspace *w, double x, double y)
 {
 	/* the canvas point x, y in the middle of the screen */
@@ -1260,14 +1413,13 @@ animate(void)
 		busy |= step(&morph.a, now, &e);
 		showmorph(e);
 	}
-	wl_list_for_each(m, &mons, link) {
-		if (!m->ws || !m->ws->ztarget)
-			continue;
+	if (zsnap.tree) {
 		/* a third of the way each frame: quick, and it lands softly */
-		e = fabs(log(m->ws->ztarget / m->ws->zoom)) < 0.004 ? 1 : 0.35;
-		zoomat(m->ws, m->ws->zoom + (m->ws->ztarget - m->ws->zoom) * e, cursor->x, cursor->y);
-		if (e == 1 || !m->ws->mode.canvas)
-			m->ws->ztarget = 0;
+		e = fabs(log(zsnap.ws->ztarget / zsnap.z)) < 0.004 ? 1 : 0.35;
+		zsnap.z += (zsnap.ws->ztarget - zsnap.z) * e;
+		zshow(zsnap.z);
+		if (e == 1)
+			zend();
 		else
 			busy = 1;
 	}
@@ -2625,6 +2777,8 @@ arrange(void)
 	Monitor *m;
 	Client *c;
 
+	if (zsnap.tree && !zsnap.ws->mode.canvas)
+		zend();
 	/* runtime changes (dfwc.tiling(), mfact keys, a reload) belong to the shown workspace */
 	if (selws)
 		modeget(&selws->mode);
@@ -2680,6 +2834,7 @@ view(Workspace *w)
 
 	if (!m || w == m->ws)
 		return;
+	zend(); /* a zoom still gliding lands first */
 	old = m->ws;
 	if (m->slidefrom) /* a slide still running ends where it was going */
 		wsshow(m->slidefrom, 0, 0);
@@ -2757,11 +2912,12 @@ magnify(double f)
 	if (!w || !w->mode.canvas || f <= 0)
 		return;
 	w->ztarget = MIN(MAX((w->ztarget ? w->ztarget : w->zoom) * f, 0.05), 4);
-	if (!settings.anim_move) {
+	if (!settings.anim_move || w->m->ws != w) {
 		zoomat(w, w->ztarget, cursor->x, cursor->y);
 		w->ztarget = 0;
 		return;
 	}
+	zstart(w);
 	wake();
 }
 
@@ -2776,7 +2932,7 @@ overview(void)
 
 	if (!w || !w->mode.canvas)
 		return;
-	w->ztarget = 0;
+	zend();
 	if (w->ovzoom) {
 		w->zoom = w->ovzoom;
 		w->ovzoom = 0;
@@ -2901,7 +3057,8 @@ updatemons(struct wl_listener *listener, void *data)
 			/* same pixels, new logical size (a canvas zoom): no redraw */
 			wlr_scene_buffer_set_dest_size(m->wall, m->area.width, m->area.height);
 			wlr_scene_node_set_position(&m->wall->node, m->area.x, m->area.y);
-			m->wallbox = m->area; /* the same pixels on the glass: the blur cache holds */
+			wlr_scene_optimized_blur_mark_dirty(optblur);
+			m->wallbox = m->area;
 		} else {
 			drawwallpaper(m);
 		}
@@ -4622,6 +4779,7 @@ cleanup(void)
 		free(w);
 	wl_list_init(&orphans);
 	selws = NULL;
+	free(zsnap.n);
 	wlr_scene_node_destroy(&scene->tree.node);
 	wlr_xcursor_manager_destroy(cursor_mgr);
 	wlr_cursor_destroy(cursor);
