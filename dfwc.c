@@ -1,21 +1,20 @@
 /* See LICENSE file for copyright and license details.
  *
- * dfwc is a floating Wayland compositor on wlroots and scenefx. Windows float
- * and keep the stacking order the user gives them; keybinds and settings come
- * from init.lua (see lua.c).
+ * dfwc is a Wayland compositor on wlroots and scenefx. Windows float by
+ * default; each workspace can also tile them or become a canvas to pan and
+ * zoom. Keybinds and settings come from init.lua (see lua.c).
  */
 #include <drm_fourcc.h>
 #include <errno.h>
-#include <fcft/fcft.h>
-#include <png.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <limits.h>
+#include <linux/input-event-codes.h>
 #include <locale.h>
 #include <math.h>
-#include <linux/input-event-codes.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,8 +23,10 @@
 #include <time.h>
 #include <uchar.h>
 #include <unistd.h>
-#include <scenefx/render/fx_renderer/fx_renderer.h>
+#include <fcft/fcft.h>
 #include <libinput.h>
+#include <png.h>
+#include <scenefx/render/fx_renderer/fx_renderer.h>
 #include <scenefx/types/wlr_scene.h>
 #include <wlr/backend.h>
 #include <wlr/backend/libinput.h>
@@ -42,6 +43,8 @@
 #include <wlr/types/wlr_ext_image_capture_source_v1.h>
 #include <wlr/types/wlr_ext_image_copy_capture_v1.h>
 #include <wlr/types/wlr_fractional_scale_v1.h>
+#include <wlr/types/wlr_idle_inhibit_v1.h>
+#include <wlr/types/wlr_idle_notify_v1.h>
 #include <wlr/types/wlr_keyboard.h>
 #include <wlr/types/wlr_layer_shell_v1.h>
 #include <wlr/types/wlr_linux_dmabuf_v1.h>
@@ -50,19 +53,16 @@
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_pointer.h>
 #include <wlr/types/wlr_pointer_constraints_v1.h>
-#include <wlr/types/wlr_relative_pointer_v1.h>
-#include <wlr/types/wlr_tearing_control_v1.h>
-#include <wlr/types/wlr_session_lock_v1.h>
-#include <wlr/types/wlr_idle_notify_v1.h>
-#include <wlr/types/wlr_idle_inhibit_v1.h>
-#include <wlr/util/region.h>
 #include <wlr/types/wlr_presentation_time.h>
 #include <wlr/types/wlr_primary_selection.h>
 #include <wlr/types/wlr_primary_selection_v1.h>
+#include <wlr/types/wlr_relative_pointer_v1.h>
 #include <wlr/types/wlr_screencopy_v1.h>
 #include <wlr/types/wlr_seat.h>
+#include <wlr/types/wlr_session_lock_v1.h>
 #include <wlr/types/wlr_single_pixel_buffer_v1.h>
 #include <wlr/types/wlr_subcompositor.h>
+#include <wlr/types/wlr_tearing_control_v1.h>
 #include <wlr/types/wlr_viewporter.h>
 #include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/types/wlr_xdg_activation_v1.h>
@@ -70,6 +70,7 @@
 #include <wlr/types/wlr_xdg_output_v1.h>
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/log.h>
+#include <wlr/util/region.h>
 #include <wlr/xwayland.h>
 
 #include "dfwc.h"
@@ -453,9 +454,13 @@ selclient(void)
 static Monitor *
 selmon(void)
 {
+	/* the screen with the pointer, or any while it's between screens */
 	struct wlr_output *o = wlr_output_layout_output_at(output_layout, cursor->x, cursor->y);
+	Monitor *m;
 
-	return o ? o->data : NULL;
+	if (o)
+		return o->data;
+	return wl_list_empty(&mons) ? NULL : wl_container_of(mons.next, m, link);
 }
 
 static void
@@ -684,8 +689,6 @@ curws(void)
 	/* the workspace shown on the screen with the pointer */
 	Monitor *m = selmon();
 
-	if (!m && !wl_list_empty(&mons))
-		m = wl_container_of(mons.next, m, link);
 	return m ? m->ws : NULL;
 }
 
@@ -1006,14 +1009,12 @@ updateborders(Client *c)
 	static const float red[4] = { 1, 0.2, 0.2, 1 };
 	const Settings *s = &settings;
 	struct wlr_box cg = cgeom(c), *geo = &cg, win = { 0, 0, geo->width, geo->height };
-	float fo[4], fi[4], fe[4];
-	const float *outer = fo, *inner = fi;
-	GradKey k;
-	int grad, ri, bot, right;
 	const int *w = s->border_width, iw = s->inner_border_width, g = s->border_gap;
+	float fo[4], fi[4], fe[4], color[4];
+	const float *outer = fo, *inner = fi;
+	int bare = c->fullscreen || c->smart, R, L, sh, grad, ri, bot, right;
 	struct wlr_box in, gap, out;
-	float color[4];
-	int bare = c->fullscreen || c->smart, R, L, sh;
+	GradKey k;
 
 	/* the colors on screen, faded in while the window opens */
 	memcpy(fo, flashes % 2 ? red : c->shown[0], sizeof(fo));
@@ -1178,12 +1179,15 @@ ghost(Client *c)
 	/* the window's last frame, kept to fade out after the app has let go */
 	struct wlr_scene_rect *rects[LENGTH(c->ring) + LENGTH(c->arm)], *r;
 	Ghost *g;
+	int x, y;
 
 	if (!settings.anim_close || !c->scene->node.enabled || !shown(c) || !(g = calloc(1, sizeof(*g))))
 		return;
-	/* outside the workspace's tree, which may go before the fade ends */
+	/* outside the workspace's tree, which may go before the fade ends, at
+	 * the window's place on screen */
 	g->tree = wlr_scene_tree_create(layers[clientlayer(c)]);
-	wlr_scene_node_set_position(&g->tree->node, c->scene->node.x, c->scene->node.y);
+	wlr_scene_node_coords(&c->scene->node, &x, &y);
+	wlr_scene_node_set_position(&g->tree->node, x, y);
 	if (c->shadow->node.enabled) {
 		memcpy(g->shadowcolor, c->shadow->color, sizeof(g->shadowcolor));
 		g->shadow = wlr_scene_shadow_create(g->tree, c->shadow->width, c->shadow->height,
@@ -1241,8 +1245,8 @@ animate(void)
 			}
 			upd = 1;
 		}
-		if (settings.border_spin > 0 && c->gradkey.out.width)
-			busy = upd = 1; /* a spinning gradient border */
+		if (settings.border_spin > 0 && c->gradkey.out.width && shown(c))
+			busy = upd = 1; /* a spinning gradient border you can see */
 		if (c->mv.dur) {
 			busy |= step(&c->mv, now, &e);
 			wlr_scene_node_set_position(&c->scene->node,
@@ -1312,11 +1316,8 @@ clientfrom(struct wlr_surface *surface)
 static Monitor *
 monof(Client *c)
 {
-	struct wlr_box b = clientbox(c);
-	struct wlr_output *o = wlr_output_layout_output_at(output_layout,
-		b.x + b.width / 2.0, b.y + b.height / 2.0);
-
-	return o ? o->data : selmon();
+	/* a window's screen is its workspace's, panned canvas or not */
+	return c->ws && c->ws->m ? c->ws->m : selmon();
 }
 
 static int
@@ -1502,10 +1503,8 @@ neighbor(Client *c, int dx, int dy)
 void
 focusstack(int dir)
 {
-	Client *c = selclient();
+	Client *c = selclient(), *n;
 	struct wl_list *l;
-
-	Client *n;
 
 	if (!c)
 		return;
@@ -1856,7 +1855,7 @@ snap(Client *c, int *x, int *y, int dx, int dy)
 	/* line the window's outer edges up with screen edges and other windows' edges */
 	struct wlr_box g = cgeom(c), *geo = &g;
 	struct wlr_box me = outset(c, (struct wlr_box){ *x, *y, geo->width, geo->height }), o;
-	Monitor *m = selmon();
+	Monitor *m = monof(c);
 	int bx = INT_MAX, by = INT_MAX;
 	Client *t;
 
@@ -1873,7 +1872,7 @@ snap(Client *c, int *x, int *y, int dx, int dy)
 		TRYY(o.y + o.height - me.y - me.height, 1);
 	}
 	wl_list_for_each(t, &clients, link) {
-		if (t == c || !shown(t))
+		if (t == c || !shown(t) || t->ws != c->ws)
 			continue;
 		o = outset(t, clientbox(t));
 		if (me.y < o.y + o.height && o.y < me.y + me.height) { /* side by side */
@@ -1952,7 +1951,6 @@ static int
 repeatkey(void *data)
 {
 	struct wlr_keyboard *kb = wlr_seat_get_keyboard(seat);
-
 	int bound;
 
 	repeating = 1;
@@ -2231,6 +2229,7 @@ buttonpress(struct wl_listener *listener, void *data)
 	double sx, sy, cx, cy;
 	Workspace *w;
 	Client *c;
+	int mod;
 
 	wlr_idle_notifier_v1_notify_activity(idlenotifier, seat);
 	if (rice.node && !locked) { /* the menu takes clicks; one outside closes it */
@@ -2265,9 +2264,8 @@ buttonpress(struct wl_listener *listener, void *data)
 		if (!c && surface && !exclusive && (ls = wlr_layer_surface_v1_try_from_wlr_surface(
 				wlr_surface_get_root_surface(surface))) && ls->current.keyboard_interactive)
 			kbfocus(ls->surface); /* on-demand layer surfaces get the keyboard on click */
-		kb = wlr_seat_get_keyboard(seat);
-		if (c && kb && (wlr_keyboard_get_modifiers(kb) & MODMASK) == modkey
-		&& (event->button == BTN_LEFT || event->button == BTN_RIGHT)) {
+		mod = (kb = wlr_seat_get_keyboard(seat)) && (wlr_keyboard_get_modifiers(kb) & MODMASK) == modkey;
+		if (c && mod && (event->button == BTN_LEFT || event->button == BTN_RIGHT)) {
 			/* Mod+left moves, Mod+right resizes from the nearest corner */
 			box = clientbox(c);
 			cx = box.x + box.width / 2.0;
@@ -2279,8 +2277,7 @@ buttonpress(struct wl_listener *listener, void *data)
 					| (cursor->y < cy ? WLR_EDGE_TOP : WLR_EDGE_BOTTOM));
 			return;
 		}
-		if (!c && kb && (wlr_keyboard_get_modifiers(kb) & MODMASK) == modkey
-		&& event->button == BTN_RIGHT && (panws = curws()) && panws->mode.canvas) {
+		if (!c && mod && event->button == BTN_RIGHT && (panws = curws()) && panws->mode.canvas) {
 			/* Mod+right-drag on an empty canvas moves the view */
 			cursor_mode = CurPan;
 			grabx = cursor->x + panws->cx;
@@ -2288,8 +2285,7 @@ buttonpress(struct wl_listener *listener, void *data)
 			wlr_cursor_set_xcursor(cursor, cursor_mgr, "grabbing");
 			return;
 		}
-		if (!c && kb && (wlr_keyboard_get_modifiers(kb) & MODMASK) == modkey
-		&& event->button == BTN_LEFT) {
+		if (!c && mod && event->button == BTN_LEFT) {
 			/* Mod+drag on the desktop draws where the next window goes */
 			endbox();
 			cursor_mode = CurDraw;
@@ -2645,6 +2641,8 @@ arrange(void)
 	}
 	wl_list_for_each(m, &mons, link)
 		tile(m);
+	if (rice.node) /* the menu shows this workspace's values */
+		ricedraw();
 }
 
 static void
@@ -2947,7 +2945,6 @@ mapnotify(struct wl_listener *listener, void *data)
 	Client *c = wl_container_of(listener, c, map), *p;
 	struct wlr_box g, *geo = &g, area, around, box;
 	int w, h, claimed;
-
 	static unsigned int ids;
 
 	if (c->xs) { /* X11 surfaces come and go with each map */
@@ -3345,8 +3342,9 @@ xconfigure(struct wl_listener *listener, void *data)
 
 	if (!cmapped(c) || !(c->tiled || c->maximized || c->fullscreen)) {
 		wlr_xwayland_surface_configure(c->xs, e->x, e->y, e->width, e->height);
+		b = oncanvas(c, (struct wlr_box){ e->x, e->y, e->width, e->height }, 1);
 		if (cmapped(c))
-			wlr_scene_node_set_position(&c->scene->node, e->x, e->y);
+			wlr_scene_node_set_position(&c->scene->node, b.x, b.y);
 		return;
 	}
 	b = clientbox(c);
