@@ -52,6 +52,9 @@
 #include <wlr/types/wlr_pointer_constraints_v1.h>
 #include <wlr/types/wlr_relative_pointer_v1.h>
 #include <wlr/types/wlr_tearing_control_v1.h>
+#include <wlr/types/wlr_session_lock_v1.h>
+#include <wlr/types/wlr_idle_notify_v1.h>
+#include <wlr/types/wlr_idle_inhibit_v1.h>
 #include <wlr/util/region.h>
 #include <wlr/types/wlr_presentation_time.h>
 #include <wlr/types/wlr_primary_selection.h>
@@ -79,7 +82,7 @@
 
 enum { CurNormal, CurMove, CurResize, CurDraw };
 /* scene layers, bottom to top */
-enum { LyrBg, LyrBottom, LyrClients, LyrOnTop, LyrTop, LyrFullscreen, LyrX11Menus, LyrOverlay, NumLayers };
+enum { LyrBg, LyrBottom, LyrClients, LyrOnTop, LyrTop, LyrFullscreen, LyrX11Menus, LyrOverlay, LyrLock, NumLayers };
 
 typedef struct {
 	uint32_t start, dur; /* ms; dur 0: not running */
@@ -230,6 +233,13 @@ static struct wlr_relative_pointer_manager_v1 *relptr;
 static struct wlr_pointer_constraints_v1 *constraints;
 static struct wlr_pointer_constraint_v1 *activecon; /* the one under the pointer, if any */
 static struct wlr_tearing_control_manager_v1 *tearingmgr;
+static struct wlr_idle_notifier_v1 *idlenotifier;
+static int inhibitors; /* idle inhibitors alive, e.g. a playing video */
+static struct wlr_session_lock_v1 *lock; /* the running locker's lock */
+static int locked; /* stays set when the locker dies, until a new one unlocks */
+static struct wlr_scene_rect *lockbg; /* black over everything while locked */
+static struct wlr_scene_tree *locktree; /* the locker's surfaces */
+static struct wl_listener locksurf, lockunlock, lockdestroy;
 static struct wlr_xwayland *xwayland;
 static struct wlr_cursor_shape_manager_v1 *cursor_shape_mgr;
 static struct wlr_cursor *cursor;
@@ -893,12 +903,21 @@ monof(Client *c)
 	return o ? o->data : selmon();
 }
 
+static int
+lockable(struct wlr_surface *s)
+{
+	/* while locked only the locker's surfaces may get input */
+	return !locked || (s && wlr_session_lock_surface_v1_try_from_wlr_surface(s));
+}
+
 static void
 kbfocus(struct wlr_surface *surface)
 {
 	struct wlr_keyboard *kb = wlr_seat_get_keyboard(seat);
 	Client *old = selclient(), *c;
 
+	if (!lockable(surface))
+		return;
 	wlr_seat_keyboard_notify_enter(seat, surface,
 		kb ? kb->keycodes : NULL, kb ? kb->num_keycodes : 0, kb ? &kb->modifiers : NULL);
 	if (old)
@@ -1338,7 +1357,7 @@ safetykey(uint32_t mods, xkb_keysym_t sym)
 	/* hardcoded so a broken config can never lock the user in */
 	if (mods != (WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT))
 		return 0;
-	if (sym == XKB_KEY_BackSpace) {
+	if (sym == XKB_KEY_BackSpace && !locked) { /* killing dfwc must not open the lock */
 		quit();
 		return 1;
 	}
@@ -1467,6 +1486,7 @@ keypress(struct wl_listener *listener, void *data)
 	const xkb_keysym_t *syms;
 	int n, handled;
 
+	wlr_idle_notifier_v1_notify_activity(idlenotifier, seat);
 	if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED && cursor_mode == CurDraw
 	&& xkb_state_key_get_one_sym(kb->wlr->xkb_state, code) == XKB_KEY_Escape) {
 		cursor_mode = CurNormal;
@@ -1481,7 +1501,7 @@ keypress(struct wl_listener *listener, void *data)
 		for (int i = 0; i < n; i++) {
 			if (safetykey(mods, syms[i]))
 				return;
-			if (!(handled = config_key(mods, syms[i])))
+			if (locked || !(handled = config_key(mods, syms[i])))
 				continue;
 			if (handled == BindRepeat && kb->wlr->repeat_info.rate > 0) {
 				rep.mods = mods;
@@ -1506,7 +1526,7 @@ repeatkey(void *data)
 	int bound;
 
 	repeating = 1;
-	bound = kb && kb->repeat_info.rate > 0 && config_key(rep.mods, rep.sym);
+	bound = !locked && kb && kb->repeat_info.rate > 0 && config_key(rep.mods, rep.sym);
 	repeating = 0;
 	if (bound)
 		wl_event_source_timer_update(rep.timer, 1000 / kb->repeat_info.rate);
@@ -1737,6 +1757,8 @@ motionrelative(struct wl_listener *listener, void *data)
 	struct wlr_pointer_motion_event *event = data;
 	double dx = event->delta_x, dy = event->delta_y, sx, sy, cx, cy;
 
+	wlr_idle_notifier_v1_notify_activity(idlenotifier, seat);
+
 	/* games aim with the raw, unaccelerated movement */
 	wlr_relative_pointer_manager_v1_send_relative_motion(relptr, seat,
 		(uint64_t)event->time_msec * 1000, dx, dy, event->unaccel_dx, event->unaccel_dy);
@@ -1759,6 +1781,7 @@ motionabsolute(struct wl_listener *listener, void *data)
 {
 	struct wlr_pointer_motion_absolute_event *event = data;
 
+	wlr_idle_notifier_v1_notify_activity(idlenotifier, seat);
 	wlr_cursor_warp_absolute(cursor, &event->pointer->base, event->x, event->y);
 	motionnotify(event->time_msec);
 }
@@ -1774,6 +1797,15 @@ buttonpress(struct wl_listener *listener, void *data)
 	double sx, sy, cx, cy;
 	Client *c;
 
+	wlr_idle_notifier_v1_notify_activity(idlenotifier, seat);
+	if (locked) { /* only the locker sees clicks; one gives its surface the keyboard */
+		if (event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
+			clientat(cursor->x, cursor->y, &surface, &sx, &sy);
+			kbfocus(surface);
+		}
+		wlr_seat_pointer_notify_button(seat, event->time_msec, event->button, event->state);
+		return;
+	}
 	if (event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
 		c = clientat(cursor->x, cursor->y, &surface, &sx, &sy);
 		focusclient(c, 1);
@@ -1823,6 +1855,7 @@ axisnotify(struct wl_listener *listener, void *data)
 {
 	struct wlr_pointer_axis_event *event = data;
 
+	wlr_idle_notifier_v1_notify_activity(idlenotifier, seat);
 	wlr_seat_pointer_notify_axis(seat, event->time_msec, event->orientation, event->delta,
 		event->delta_discrete, event->source, event->relative_direction);
 }
@@ -3164,6 +3197,103 @@ quitsignal(int sig, void *data)
 	return 0;
 }
 
+/* lock screen (swaylock) and idle (swayidle) */
+
+static void
+newlocksurface(struct wl_listener *listener, void *data)
+{
+	struct wlr_session_lock_surface_v1 *ls = data;
+	struct wlr_scene_tree *t = wlr_scene_subsurface_tree_create(locktree, ls->surface);
+	struct wlr_surface *f = seat->keyboard_state.focused_surface;
+	struct wlr_box b;
+
+	wlr_output_layout_get_box(output_layout, ls->output, &b);
+	wlr_scene_node_set_position(&t->node, b.x, b.y);
+	wlr_session_lock_surface_v1_configure(ls, b.width, b.height);
+	/* shortcut: if the focused one goes (screen unplugged), typing needs a click on another */
+	if (!f || !wlr_session_lock_surface_v1_try_from_wlr_surface(f))
+		kbfocus(ls->surface);
+}
+
+static void
+endlock(int unlocked)
+{
+	unlisten(&locksurf, &lockunlock, &lockdestroy, NULL);
+	wlr_scene_node_destroy(&locktree->node);
+	lock = NULL;
+	wlr_seat_keyboard_notify_clear_focus(seat);
+	if (!unlocked)
+		return; /* the locker died: stay black and locked until a new one unlocks */
+	locked = 0;
+	wlr_scene_node_set_enabled(&lockbg->node, false);
+	if (exclusive)
+		kbfocus(exclusive->wlr->surface);
+	else
+		focustop();
+	motionnotify(0); /* the pointer goes back to what's under it */
+}
+
+static void
+unlocksession(struct wl_listener *listener, void *data)
+{
+	endlock(1);
+}
+
+static void
+destroylock(struct wl_listener *listener, void *data)
+{
+	endlock(0);
+}
+
+static void
+newlock(struct wl_listener *listener, void *data)
+{
+	struct wlr_session_lock_v1 *l = data;
+
+	if (lock) { /* one locker at a time */
+		wlr_session_lock_v1_destroy(l);
+		return;
+	}
+	lock = l;
+	locked = 1;
+	endbox();
+	ungrab();
+	constrain(NULL);
+	wlr_seat_keyboard_notify_clear_focus(seat);
+	wlr_seat_pointer_clear_focus(seat);
+	wlr_scene_node_set_enabled(&lockbg->node, true);
+	locktree = wlr_scene_tree_create(layers[LyrLock]);
+	LISTEN(&l->events.new_surface, &locksurf, newlocksurface);
+	LISTEN(&l->events.unlock, &lockunlock, unlocksession);
+	LISTEN(&l->events.destroy, &lockdestroy, destroylock);
+	wlr_session_lock_v1_send_locked(l);
+}
+
+static void
+uninhibit(struct wl_listener *listener, void *data)
+{
+	wl_list_remove(&listener->link);
+	free(listener);
+	wlr_idle_notifier_v1_set_inhibited(idlenotifier, --inhibitors > 0);
+}
+
+static void
+inhibit(struct wl_listener *listener, void *data)
+{
+	struct wlr_idle_inhibitor_v1 *i = data;
+	struct wl_listener *l = calloc(1, sizeof(*l));
+
+	if (!l)
+		return;
+	/* shortcut: hidden and minimized windows inhibit too; check visibility if
+	 * a video playing in the background keeps the screen on */
+	LISTEN(&i->events.destroy, l, uninhibit);
+	wlr_idle_notifier_v1_set_inhibited(idlenotifier, ++inhibitors > 0);
+}
+
+static struct wl_listener new_lock = { .notify = newlock };
+static struct wl_listener new_inhibitor = { .notify = inhibit };
+
 static void
 setup(void)
 {
@@ -3231,6 +3361,13 @@ setup(void)
 	constraints = wlr_pointer_constraints_v1_create(dpy);
 	wl_signal_add(&constraints->events.new_constraint, &new_constraint);
 	tearingmgr = wlr_tearing_control_manager_v1_create(dpy, 1);
+	idlenotifier = wlr_idle_notifier_v1_create(dpy);
+	wl_signal_add(&wlr_idle_inhibit_v1_create(dpy)->events.new_inhibitor, &new_inhibitor);
+	wl_signal_add(&wlr_session_lock_manager_v1_create(dpy)->events.new_lock, &new_lock);
+	/* covers every screen, and clicks, until the locker draws */
+	lockbg = wlr_scene_rect_create(layers[LyrLock], 65535, 65535, (float[4]){ 0, 0, 0, 1 });
+	wlr_scene_node_set_position(&lockbg->node, -32768, -32768);
+	wlr_scene_node_set_enabled(&lockbg->node, false);
 
 	output_layout = wlr_output_layout_create(dpy);
 	wl_signal_add(&output_layout->events.change, &layout_change);
@@ -3311,7 +3448,7 @@ cleanup(void)
 	struct wl_listener *listeners[] = { &new_output, &new_input, &new_toplevel, &new_popup,
 		&cursor_motion, &cursor_motion_absolute, &cursor_button, &cursor_axis, &cursor_frame,
 		&request_cursor, &request_sel, &request_psel, &request_shape, &layout_change,
-		&new_layer, &new_deco, &request_activate, &new_constraint };
+		&new_layer, &new_deco, &request_activate, &new_constraint, &new_lock, &new_inhibitor };
 	Monitor *m;
 	Ghost *g, *gtmp;
 

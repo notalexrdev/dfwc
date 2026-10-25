@@ -48,10 +48,21 @@ Nested, the modifier is Alt instead of Super.
 
 | Keys | Action |
 |---|---|
-| Ctrl+Alt+Backspace | quit dfwc |
+| Ctrl+Alt+Backspace | quit dfwc (not while the screen is locked) |
 | Ctrl+Alt+F1–F12 | switch to a TTY |
 
 These can't be rebound, so a broken config never locks you in.
+
+## Lock and idle
+
+dfwc speaks the protocols swaylock and swayidle use; video players can keep the screen awake.
+
+    dfwc.bind("Mod+Escape", function() dfwc.spawn("swaylock -f -c 000000") end)
+    dfwc.autostart("swayidle -w timeout 300 'swaylock -f -c 000000' before-sleep 'swaylock -f -c 000000'")
+
+While locked only the locker gets input and your binds are off. If the locker crashes the
+screen stays black and locked; unlock by starting it again from a TTY
+(`WAYLAND_DISPLAY=wayland-0 swaylock`).
 
 ## Config
 

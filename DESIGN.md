@@ -145,4 +145,4 @@ Successor to dfwm (X11 dwm fork in `~/Projekte/dfwm-ste/dwm`). Planning confirme
    - Gaming: pointer lock, relative pointer, opt-in tearing.
    - Effects: shadows, blur, gradients (scenefx patch if needed), animations. The default rice arrives here.
    - Window rules: done 2026-10-24 (`dfwc.rule`).
-3. **Later, maybe:** workspaces, external monitors with per-monitor scale, media keys, lock screen, idle handling, IPC/dfwcctl, notifications.
+3. **Later, maybe:** workspaces, external monitors with per-monitor scale, IPC/dfwcctl. Done early: media keys (default config), lock screen + idle (ext-session-lock, ext-idle-notify, idle-inhibit; 2026-10-25), notifications (mako).
