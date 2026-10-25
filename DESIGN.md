@@ -132,6 +132,34 @@ Successor to dfwm (X11 dwm fork in `~/Projekte/dfwm-ste/dwm`). Planning confirme
 - **Unclear:** border gradients. The gradient shaders exist inside scenefx, but no rect gradient setter shows in the header.
 - **Code to read:** SwayFX, mangowm, mwc.
 
+### Grilling round 3: canvas and rice menu (2026-10-25)
+
+The user's two big feature ideas, planned before the base (workspaces, monitors) is built so
+the base fits them.
+
+- **Canvas mode:** a third mode beside floating and tiling, a free 2D canvas: windows sit
+  anywhere on an endless plane and the view pans in any direction.
+  - **Per workspace:** each workspace is floating, tiling or canvas, switched like tiling today.
+    So workspaces come first.
+  - **Panning:** Mod+right-drag on empty space (Mod+left-drag still draws a box), keys
+    (e.g. Mod+Ctrl+arrows) and a three-finger touchpad swipe.
+  - **Zoom:** both an overview (zoom out to fit everything, click to jump back in) and free zoom
+    (work while zoomed: windows scaled, input mapped through the zoom). Both come
+    preconfigured; **free zoom is the default**. Free zoom is the hard part (scaled buffers,
+    input transforms, popups).
+  - **Monitors:** each monitor is its own view onto the same canvas and pans on its own.
+- **Rice menu:** a key opens a panel dfwc draws itself in the ink style: sliders, color
+  swatches, toggles, keyboard and mouse. Changes apply live.
+  - **Covers:** borders and colors (widths, focused/unfocused, gradients, angle, spin, corners,
+    radius), effects (shadows, blur, opacity, animation speeds and curve), layout and gaps
+    (tiling, layout, gaps, mfact, smart gaps), wallpaper and theme (wallpaper, background,
+    presets like ink and paper).
+  - **Saving:** to `~/.config/dfwc/rice.lua`, loaded after `init.lua`. dfwc rewrites only that
+    file and never touches the hand-written config.
+- **Order this implies:** workspaces → canvas mode (pan, then zoom) → monitors as views. The
+  rice menu needs none of these and can come any time; it doesn't need dfwcctl since dfwc
+  draws it.
+
 ## Milestones
 
 1. **Usable floating desktop.** Done 2026-10-24, all features tested nested in KDE; not yet run from a TTY.
