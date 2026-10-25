@@ -38,6 +38,13 @@ for i = 1, 9 do
 	dfwc.bind("Mod+Shift+" .. i, function() dfwc.send(i) end)
 end
 
+-- canvas: Mod+c makes this workspace an endless plane; pan with Mod+Alt+arrows,
+-- Mod+right-drag on empty space, or three fingers on the touchpad
+dfwc.bind("Mod+c", dfwc.canvas)
+for key, d in pairs{ Left = { -80, 0 }, Right = { 80, 0 }, Up = { 0, -80 }, Down = { 0, 80 } } do
+	dfwc.bind("Mod+Alt+" .. key, function() dfwc.pan(d[1], d[2]) end, { repeats = true })
+end
+
 -- arrows move a window, Shift+arrows resize it;
 -- tiled windows swap with their neighbour or move the split instead
 for key, d in pairs{ Left = { -20, 0 }, Right = { 20, 0 }, Up = { 0, -20 }, Down = { 0, 20 } } do

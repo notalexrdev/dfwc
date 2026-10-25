@@ -80,7 +80,7 @@
 #define LISTEN(E, L, H)         wl_signal_add((E), ((L)->notify = (H), (L)))
 #define MODMASK                 (WLR_MODIFIER_SHIFT | WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT | WLR_MODIFIER_LOGO)
 
-enum { CurNormal, CurMove, CurResize, CurDraw };
+enum { CurNormal, CurMove, CurResize, CurDraw, CurPan };
 /* scene layers, bottom to top */
 enum { LyrBg, LyrBottom, LyrClients, LyrOnTop, LyrTop, LyrFullscreen, LyrX11Menus, LyrOverlay, LyrLock, NumLayers };
 
@@ -89,7 +89,7 @@ typedef struct {
 } Anim;
 
 typedef struct {
-	bool tiling;
+	bool tiling, canvas;
 	char layout[64];
 	double mfact;
 	int nmaster;
@@ -188,6 +188,7 @@ struct Workspace {
 	Monitor *m;
 	struct wlr_scene_tree *tree[3]; /* its windows, under LyrClients, LyrOnTop, LyrFullscreen */
 	Mode mode;
+	int cx, cy; /* a canvas's view: the screen's top-left, in canvas coordinates */
 };
 
 typedef struct {
@@ -287,6 +288,7 @@ static int animating; /* frames keep coming until every animation is done */
 static struct wl_list ghosts;
 static struct wl_list orphans; /* workspaces waiting for a screen after the last one went */
 static Workspace *selws;       /* the workspace whose Mode settings holds */
+static Workspace *panws;       /* the canvas being dragged */
 static int tileddrag; /* the window being moved is tiled and stays tiled */
 static struct {
 	struct wl_event_source *timer;
@@ -470,12 +472,26 @@ cmapped(Client *c)
 	return csurface(c) && csurface(c)->mapped;
 }
 
+static struct wlr_box
+oncanvas(Client *c, struct wlr_box b, int dir)
+{
+	/* screen to window coordinates (dir 1) or back (-1); they differ only on a
+	 * panned canvas */
+	if (c->ws) {
+		b.x += dir * c->ws->cx;
+		b.y += dir * c->ws->cy;
+	}
+	return b;
+}
+
 static void
 cconfigure(Client *c, int x, int y, int w, int h)
 {
 	/* X11 windows get their screen position too, or their menus open in the wrong place */
+	struct wlr_box b = oncanvas(c, (struct wlr_box){ x, y, w, h }, -1);
+
 	if (c->xs)
-		wlr_xwayland_surface_configure(c->xs, x, y, MAX(w, 1), MAX(h, 1));
+		wlr_xwayland_surface_configure(c->xs, b.x, b.y, MAX(w, 1), MAX(h, 1));
 	else
 		wlr_xdg_toplevel_set_size(c->toplevel, MAX(w, 1), MAX(h, 1));
 }
@@ -483,12 +499,12 @@ cconfigure(Client *c, int x, int y, int w, int h)
 static void
 cmove(Client *c, int x, int y)
 {
-	struct wlr_box g = cgeom(c);
+	struct wlr_box g = cgeom(c), b = oncanvas(c, (struct wlr_box){ x, y, g.width, g.height }, -1);
 
 	c->mv.dur = 0; /* a direct move ends any glide */
 	wlr_scene_node_set_position(&c->scene->node, x, y);
 	if (c->xs)
-		wlr_xwayland_surface_configure(c->xs, x, y, g.width, g.height);
+		wlr_xwayland_surface_configure(c->xs, b.x, b.y, g.width, g.height);
 }
 
 static void
@@ -677,6 +693,7 @@ static void
 modeget(Mode *md)
 {
 	md->tiling = settings.tiling;
+	md->canvas = settings.canvas;
 	memcpy(md->layout, settings.layout, sizeof(md->layout));
 	md->mfact = settings.mfact;
 	md->nmaster = settings.nmaster;
@@ -686,6 +703,7 @@ static void
 modeset(const Mode *md)
 {
 	settings.tiling = md->tiling;
+	settings.canvas = md->canvas;
 	memcpy(settings.layout, md->layout, sizeof(settings.layout));
 	settings.mfact = md->mfact;
 	settings.nmaster = md->nmaster;
@@ -706,18 +724,63 @@ wsnew(Monitor *m)
 		wlr_scene_node_set_enabled(&w->tree[i]->node, false);
 	}
 	/* a new workspace starts as the config says */
-	w->mode = (Mode){ .tiling = own->tiling, .mfact = own->mfact, .nmaster = own->nmaster };
+	w->mode = (Mode){ .tiling = own->tiling, .canvas = own->canvas, .mfact = own->mfact,
+		.nmaster = own->nmaster };
 	memcpy(w->mode.layout, own->layout, sizeof(w->mode.layout));
 	wl_list_insert(m->spaces.prev, &w->link);
 	return w;
 }
 
 static void
-wsshow(Workspace *w, int on, int y)
+wsplace(Workspace *w, int slide)
 {
-	for (int i = 0; i < 3; i++) {
+	for (int i = 0; i < 3; i++)
+		wlr_scene_node_set_position(&w->tree[i]->node, -w->cx, -w->cy + slide);
+}
+
+static void
+wsshow(Workspace *w, int on, int slide)
+{
+	for (int i = 0; i < 3; i++)
 		wlr_scene_node_set_enabled(&w->tree[i]->node, on);
-		wlr_scene_node_set_position(&w->tree[i]->node, 0, y);
+	wsplace(w, slide);
+}
+
+static void
+pan(Workspace *w, int x, int y)
+{
+	/* one tree move however many windows; X11 apps are told where they now
+	 * are, or their menus open in the wrong place */
+	struct wlr_box b;
+	Client *c;
+
+	w->cx = x;
+	w->cy = y;
+	wsplace(w, 0);
+	wl_list_for_each(c, &clients, link) {
+		if (c->ws == w && c->xs) {
+			b = oncanvas(c, clientbox(c), -1);
+			wlr_xwayland_surface_configure(c->xs, b.x, b.y, b.width, b.height);
+		}
+	}
+}
+
+static void
+unpan(Workspace *w)
+{
+	/* leaving canvas mode keeps windows where they are on screen, so floating
+	 * and tiling never see an offset */
+	int x = w->cx, y = w->cy;
+	Client *c;
+
+	w->cx = w->cy = 0;
+	wsplace(w, 0);
+	wl_list_for_each(c, &clients, link) {
+		if (c->ws != w)
+			continue;
+		c->prev.x -= x;
+		c->prev.y -= y;
+		cmove(c, c->scene->node.x - x, c->scene->node.y - y);
 	}
 }
 
@@ -1263,7 +1326,7 @@ static void
 floatout(Client *c)
 {
 	/* moving a tiled window by hand floats it where it is, like dwm */
-	if (!settings.tiling || c->floating)
+	if (!settings.tiling || settings.canvas || c->floating)
 		return;
 	c->floating = 1;
 	c->tiled = c->smart = 0;
@@ -1339,6 +1402,8 @@ ungrab(void)
 
 	if (cursor_mode == CurResize)
 		cresizing(grabc, 0);
+	if (cursor_mode == CurPan)
+		wlr_cursor_set_xcursor(cursor, cursor_mgr, "default");
 	cursor_mode = CurNormal;
 	grabc = NULL;
 	if (!tileddrag)
@@ -1453,7 +1518,7 @@ setmaximized(Client *c, int on)
 		if (on)
 			c->prev = clientbox(c);
 		c->maximized = on;
-		resizeclient(c, on ? inset(c, m->usable) : c->prev);
+		resizeclient(c, on ? oncanvas(c, inset(c, m->usable), 1) : c->prev);
 		restyle(c);
 		arrange();
 	}
@@ -1471,7 +1536,8 @@ setfullscreen(Client *c, int on)
 		/* above bars, below overlays like lock screens */
 		c->fullscreen = on;
 		wlr_scene_node_reparent(&c->scene->node, clienttree(c));
-		resizeclient(c, on ? m->area : c->maximized ? inset(c, m->usable) : c->prev);
+		resizeclient(c, on ? oncanvas(c, m->area, 1)
+			: c->maximized ? oncanvas(c, inset(c, m->usable), 1) : c->prev);
 		restyle(c);
 		arrange();
 	}
@@ -1738,7 +1804,7 @@ snap(Client *c, int *x, int *y, int dx, int dy)
 	if (!settings.snap)
 		return;
 	/* keys never push a window off the screen; a held key also stops at windows */
-	if (m) {
+	if (m && !(c->ws && c->ws->mode.canvas)) { /* a canvas has no edges */
 		o = m->usable;
 		TRYX(o.x - me.x, 1);
 		TRYX(o.x + o.width - me.x - me.width, 1);
@@ -1965,6 +2031,10 @@ motionnotify(uint32_t time)
 		cmove(grabc, x, y);
 		return;
 	}
+	if (cursor_mode == CurPan) {
+		pan(panws, grabx - cursor->x, graby - cursor->y);
+		return;
+	}
 	if (cursor_mode == CurDraw) {
 		draw.box = (struct wlr_box){ MIN(draw.x, cursor->x), MIN(draw.y, cursor->y),
 			fabs(cursor->x - draw.x), fabs(cursor->y - draw.y) };
@@ -2116,6 +2186,15 @@ buttonpress(struct wl_listener *listener, void *data)
 			else
 				grab(c, CurResize, (cursor->x < cx ? WLR_EDGE_LEFT : WLR_EDGE_RIGHT)
 					| (cursor->y < cy ? WLR_EDGE_TOP : WLR_EDGE_BOTTOM));
+			return;
+		}
+		if (!c && kb && (wlr_keyboard_get_modifiers(kb) & MODMASK) == modkey
+		&& event->button == BTN_RIGHT && (panws = curws()) && panws->mode.canvas) {
+			/* Mod+right-drag on an empty canvas moves the view */
+			cursor_mode = CurPan;
+			grabx = cursor->x + panws->cx;
+			graby = cursor->y + panws->cy;
+			wlr_cursor_set_xcursor(cursor, cursor_mgr, "grabbing");
 			return;
 		}
 		if (!c && kb && (wlr_keyboard_get_modifiers(kb) & MODMASK) == modkey
@@ -2382,8 +2461,8 @@ layout(const char *name, struct wlr_box a, int n, struct wlr_box *out)
 static int
 istiled(Client *c)
 {
-	return c->ws && c->ws->mode.tiling && !c->floating && !c->minimized && !c->fullscreen
-		&& !c->maximized;
+	return c->ws && c->ws->mode.tiling && !c->ws->mode.canvas && !c->floating && !c->minimized
+		&& !c->fullscreen && !c->maximized;
 }
 
 static void
@@ -2438,11 +2517,15 @@ arrange(void)
 		selws = w;
 		modeset(&w->mode);
 	}
-	wl_list_for_each(m, &mons, link)
+	wl_list_for_each(m, &mons, link) {
 		prune(m);
+		wl_list_for_each(w, &m->spaces, link)
+			if (!w->mode.canvas && (w->cx || w->cy))
+				unpan(w);
+	}
 	/* tiling turned off: everything back where it floated */
 	wl_list_for_each(c, &tiles, tlink) {
-		if (c->tiled && !(c->ws && c->ws->mode.tiling)) {
+		if (c->tiled && !(c->ws && c->ws->mode.tiling && !c->ws->mode.canvas)) {
 			c->tiled = c->smart = 0;
 			resizeclient(c, c->floatbox);
 			restyle(c);
@@ -2455,10 +2538,16 @@ arrange(void)
 static void
 movetows(Client *c, Workspace *w)
 {
+	int dx, dy;
+
 	if (!w || c->ws == w)
 		return;
+	dx = w->cx - (c->ws ? c->ws->cx : 0);
+	dy = w->cy - (c->ws ? c->ws->cy : 0);
 	c->ws = w;
 	wlr_scene_node_reparent(&c->scene->node, clienttree(c));
+	if (dx || dy) /* same place on screen */
+		cmove(c, c->scene->node.x + dx, c->scene->node.y + dy);
 }
 
 static void
@@ -2486,6 +2575,32 @@ view(Workspace *w)
 	}
 	focustop();
 	arrange();
+}
+
+void
+panby(int dx, int dy)
+{
+	Workspace *w = curws();
+
+	if (w && w->mode.canvas)
+		pan(w, w->cx + dx, w->cy + dy);
+}
+
+static void
+swipe(struct wl_listener *listener, void *data)
+{
+	/* three fingers on the touchpad drag a canvas around */
+	struct wlr_pointer_swipe_update_event *event = data;
+	static double rx, ry; /* fractions of a pixel left from earlier events */
+
+	wlr_idle_notifier_v1_notify_activity(idlenotifier, seat);
+	if (event->fingers != 3 || locked)
+		return;
+	rx -= event->dx;
+	ry -= event->dy;
+	panby(rx, ry);
+	rx -= (int)rx;
+	ry -= (int)ry;
 }
 
 void
@@ -2557,7 +2672,7 @@ arrangelayers(Monitor *m)
 	m->usable = usable;
 	wl_list_for_each(c, &clients, link)
 		if (monof(c) == m && (c->maximized || c->fullscreen))
-			resizeclient(c, c->fullscreen ? m->area : inset(c, m->usable));
+			resizeclient(c, oncanvas(c, c->fullscreen ? m->area : inset(c, m->usable), 1));
 	tile(m);
 }
 
@@ -2650,6 +2765,7 @@ mapnotify(struct wl_listener *listener, void *data)
 		config_rule(&(WinInfo){ .app_id = cappid(c), .title = ctitle(c) }, &c->rule);
 	}
 	g = cgeom(c);
+	c->ws = curws(); /* first: placement below is in its coordinates */
 	c->id = ++ids;
 	wl_list_insert(&clients, &c->link);
 	wl_list_insert(&tiles, &c->tlink);
@@ -2657,14 +2773,15 @@ mapnotify(struct wl_listener *listener, void *data)
 	c->floating = cfloats(c) || (draw.claim == c && settings.tiling) || c->rule.floating;
 	wlr_scene_node_set_enabled(&c->scene->node, true);
 	outputbox(&area);
-	area = inset(c, area);
+	area = oncanvas(c, inset(c, area), 1);
 	if ((claimed = draw.claim == c)) {
 		/* already sized for the drawn box; a click only sets the corner */
 		morph.from = draw.box;
-		box = inset(c, draw.box);
+		around = oncanvas(c, draw.box, 1);
+		box = inset(c, around);
 		if (c->xs && !tinybox()) /* X11 apps aren't sized before they map */
 			cconfigure(c, box.x, box.y, box.width, box.height);
-		cmove(c, tinybox() ? draw.box.x : box.x, tinybox() ? draw.box.y : box.y);
+		cmove(c, tinybox() ? around.x : box.x, tinybox() ? around.y : box.y);
 		endbox();
 	} else if (!wlr_box_empty(&area)) {
 		/* where the rule says, else centered on the screen, dialogs on their
@@ -2683,14 +2800,13 @@ mapnotify(struct wl_listener *listener, void *data)
 		cmove(c, box.x, box.y);
 	}
 	c->ontop = c->rule.ontop;
-	c->ws = curws();
 	wlr_scene_node_reparent(&c->scene->node, clienttree(c));
 	c->fade = settings.anim_open ? 0 : 1;
 	if (settings.anim_open)
 		startanim(&c->open, settings.anim_open);
 	restyle(c);
 	if (claimed && settings.anim_open) {
-		morph.to = outset(c, clientbox(c));
+		morph.to = oncanvas(c, outset(c, clientbox(c)), -1);
 		startanim(&morph.a, settings.anim_open);
 		showmorph(0);
 	}
@@ -2961,7 +3077,7 @@ commitpopup(struct wl_listener *listener, void *data)
 	struct wlr_scene_tree *tree = p->wlr->base->data;
 	Client *c;
 	struct wlr_box box, g = p->wlr->base->geometry;
-	int sh = settings.shadow_size, *o = settings.shadow_offset;
+	int sh = settings.shadow_size, *o = settings.shadow_offset, sx, sy;
 	pixman_box32_t *e = pixman_region32_extents(&p->wlr->base->surface->opaque_region);
 	struct wlr_box b = { e->x1 - g.x, e->y1 - g.y, e->x2 - e->x1, e->y2 - e->y1 };
 	float color[4];
@@ -2970,8 +3086,9 @@ commitpopup(struct wl_listener *listener, void *data)
 		/* keep menus on screen; the box is relative to the toplevel's surface */
 		if ((c = clientof(&tree->node))) {
 			outputbox(&box);
-			box.x -= c->scene->node.x - c->toplevel->base->geometry.x;
-			box.y -= c->scene->node.y - c->toplevel->base->geometry.y;
+			wlr_scene_node_coords(&c->scene->node, &sx, &sy); /* on screen, canvas or not */
+			box.x -= sx - c->toplevel->base->geometry.x;
+			box.y -= sy - c->toplevel->base->geometry.y;
 			wlr_xdg_popup_unconstrain_from_box(p->wlr, &box);
 		}
 		wlr_xdg_surface_schedule_configure(p->wlr->base);
@@ -3592,6 +3709,7 @@ static struct wl_listener cursor_motion_absolute = { .notify = motionabsolute };
 static struct wl_listener cursor_button = { .notify = buttonpress };
 static struct wl_listener cursor_axis = { .notify = axisnotify };
 static struct wl_listener cursor_frame = { .notify = framenotify };
+static struct wl_listener cursor_swipe = { .notify = swipe };
 static struct wl_listener request_cursor = { .notify = setcursor };
 static struct wl_listener request_sel = { .notify = setsel };
 static struct wl_listener request_psel = { .notify = setpsel };
@@ -3811,6 +3929,7 @@ setup(void)
 	wl_signal_add(&cursor->events.button, &cursor_button);
 	wl_signal_add(&cursor->events.axis, &cursor_axis);
 	wl_signal_add(&cursor->events.frame, &cursor_frame);
+	wl_signal_add(&cursor->events.swipe_update, &cursor_swipe);
 	cursor_shape_mgr = wlr_cursor_shape_manager_v1_create(dpy, 1);
 	wl_signal_add(&cursor_shape_mgr->events.request_set_shape, &request_shape);
 
@@ -3861,7 +3980,7 @@ cleanup(void)
 {
 	/* wlroots asserts that no listeners are left when it destroys these */
 	struct wl_listener *listeners[] = { &new_output, &new_input, &new_toplevel, &new_popup,
-		&cursor_motion, &cursor_motion_absolute, &cursor_button, &cursor_axis, &cursor_frame,
+		&cursor_motion, &cursor_motion_absolute, &cursor_button, &cursor_axis, &cursor_frame, &cursor_swipe,
 		&request_cursor, &request_sel, &request_psel, &request_shape, &layout_change,
 		&new_layer, &new_deco, &request_activate, &new_constraint, &new_lock, &new_inhibitor };
 	Monitor *m;

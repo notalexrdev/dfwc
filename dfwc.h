@@ -36,6 +36,7 @@ typedef struct {
 	/* tiling; these four keep their runtime value across reloads unless
 	 * the config's own value for them changes */
 	bool tiling;
+	bool canvas;         /* an endless plane you pan around; wins over tiling */
 	char layout[64];
 	double mfact;
 	int nmaster;
@@ -92,6 +93,7 @@ void togglemaximize(void);
 void toggleontop(void);
 void viewws(int n, int dir);              /* the n-th workspace, or dir steps from the shown one */
 void sendws(int n, int dir, int follow);  /* the focused window there, maybe following it */
+void panby(int dx, int dy);               /* move a canvas workspace's view */
 
 /* lua.c */
 extern Settings settings;

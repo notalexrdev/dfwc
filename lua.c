@@ -87,6 +87,7 @@ static const struct {
 	FIELD(box_timeout, Int, 0, 60000),
 	FIELD(snap, Int, 0, 200),
 	FIELD(tiling, Bool, 0, 0),
+	FIELD(canvas, Bool, 0, 0),
 	FIELD(layout, Str, 0, 0),
 	FIELD(mfact, Num, 0.05, 0.95),
 	FIELD(nmaster, Int, 0, 20),
@@ -112,7 +113,7 @@ static const struct {
 /* runtime changes to these survive a save, unless the config's value for them changed */
 #define KEEP(N) { offsetof(Settings, N), sizeof(((Settings *)0)->N) }
 static const struct { size_t off, size; } keep[] = {
-	KEEP(tiling), KEEP(layout), KEEP(mfact), KEEP(nmaster),
+	KEEP(tiling), KEEP(canvas), KEEP(layout), KEEP(mfact), KEEP(nmaster),
 };
 
 static const char *const layouts[] = {
@@ -511,6 +512,24 @@ l_tiling(lua_State *L)
 }
 
 static int
+l_canvas(lua_State *L)
+{
+	Settings *s = L == load.L ? &load.settings : &settings;
+
+	s->canvas = lua_isnoneornil(L, 1) ? !s->canvas : lua_toboolean(L, 1);
+	if (s == &settings)
+		arrange();
+	return 0;
+}
+
+static int
+l_pan(lua_State *L)
+{
+	panby(luaL_checkinteger(L, 1), luaL_checkinteger(L, 2));
+	return 0;
+}
+
+static int
 l_mfact(lua_State *L)
 {
 	Settings *s = L == load.L ? &load.settings : &settings;
@@ -844,6 +863,7 @@ static const luaL_Reg api[] = {
 	{ "addlayout", l_addlayout },
 	{ "autostart", l_autostart },
 	{ "bind", l_bind },
+	{ "canvas", l_canvas },
 	{ "close", l_close },
 	{ "float", l_float },
 	{ "focus", l_focus },
@@ -860,6 +880,7 @@ static const luaL_Reg api[] = {
 	{ "reload", l_reload },
 	{ "resize", l_resize },
 	{ "restore", l_restore },
+	{ "pan", l_pan },
 	{ "rule", l_rule },
 	{ "send", l_send },
 	{ "set", l_set },

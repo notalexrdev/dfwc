@@ -148,6 +148,10 @@ the base fits them.
     preconfigured; **free zoom is the default**. Free zoom is the hard part (scaled buffers,
     input transforms, popups).
   - **Monitors:** each monitor is its own view onto the same canvas and pans on its own.
+  - Panning done 2026-10-25: each workspace has a view offset that moves its scene trees (one
+    move however many windows); window coordinates are canvas coordinates, converted only
+    where screen coordinates come in (placement, maximize/fullscreen, popups, X11 positions,
+    the drawn box); leaving canvas mode bakes the offset into the windows. Zoom is next.
 - **Rice menu:** a key opens a panel dfwc draws itself in the ink style: sliders, color
   swatches, toggles, keyboard and mouse. Changes apply live.
   - **Covers:** borders and colors (widths, focused/unfocused, gradients, angle, spin, corners,

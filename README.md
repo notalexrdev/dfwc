@@ -99,6 +99,8 @@ the bind while the key is held.
 | `dfwc.restore()` | pick a hidden window from a menu to bring back |
 | `dfwc.tiling()` | switch between floating and tiling (`true`/`false` to set) |
 | `dfwc.workspace(n)` | show the n-th workspace, or `"next"` / `"prev"` |
+| `dfwc.canvas()` | make this workspace a canvas or not (`true`/`false` to set) |
+| `dfwc.pan(dx, dy)` | move a canvas's view by that many pixels |
 | `dfwc.send(n, follow)` | move the focused window to workspace n (or `"next"`/`"prev"`); `true` goes along |
 | `dfwc.layout(name)` | pick a tiling layout |
 | `dfwc.float()` | let the focused window float while the rest tile |
@@ -148,6 +150,7 @@ the bind while the key is held.
 | `anim_move` | 200 ms: tiling, maximize and zoom glide windows into place |
 | `anim_curve` | `{ 0.2, 0.9, 0.3, 1 }`: the easing of all of them, as a CSS cubic-bezier |
 | `tearing` | false: fullscreen games that ask may skip vsync for less input lag |
+| `canvas` | false: workspaces are endless planes you pan around (see Canvas) |
 | `tiling` | false |
 | `layout` | `"tile"` |
 | `mfact`, `nmaster` | 0.55, 1 |
@@ -177,6 +180,14 @@ workspace keeps its own `tiling`, `layout`, `mfact` and `nmaster`; a new one sta
 the config's values, and changing them in the config applies to the workspace you're on.
 Switching slides, timed by `anim_move`. An app asking for attention takes you to its
 workspace.
+
+### Canvas
+
+`dfwc.canvas()` (Mod+c) turns a workspace into an endless plane: windows go anywhere and
+you move the view instead. Pan with Mod+Alt+arrows, Mod+right-drag on empty space, or
+three fingers on the touchpad. New windows open in the middle of the view; maximize and
+fullscreen fill the screen wherever you are. Canvas wins over tiling; turning it off
+leaves every window where it is on screen. `canvas = true` makes new workspaces canvases.
 
 ### Tiling
 
