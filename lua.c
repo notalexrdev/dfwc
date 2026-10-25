@@ -1,8 +1,8 @@
 /* See LICENSE file for copyright and license details.
  *
- * init.lua is loaded at startup and again whenever a .lua file next to it is
- * saved. Each load gets a fresh Lua state; a config that fails to load never
- * replaces a working one.
+ * init.lua, then rice.lua (what the menu saved), are loaded at startup and
+ * again whenever a .lua file next to them is saved. Each load gets a fresh Lua
+ * state; a config that fails to load never replaces a working one.
  */
 #include <limits.h>
 #include <stddef.h>
@@ -479,9 +479,14 @@ static int
 l_layout(lua_State *L)
 {
 	Settings *s = L == load.L ? &load.settings : &settings;
-	size_t len;
+	size_t len, i, n = LENGTH(layouts) - 1;
 	const char *name = luaL_checklstring(L, 1, &len);
 
+	if (!strcmp(name, "next") || !strcmp(name, "prev")) { /* through the built-in ones */
+		for (i = 0; i < n && strcmp(s->layout, layouts[i]); i++);
+		name = layouts[(i + (*name == 'n' ? 1 : n - 1)) % n];
+		len = strlen(name);
+	}
 	if (!knownlayout(L, name) || len >= sizeof(s->layout))
 		return luaL_error(L, "unknown layout \"%s\"", name);
 	memcpy(s->layout, name, len + 1);
