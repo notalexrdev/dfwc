@@ -191,6 +191,7 @@ struct Workspace {
 	Mode mode;
 	int cx, cy; /* a canvas's view: the screen's top-left, in canvas coordinates */
 	double zoom;   /* a canvas's zoom, applied as the screen's scale */
+	double ztarget; /* the zoom it's gliding to; 0: none */
 	double ovzoom; /* the zoom to go back to from the overview; 0: not in it */
 	int ovx, ovy;  /* and the view */
 };
@@ -1260,6 +1261,17 @@ animate(void)
 		showmorph(e);
 	}
 	wl_list_for_each(m, &mons, link) {
+		if (!m->ws || !m->ws->ztarget)
+			continue;
+		/* a third of the way each frame: quick, and it lands softly */
+		e = fabs(log(m->ws->ztarget / m->ws->zoom)) < 0.004 ? 1 : 0.35;
+		zoomat(m->ws, m->ws->zoom + (m->ws->ztarget - m->ws->zoom) * e, cursor->x, cursor->y);
+		if (e == 1 || !m->ws->mode.canvas)
+			m->ws->ztarget = 0;
+		else
+			busy = 1;
+	}
+	wl_list_for_each(m, &mons, link) {
 		if (!m->slide.dur)
 			continue;
 		busy |= step(&m->slide, now, &e);
@@ -2243,7 +2255,7 @@ buttonpress(struct wl_listener *listener, void *data)
 		if ((c = clientat(cursor->x, cursor->y, &surface, &sx, &sy)))
 			b = clientbox(c);
 		w->zoom = w->ovzoom;
-		w->ovzoom = 0;
+		w->ovzoom = w->ztarget = 0;
 		applyscale(w->m);
 		lookat(w, b.x + b.width / 2.0, b.y + b.height / 2.0);
 		focusclient(c, 1);
@@ -2626,7 +2638,7 @@ arrange(void)
 			if (!w->mode.canvas && (w->cx || w->cy || w->zoom != 1)) {
 				unpan(w);
 				w->zoom = 1;
-				w->ovzoom = 0;
+				w->ovzoom = w->ztarget = 0;
 			}
 		}
 		applyscale(m);
@@ -2738,10 +2750,19 @@ swipe(struct wl_listener *listener, void *data)
 void
 magnify(double f)
 {
+	/* sets where the zoom is going; animate() glides there around the pointer,
+	 * one step per frame however many scroll or pinch events come in */
 	Workspace *w = curws();
 
-	if (w && w->mode.canvas && f > 0)
-		zoomat(w, w->zoom * f, cursor->x, cursor->y);
+	if (!w || !w->mode.canvas || f <= 0)
+		return;
+	w->ztarget = MIN(MAX((w->ztarget ? w->ztarget : w->zoom) * f, 0.05), 4);
+	if (!settings.anim_move) {
+		zoomat(w, w->ztarget, cursor->x, cursor->y);
+		w->ztarget = 0;
+		return;
+	}
+	wake();
 }
 
 void
@@ -2755,6 +2776,7 @@ overview(void)
 
 	if (!w || !w->mode.canvas)
 		return;
+	w->ztarget = 0;
 	if (w->ovzoom) {
 		w->zoom = w->ovzoom;
 		w->ovzoom = 0;
@@ -2879,8 +2901,7 @@ updatemons(struct wl_listener *listener, void *data)
 			/* same pixels, new logical size (a canvas zoom): no redraw */
 			wlr_scene_buffer_set_dest_size(m->wall, m->area.width, m->area.height);
 			wlr_scene_node_set_position(&m->wall->node, m->area.x, m->area.y);
-			wlr_scene_optimized_blur_mark_dirty(optblur);
-			m->wallbox = m->area;
+			m->wallbox = m->area; /* the same pixels on the glass: the blur cache holds */
 		} else {
 			drawwallpaper(m);
 		}
