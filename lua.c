@@ -40,6 +40,7 @@ typedef struct {
 	int rules;   /* registry ref of the list of dfwc.rule() functions */
 	Settings settings; /* what dfwc runs with */
 	Settings own;      /* what the file itself set, before runtime changes were kept */
+	bool riced[128];   /* settings rice.lua or the menu set, by field index */
 } Config;
 
 enum { Str, Int, Num, Bool, Color, Grad, Mod, Sides, Wall, Curve, Pair };
@@ -122,6 +123,8 @@ static const char *const layouts[] = {
 
 #define HEX(C) { ((C) >> 16 & 0xff) / 255.0f, ((C) >> 8 & 0xff) / 255.0f, ((C) & 0xff) / 255.0f, 1 }
 
+static_assert(LENGTH(fields) <= LENGTH(((Config *)0)->riced), "Config.riced is too small");
+
 static const Settings defaults = {
 	.repeat_rate = 25, .repeat_delay = 600,
 	.touchpad_tap = true, .touchpad_dwt = true,
@@ -173,6 +176,8 @@ static const char defconfig[] = {
 static Config cur = { .style = LUA_NOREF, .layouts = LUA_NOREF },
 	load = { .style = LUA_NOREF, .layouts = LUA_NOREF }; /* running, loading */
 static char dir[PATH_MAX], path[PATH_MAX + sizeof("/init.lua")];
+static int ricing; /* dfwc.set() runs for rice.lua or the menu: note what it sets */
+static int ricedirty; /* the menu changed something rice.lua doesn't have yet */
 static struct wl_event_loop *evloop;
 static struct wl_event_source *pending; /* scheduled reload */
 static struct wl_event_source *watcher;
@@ -288,6 +293,8 @@ l_set(lua_State *L)
 			return luaL_error(L, "unknown setting \"%s\"", key);
 		p = (char *)&tmp + fields[i].off;
 		ok = 1;
+		if (ricing)
+			(L == load.L ? &load : &cur)->riced[i] = true;
 		switch (fields[i].type) {
 		case Str:
 			if ((ok = lua_type(L, -1) == LUA_TSTRING)) {
@@ -859,6 +866,7 @@ ACTION(float, togglefloat())
 ACTION(fullscreen, togglefullscreen())
 ACTION(launch, spawn(settings.launcher))
 ACTION(maximize, togglemaximize())
+ACTION(menu, togglemenu())
 ACTION(minimize, minimize())
 ACTION(overview, overview())
 ACTION(ontop, toggleontop())
@@ -880,6 +888,7 @@ static const luaL_Reg api[] = {
 	{ "layout", l_layout },
 	{ "maximize", l_maximize },
 	{ "mfact", l_mfact },
+	{ "menu", l_menu },
 	{ "minimize", l_minimize },
 	{ "move", l_move },
 	{ "nmaster", l_nmaster },
@@ -915,6 +924,22 @@ freeconfig(Config *c)
 }
 
 static int
+loadrice(lua_State *L)
+{
+	/* what the menu saved, on top of the config; it may be missing */
+	char rice[sizeof(dir) + sizeof("/rice.lua")];
+	int ok;
+
+	snprintf(rice, sizeof(rice), "%s/rice.lua", dir);
+	if (access(rice, R_OK))
+		return 1;
+	ricing = 1;
+	ok = luaL_dofile(L, rice) == LUA_OK;
+	ricing = 0;
+	return ok;
+}
+
+static int
 loadconfig(const char *file)
 {
 	/* file NULL loads the built-in default */
@@ -944,7 +969,7 @@ loadconfig(const char *file)
 
 	if ((file ? luaL_loadfile(L, file)
 	          : luaL_loadbuffer(L, defconfig, sizeof(defconfig), "=default init.lua")) != LUA_OK
-	|| lua_pcall(L, 0, 0, 0) != LUA_OK) {
+	|| lua_pcall(L, 0, 0, 0) != LUA_OK || !loadrice(L)) {
 		wlr_log(WLR_ERROR, "config: %s", lua_tostring(L, -1));
 		configerror(lua_tostring(L, -1));
 		freeconfig(&load);
@@ -1064,4 +1089,133 @@ config_finish(void)
 	for (size_t i = 0; i < nstarted; i++)
 		free(started[i]);
 	free(started);
+}
+
+/* the rice menu: dfwc.c draws it, changes go through dfwc.set() here */
+
+void config_save(void);
+
+int
+config_menu(const char *code)
+{
+	/* run a dfwc.set{} (or dfwc.tiling(), ...) for the menu; what it sets is saved */
+	int ok;
+
+	if (!cur.L)
+		return 0;
+	ricing = 1;
+	if (!(ok = luaL_dostring(cur.L, code) == LUA_OK)) {
+		wlr_log(WLR_ERROR, "menu: %s", lua_tostring(cur.L, -1));
+		lua_pop(cur.L, 1);
+	}
+	ricing = 0;
+	ricedirty |= ok;
+	config_save(); /* every step, so a reload meanwhile keeps it */
+	return ok;
+}
+
+static void
+putcolor(FILE *f, const float c[4])
+{
+	int v[4];
+
+	for (int i = 0; i < 4; i++)
+		v[i] = c[i] * 255 + 0.5f;
+	fprintf(f, v[3] == 255 ? "\"#%02x%02x%02x\"" : "\"#%02x%02x%02x%02x\"", v[0], v[1], v[2], v[3]);
+}
+
+static void
+putfield(FILE *f, size_t i)
+{
+	/* the live value of fields[i], as Lua dfwc.set() takes it */
+	const char *p = (const char *)&settings + fields[i].off;
+	const int *n = (const int *)p;
+	const float *g = (const float *)p;
+	size_t k;
+
+	switch (fields[i].type) {
+	case Wall:
+		if (!*p) {
+			fputs("false", f);
+			break;
+		}
+		[[fallthrough]]; /* a name, or a path */
+	case Str:
+		fputc('"', f);
+		for (; *p; p++)
+			fprintf(f, *p == '"' || *p == '\\' ? "\\%c" : "%c", *p);
+		fputc('"', f);
+		break;
+	case Int:
+		fprintf(f, "%d", *n);
+		break;
+	case Num:
+		fprintf(f, "%.4g", *(const double *)p);
+		break;
+	case Bool:
+		fputs(*(const bool *)p ? "true" : "false", f);
+		break;
+	case Color:
+		putcolor(f, g);
+		break;
+	case Grad:
+		if (!memcmp(g, g + 4, 4 * sizeof(*g))) {
+			putcolor(f, g);
+			break;
+		}
+		fputs("{ ", f);
+		putcolor(f, g);
+		fputs(", ", f);
+		putcolor(f, g + 4);
+		fputs(" }", f);
+		break;
+	case Sides:
+		if (n[0] == n[1] && n[1] == n[2] && n[2] == n[3])
+			fprintf(f, "%d", n[0]);
+		else
+			fprintf(f, "{ %d, %d, %d, %d }", n[0], n[1], n[2], n[3]);
+		break;
+	case Pair:
+		fprintf(f, "{ %d, %d }", n[0], n[1]);
+		break;
+	case Curve:
+		fprintf(f, "{ %.3g, %.3g, %.3g, %.3g }", g[0], g[1], g[2], g[3]);
+		break;
+	case Mod:
+		for (k = 1; k < LENGTH(modnames) && modnames[k].mask != *(const uint32_t *)p; k++);
+		fprintf(f, "\"%s\"", k < LENGTH(modnames) ? modnames[k].name : "auto");
+		break;
+	}
+}
+
+void
+config_save(void)
+{
+	/* rice.lua gets the settings the menu or rice.lua itself ever set, nothing
+	 * else, so init.lua still decides the rest; written whole, then swapped in */
+	char rice[sizeof(dir) + sizeof("/rice.lua")], tmp[sizeof(rice) + 4];
+	FILE *f;
+
+	if (!ricedirty || !cur.L)
+		return;
+	ricedirty = 0;
+	snprintf(rice, sizeof(rice), "%s/rice.lua", dir);
+	snprintf(tmp, sizeof(tmp), "%s.new", rice);
+	if (!(f = fopen(tmp, "w"))) {
+		wlr_log_errno(WLR_ERROR, "menu: can't write %s", tmp);
+		return;
+	}
+	fputs("-- written by the dfwc menu (Mod+comma) after init.lua; delete a line to let\n"
+		"-- init.lua decide that setting again, or the file to start over\n"
+		"dfwc.set{\n", f);
+	for (size_t i = 0; i < LENGTH(fields); i++) {
+		if (!cur.riced[i])
+			continue;
+		fprintf(f, "\t%s = ", fields[i].name);
+		putfield(f, i);
+		fputs(",\n", f);
+	}
+	fputs("}\n", f);
+	if (fclose(f) || rename(tmp, rice))
+		wlr_log_errno(WLR_ERROR, "menu: can't save %s", rice);
 }

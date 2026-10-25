@@ -15,6 +15,7 @@ dfwc.bind("Mod+p",            dfwc.launch)
 dfwc.bind("Mod+Shift+c",      dfwc.close)
 dfwc.bind("Mod+Shift+q",      dfwc.quit)
 dfwc.bind("Mod+Control+r",    dfwc.reload)
+dfwc.bind("Mod+comma",        dfwc.menu) -- the rice menu: looks, live; saved to rice.lua
 
 -- laptop keys (F1/F2 etc. on most laptops): brightnessctl and PipeWire's wpctl
 local function key(k, cmd, repeats)

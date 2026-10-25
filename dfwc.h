@@ -96,6 +96,7 @@ void sendws(int n, int dir, int follow);  /* the focused window there, maybe fol
 void panby(int dx, int dy);               /* move a canvas workspace's view */
 void magnify(double f);                   /* zoom a canvas by f around the pointer */
 void overview(void);                      /* a canvas zoomed out to fit every window, or back */
+void togglemenu(void);                    /* the rice menu */
 
 /* lua.c */
 extern Settings settings;
@@ -104,6 +105,8 @@ int config_key(uint32_t mods, xkb_keysym_t sym);
 void config_reload(void);
 void config_finish(void);
 const Settings *config_own(void); /* what the config file itself set */
+int config_menu(const char *code);  /* Lua the menu runs; what it sets goes to rice.lua */
+void config_save(void);             /* write rice.lua if the menu changed anything */
 bool config_hasstyle(void);
 bool config_haslayout(const char *name);
 bool config_layout(const char *name, struct wlr_box area, int n, struct wlr_box *out);

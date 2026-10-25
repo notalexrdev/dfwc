@@ -292,6 +292,13 @@ static struct wl_list ghosts;
 static struct wl_list orphans; /* workspaces waiting for a screen after the last one went */
 static Workspace *selws;       /* the workspace whose Mode settings holds */
 static Workspace *panws;       /* the canvas being dragged */
+static struct {
+	struct wlr_scene_buffer *node; /* NULL while closed */
+	struct wlr_box box;            /* on screen, layout coordinates */
+	double z;                      /* panel pixels per layout unit: undoes a canvas zoom */
+	int sel, preset, rowh;
+} rice = { .preset = -1 }; /* the menu (Mod+comma) */
+
 static int tileddrag; /* the window being moved is tiled and stays tiled */
 static struct {
 	struct wl_event_source *timer;
@@ -427,6 +434,11 @@ static void snap(Client *c, int *x, int *y, int dx, int dy);
 static void showmorph(double e);
 static void focustop(void);
 static void movetows(Client *c, Workspace *w);
+static void ricedraw(void);
+static void ricekey(xkb_keysym_t sym);
+static void riceclick(uint32_t button);
+static int ricerow(void);
+static void ricechange(int i, int dir);
 static const struct wlr_buffer_impl textbufimpl;
 static void constrain(struct wlr_pointer_constraint_v1 *con);
 static void floatout(Client *c);
@@ -1900,6 +1912,17 @@ keypress(struct wl_listener *listener, void *data)
 		endbox();
 		return;
 	}
+	if (rice.node && !locked) { /* the menu has the keyboard; the safety keys still work */
+		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+			n = xkb_keymap_key_get_syms_by_level(kb->wlr->keymap, code,
+				xkb_state_key_get_layout(kb->wlr->xkb_state, code), 0, &syms);
+			for (int i = 0; i < n; i++)
+				if (safetykey(mods, syms[i]))
+					return;
+			ricekey(xkb_state_key_get_one_sym(kb->wlr->xkb_state, code));
+		}
+		return;
+	}
 	if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
 		wl_event_source_timer_update(rep.timer, 0); /* a new key ends any repeat */
 		/* level 0 so "Mod+Shift+c" matches c, not C, on every layout */
@@ -2210,6 +2233,11 @@ buttonpress(struct wl_listener *listener, void *data)
 	Client *c;
 
 	wlr_idle_notifier_v1_notify_activity(idlenotifier, seat);
+	if (rice.node && !locked) { /* the menu takes clicks; one outside closes it */
+		if (event->state == WL_POINTER_BUTTON_STATE_PRESSED)
+			riceclick(event->button);
+		return;
+	}
 	if (event->state == WL_POINTER_BUTTON_STATE_PRESSED && (w = curws()) && w->ovzoom && !locked) {
 		/* a click in the overview zooms back in there, on the window clicked */
 		struct wlr_box b = { cursor->x + w->cx, cursor->y + w->cy, 0, 0 };
@@ -2292,6 +2320,15 @@ axisnotify(struct wl_listener *listener, void *data)
 	Workspace *w;
 
 	wlr_idle_notifier_v1_notify_activity(idlenotifier, seat);
+	if (rice.node && !locked && event->orientation == WL_POINTER_AXIS_VERTICAL_SCROLL
+	&& ricerow() >= 0) { /* scrolling over a row changes it */
+		if (event->delta) {
+			rice.sel = ricerow();
+			ricechange(rice.sel, event->delta < 0 ? 1 : -1);
+			ricedraw();
+		}
+		return;
+	}
 	if (kb && (wlr_keyboard_get_modifiers(kb) & MODMASK) == modkey && !locked
 	&& event->orientation == WL_POINTER_AXIS_VERTICAL_SCROLL && (w = curws()) && w->mode.canvas) {
 		magnify(pow(1.1, -event->delta / 15)); /* Mod+scroll zooms a canvas, a notch 10% */
@@ -2851,6 +2888,8 @@ updatemons(struct wl_listener *listener, void *data)
 		}
 	}
 	placeerror();
+	if (rice.node)
+		ricedraw();
 }
 
 static void
@@ -3786,6 +3825,15 @@ drawwallpaper(Monitor *m)
 	wlr_scene_optimized_blur_mark_dirty(optblur);
 }
 
+static struct fcft_font *
+uifont(void)
+{
+	/* shortcut: drawn at scale 1; pass the output's dpi to fcft for crisp HiDPI text */
+	if (!font)
+		font = fcft_from_name(1, (const char *[]){ "monospace:size=11" }, NULL);
+	return font;
+}
+
 static void
 placeerror(void)
 {
@@ -3813,8 +3861,7 @@ showerror(const char *msg)
 		wlr_scene_node_destroy(&errbox->node);
 		errbox = NULL;
 	}
-	/* shortcut: drawn at scale 1; pass the output's dpi to fcft for crisp HiDPI text */
-	if (!msg || (!font && !(font = fcft_from_name(1, (const char *[]){ "monospace:size=11" }, NULL))))
+	if (!msg || !uifont())
 		return;
 	outputbox(&area);
 	maxw = area.width ? area.width - 2 * Pad : 0;
@@ -3833,6 +3880,383 @@ showerror(const char *msg)
 	errbox = wlr_scene_buffer_create(layers[LyrOverlay], &t->base);
 	wlr_buffer_drop(&t->base); /* the scene buffer holds its own reference */
 	placeerror();
+}
+
+
+/* the rice menu (Mod+comma): the main looks on one panel, changed live through
+ * dfwc.set(), saved to rice.lua when it closes */
+
+enum { RTitle, RInt, RNum, RBool, RColor, RGrad, RTo, RWall, RPreset, RTiling, RCanvas, RLayout };
+enum { RiceW = 340, RicePad = 18, RiceNum = 44, RiceBar = 72 }; /* panel, number column, slider */
+
+#define SET(K, L, F) { .kind = K, .label = L, .name = #F, .off = offsetof(Settings, F) }
+#define NUM(K, L, F, LO, HI, STEP) { .kind = K, .label = L, .name = #F, .off = offsetof(Settings, F), \
+	.min = LO, .max = HI, .step = STEP }
+static const struct {
+	int kind;
+	const char *label, *name; /* name: the setting it changes */
+	size_t off;
+	double min, max, step;
+} rows[] = {
+	{ .kind = RTitle, .label = "look" },
+	{ .kind = RPreset, .label = "preset" },
+	SET(RWall, "wallpaper", wallpaper),
+	SET(RColor, "background", background),
+	{ .kind = RTitle, .label = "borders" },
+	NUM(RInt, "width", border_width, 0, 20, 1),
+	NUM(RInt, "rounding", corner_radius, 0, 40, 2),
+	SET(RGrad, "focused", border_focused),
+	SET(RTo, "fading to", border_focused),
+	SET(RGrad, "unfocused", border_unfocused),
+	NUM(RInt, "gradient angle", border_angle, 0, 345, 15),
+	NUM(RNum, "gradient spin", border_spin, 0, 20, 1),
+	{ .kind = RTitle, .label = "effects" },
+	NUM(RInt, "shadow", shadow_size, 0, 60, 2),
+	SET(RBool, "blur", blur),
+	NUM(RNum, "opacity", opacity, 0.5, 1, 0.05),
+	NUM(RInt, "open fade", anim_open, 0, 600, 20),
+	NUM(RInt, "glide", anim_move, 0, 600, 20),
+	{ .kind = RTitle, .label = "this workspace" },
+	{ .kind = RTiling, .label = "tiling" },
+	{ .kind = RCanvas, .label = "canvas" },
+	{ .kind = RLayout, .label = "layout" },
+	{ .kind = RTitle, .label = "gaps" },
+	NUM(RInt, "inner", gaps_inner, 0, 60, 2),
+	NUM(RInt, "outer", gaps_outer, 0, 60, 2),
+	SET(RBool, "smart", smart_gaps),
+};
+#undef SET
+#undef NUM
+
+static const char *const palette[] = {
+	"#000000", "#1c1c1c", "#262626", "#3a3a3a", "#6b6b6b", "#a3a3a3", "#d4d4d4", "#ffffff",
+	"#d77c79", "#d9bc8c", "#94b979", "#84b6b2", "#88a4c9", "#b393c6", "#f5c2e7", "#89b4fa",
+};
+static const char *const walls[] = { "girl", "matrix", "hands", "" };
+static const char *const tilings[] = { "tile", "bstack", "spiral", "dwindle", "centeredmaster",
+	"grid", "monocle" };
+static const struct { const char *name, *set; } presets[] = {
+	{ "ink", "border_width = 2, corner_radius = 0, border_focused = '#a3a3a3', "
+		"border_unfocused = '#262626', border_spin = 0, shadow_size = 10" },
+	{ "soft", "border_width = 2, corner_radius = 12, border_focused = '#d4d4d4', "
+		"border_unfocused = '#262626', border_spin = 0, shadow_size = 24" },
+	{ "neon", "border_width = 3, corner_radius = 8, border_focused = { '#89b4fa', '#f5c2e7' }, "
+		"border_unfocused = '#1c1c1c', border_spin = 6, shadow_size = 14" },
+	{ "bare", "border_width = 1, corner_radius = 0, border_focused = '#6b6b6b', "
+		"border_unfocused = '#1c1c1c', border_spin = 0, shadow_size = 0" },
+};
+
+
+static void
+hex(const float c[4], char out[8])
+{
+	snprintf(out, 8, "#%02x%02x%02x", (int)(c[0] * 255 + 0.5f), (int)(c[1] * 255 + 0.5f),
+		(int)(c[2] * 255 + 0.5f));
+}
+
+static int
+pick(const char *const *list, int n, const char *s)
+{
+	for (int i = 0; i < n; i++)
+		if (!strcmp(list[i], s))
+			return i;
+	return -1;
+}
+
+static int
+cycle(int i, int n, int dir, int first)
+{
+	/* the next of first..n-1 from i (-2 when i is none of them), wrapping */
+	if (i < first)
+		return dir > 0 ? first : n - 1;
+	return first + (i - first + dir + (n - first)) % (n - first);
+}
+
+static void
+ricechange(int i, int dir)
+{
+	/* one step of rows[i], as Lua, so the config's checks apply */
+	const char *n = rows[i].name;
+	char code[384], a[8], b[8];
+	void *p = (char *)&settings + rows[i].off;
+	float (*g)[4] = p;
+	double v;
+	int k;
+
+	switch (rows[i].kind) {
+	case RInt:
+	case RNum:
+		v = rows[i].kind == RInt ? *(int *)p : *(double *)p;
+		v = MIN(MAX(v + dir * rows[i].step, rows[i].min), rows[i].max);
+		snprintf(code, sizeof(code), "dfwc.set{ %s = %.4g }", n, v);
+		break;
+	case RBool:
+		snprintf(code, sizeof(code), "dfwc.set{ %s = %s }", n, *(bool *)p ? "false" : "true");
+		break;
+	case RColor:
+	case RGrad:
+		hex(g[0], a);
+		k = cycle(pick(palette, LENGTH(palette), a), LENGTH(palette), dir, 0);
+		hex(g[1], b);
+		if (rows[i].kind == RGrad && memcmp(g[0], g[1], sizeof(g[0]))) /* keep its gradient */
+			snprintf(code, sizeof(code), "dfwc.set{ %s = { '%s', '%s' } }", n, palette[k], b);
+		else
+			snprintf(code, sizeof(code), "dfwc.set{ %s = '%s' }", n, palette[k]);
+		break;
+	case RTo: /* none (solid), then the palette */
+		hex(g[0], a);
+		hex(g[1], b);
+		k = !memcmp(g[0], g[1], sizeof(g[0])) ? -1 : pick(palette, LENGTH(palette), b);
+		k = cycle(k + 1, LENGTH(palette) + 1, dir, 0) - 1;
+		if (k < 0)
+			snprintf(code, sizeof(code), "dfwc.set{ %s = '%s' }", n, a);
+		else
+			snprintf(code, sizeof(code), "dfwc.set{ %s = { '%s', '%s' } }", n, a, palette[k]);
+		break;
+	case RWall:
+		k = cycle(pick(walls, LENGTH(walls), p), LENGTH(walls), dir, 0);
+		snprintf(code, sizeof(code), *walls[k] ? "dfwc.set{ %s = '%s' }" : "dfwc.set{ %s = false }",
+			n, walls[k]);
+		break;
+	case RPreset:
+		rice.preset = cycle(rice.preset, LENGTH(presets), dir, 0);
+		snprintf(code, sizeof(code), "dfwc.set{ %s }", presets[rice.preset].set);
+		break;
+	case RTiling:
+		snprintf(code, sizeof(code), "dfwc.tiling(%s)", settings.tiling ? "false" : "true");
+		break;
+	case RCanvas:
+		snprintf(code, sizeof(code), "dfwc.canvas(%s)", settings.canvas ? "false" : "true");
+		break;
+	case RLayout:
+		k = cycle(pick(tilings, LENGTH(tilings), settings.layout), LENGTH(tilings), dir, 0);
+		snprintf(code, sizeof(code), "dfwc.layout('%s')", tilings[k]);
+		break;
+	default:
+		return;
+	}
+	config_menu(code);
+}
+
+static void
+fill(pixman_image_t *img, int x, int y, int w, int h, uint32_t rgb)
+{
+	pixman_color_t c = { (rgb >> 16 & 0xff) * 0x101, (rgb >> 8 & 0xff) * 0x101,
+		(rgb & 0xff) * 0x101, 0xffff };
+
+	pixman_image_fill_rectangles(PIXMAN_OP_SRC, img, &c, 1,
+		&(pixman_rectangle16_t){ x, y, MAX(w, 0), MAX(h, 0) });
+}
+
+static uint32_t
+rgb(const float c[4])
+{
+	return (uint32_t)(c[0] * 255 + 0.5f) << 16 | (uint32_t)(c[1] * 255 + 0.5f) << 8
+		| (uint32_t)(c[2] * 255 + 0.5f);
+}
+
+static void
+swatch(pixman_image_t *img, int x, int y, int s, const float c[4])
+{
+	fill(img, x - 1, y - 1, s + 2, s + 2, 0x3a3a3a);
+	fill(img, x, y, s, s, rgb(c));
+}
+
+static void
+ricedraw(void)
+{
+	/* the ink panel: dim labels, the picked row lit, values right-aligned */
+	enum { W = RiceW, Pad = RicePad };
+	static pixman_color_t text = { 0x8a8a, 0x8a8a, 0x8a8a, 0xffff }, lit = { 0xeded, 0xeded, 0xeded, 0xffff },
+		dim = { 0x5050, 0x5050, 0x5050, 0xffff };
+	struct fcft_font *f = uifont();
+	Monitor *m = curws() ? curws()->m : NULL;
+	char val[96];
+	int rh, h, y, x, tw, kind;
+	const void *p;
+	const float (*g)[4];
+	double v, frac;
+	TextBuffer *t;
+
+	if (!f || !m)
+		return;
+	rice.rowh = rh = f->height + 8;
+	h = Pad * 2 + rh * (LENGTH(rows) + 2);
+	if (!(t = calloc(1, sizeof(*t)))
+	|| !(t->img = pixman_image_create_bits_no_clear(PIXMAN_a8r8g8b8, W, h, NULL, 0))) {
+		free(t);
+		return;
+	}
+	fill(t->img, 0, 0, W, h, 0x090909); /* solid: window edges behind it would cut through */
+	fill(t->img, 0, 0, W, 1, 0x262626);
+	fill(t->img, 0, h - 1, W, 1, 0x262626);
+	fill(t->img, 0, 0, 1, h, 0x262626);
+	fill(t->img, W - 1, 0, 1, h, 0x262626);
+	drawtext(t->img, f, "rice", Pad, Pad + 6, &lit, 0);
+	tw = drawtext(NULL, f, "saved to rice.lua", 0, 0, NULL, 0);
+	drawtext(t->img, f, "saved to rice.lua", W - Pad - tw, Pad + 6, &dim, 0);
+	for (size_t i = 0; i < LENGTH(rows); i++) {
+		y = Pad + rh * (i + 1);
+		kind = rows[i].kind;
+		if (kind == RTitle) {
+			drawtext(t->img, f, rows[i].label, Pad, y + 6, &dim, 0);
+			continue;
+		}
+		if ((int)i == rice.sel) {
+			fill(t->img, 1, y, W - 2, rh, 0x161616);
+			fill(t->img, 1, y, 2, rh, 0xa3a3a3);
+		}
+		drawtext(t->img, f, rows[i].label, Pad + 10, y + 4, (int)i == rice.sel ? &lit : &text, 0);
+		p = (const char *)&settings + rows[i].off;
+		g = p;
+		x = W - Pad;
+		*val = '\0';
+		switch (kind) {
+		case RInt:
+		case RNum:
+			v = kind == RInt ? *(const int *)p : *(const double *)p;
+			snprintf(val, sizeof(val), kind == RInt ? "%.0f" : "%.2g", v);
+			tw = drawtext(NULL, f, val, 0, 0, NULL, 0);
+			frac = (v - rows[i].min) / (rows[i].max - rows[i].min);
+			fill(t->img, x - RiceNum - RiceBar, y + rh / 2 - 1, RiceBar, 2, 0x262626);
+			fill(t->img, x - RiceNum - RiceBar, y + rh / 2 - 1, RiceBar * frac + 0.5, 2, 0xa3a3a3);
+			drawtext(t->img, f, val, x - tw, y + 4, &lit, 0);
+			continue;
+		case RBool:
+		case RTiling:
+		case RCanvas:
+			snprintf(val, sizeof(val), "%s", (kind == RTiling ? settings.tiling
+				: kind == RCanvas ? settings.canvas : *(const bool *)p) ? "on" : "off");
+			break;
+		case RColor:
+		case RGrad:
+			swatch(t->img, x - 14, y + rh / 2 - 7, 14, g[0]);
+			hex(g[0], val);
+			x -= 24;
+			break;
+		case RTo:
+			if (!memcmp(g[0], g[1], sizeof(g[0]))) {
+				snprintf(val, sizeof(val), "none");
+				break;
+			}
+			swatch(t->img, x - 14, y + rh / 2 - 7, 14, g[1]);
+			hex(g[1], val);
+			x -= 24;
+			break;
+		case RWall:
+			snprintf(val, sizeof(val), "‹ %s ›", !*(const char *)p ? "none"
+				: pick(walls, LENGTH(walls), p) < 0 ? "own" : (const char *)p);
+			break;
+		case RPreset:
+			snprintf(val, sizeof(val), "‹ %s ›", rice.preset < 0 ? "pick" : presets[rice.preset].name);
+			break;
+		case RLayout:
+			snprintf(val, sizeof(val), "‹ %s ›", settings.layout);
+			break;
+		}
+		tw = drawtext(NULL, f, val, 0, 0, NULL, 0);
+		drawtext(t->img, f, val, x - tw, y + 4, !strcmp(val, "off") || !strcmp(val, "none") ? &dim : &lit, 0);
+	}
+	tw = drawtext(NULL, f, "↑↓ pick  ←→ change  esc close", 0, 0, NULL, 0);
+	drawtext(t->img, f, "↑↓ pick  ←→ change  esc close", (W - tw) / 2,
+		h - Pad - rh + 4, &dim, 0);
+	wlr_buffer_init(&t->base, &textbufimpl, W, h);
+	if (!rice.node)
+		rice.node = wlr_scene_buffer_create(layers[LyrOverlay], &t->base);
+	else
+		wlr_scene_buffer_set_buffer(rice.node, &t->base);
+	wlr_buffer_drop(&t->base);
+	if (!rice.node)
+		return;
+	/* the same size on the glass however a canvas is zoomed, smaller only if the
+	 * screen is too short for it; on the right, centered */
+	rice.z = MAX(m->wlr->scale / settings.scale, (double)h / MAX(m->area.height - 48, 1));
+	rice.box = (struct wlr_box){ 0, 0, W / rice.z, h / rice.z };
+	rice.box.x = m->area.x + m->area.width - rice.box.width - 24 / rice.z;
+	rice.box.y = m->area.y + (m->area.height - rice.box.height) / 2;
+	wlr_scene_buffer_set_dest_size(rice.node, rice.box.width, rice.box.height);
+	wlr_scene_node_set_position(&rice.node->node, rice.box.x, rice.box.y);
+}
+
+void
+togglemenu(void)
+{
+	if (rice.node) {
+		wlr_scene_node_destroy(&rice.node->node);
+		rice.node = NULL;
+		config_save();
+		return;
+	}
+	rice.sel = 1;
+	ricedraw();
+}
+
+static void
+ricemove(int dir)
+{
+	/* the next row that isn't a title, wrapping */
+	int n = LENGTH(rows);
+
+	do
+		rice.sel = (rice.sel + dir + n) % n;
+	while (rows[rice.sel].kind == RTitle);
+	ricedraw();
+}
+
+static void
+ricekey(xkb_keysym_t sym)
+{
+	switch (sym) {
+	case XKB_KEY_Up: case XKB_KEY_k: ricemove(-1); break;
+	case XKB_KEY_Down: case XKB_KEY_j: case XKB_KEY_Tab: ricemove(1); break;
+	case XKB_KEY_Left: case XKB_KEY_h: ricechange(rice.sel, -1); ricedraw(); break;
+	case XKB_KEY_Right: case XKB_KEY_l: case XKB_KEY_Return: case XKB_KEY_space:
+		ricechange(rice.sel, 1);
+		ricedraw();
+		break;
+	case XKB_KEY_Escape: case XKB_KEY_q: case XKB_KEY_comma: togglemenu(); break;
+	}
+}
+
+static int
+ricerow(void)
+{
+	/* the row under the pointer, or -1 */
+	int y = (cursor->y - rice.box.y) * rice.z, i = (y - RicePad) / rice.rowh - 1;
+
+	if (!wlr_box_contains_point(&rice.box, cursor->x, cursor->y) || y < RicePad || i < 0
+	|| i >= (int)LENGTH(rows) || rows[i].kind == RTitle)
+		return -1;
+	return i;
+}
+
+static void
+riceclick(uint32_t button)
+{
+	/* a click picks a row and steps it (right button: back); sliders take the
+	 * spot clicked; outside, it closes */
+	int i = ricerow(), x, bar = RiceW - RicePad - RiceNum - RiceBar; /* where sliders start */
+	double v, frac;
+	char code[128];
+
+	if (!wlr_box_contains_point(&rice.box, cursor->x, cursor->y)) {
+		togglemenu();
+		return;
+	}
+	if (i < 0)
+		return;
+	rice.sel = i;
+	x = (cursor->x - rice.box.x) * rice.z;
+	if ((rows[i].kind == RInt || rows[i].kind == RNum) && x >= bar - 4 && x <= bar + RiceBar + 4) {
+		frac = MIN(MAX((x - bar) / (double)RiceBar, 0), 1);
+		v = rows[i].min + frac * (rows[i].max - rows[i].min);
+		v = rows[i].min + round((v - rows[i].min) / rows[i].step) * rows[i].step;
+		snprintf(code, sizeof(code), "dfwc.set{ %s = %.4g }", rows[i].name, v);
+		config_menu(code);
+	} else if (x > RiceW / 2) {
+		ricechange(i, button == BTN_RIGHT ? -1 : 1);
+	}
+	ricedraw();
 }
 
 void
