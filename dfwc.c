@@ -89,6 +89,15 @@ typedef struct {
 } Anim;
 
 typedef struct {
+	bool tiling;
+	char layout[64];
+	double mfact;
+	int nmaster;
+} Mode; /* what each workspace keeps for itself; the shown one lives in settings */
+
+typedef struct Workspace Workspace;
+
+typedef struct {
 	struct wlr_box out, hole;
 	int ro[4], ri[4], angle;
 	float col[2][4];
@@ -127,6 +136,7 @@ typedef struct {
 	uint32_t anchor;     /* edges a mouse resize grows, so the opposite ones stay put */
 	int ax, ay;          /* right and bottom edges to keep while anchored */
 	unsigned int id;     /* names the window in the restore menu */
+	Workspace *ws;       /* while mapped */
 	Rule rule;           /* what dfwc.rule() said when it opened */
 	struct wl_listener map, unmap, commit, destroy, set_title, set_app_id;
 	struct wl_listener request_move, request_resize, request_maximize, request_fullscreen;
@@ -165,8 +175,20 @@ typedef struct {
 	struct wl_list layers[4];    /* LayerSurface, indexed by zwlr_layer_shell_v1_layer */
 	struct wlr_scene_buffer *wall; /* built-in wallpaper */
 	struct wlr_box wallbox;        /* area it was drawn for */
+	struct wl_list spaces;         /* Workspace, top to bottom; the last one is empty */
+	Workspace *ws;                 /* the one shown */
+	Workspace *slidefrom;          /* sliding out while ws slides in */
+	Anim slide;
+	int slidedir;                  /* 1: the new one comes from below */
 	struct wl_listener frame, request_state, destroy;
 } Monitor;
+
+struct Workspace {
+	struct wl_list link;
+	Monitor *m;
+	struct wlr_scene_tree *tree[3]; /* its windows, under LyrClients, LyrOnTop, LyrFullscreen */
+	Mode mode;
+};
 
 typedef struct {
 	struct wl_list link; /* in Monitor.layers */
@@ -263,6 +285,8 @@ static int cycling; /* focus is walking the stack; the order commits when Mod is
 static int repeating; /* the running bind comes from a held key */
 static int animating; /* frames keep coming until every animation is done */
 static struct wl_list ghosts;
+static struct wl_list orphans; /* workspaces waiting for a screen after the last one went */
+static Workspace *selws;       /* the workspace whose Mode settings holds */
 static int tileddrag; /* the window being moved is tiled and stays tiled */
 static struct {
 	struct wl_event_source *timer;
@@ -396,6 +420,8 @@ static void placeerror(void);
 static void drawwallpaper(Monitor *m);
 static void snap(Client *c, int *x, int *y, int dx, int dy);
 static void showmorph(double e);
+static void focustop(void);
+static void movetows(Client *c, Workspace *w);
 static const struct wlr_buffer_impl textbufimpl;
 static void constrain(struct wlr_pointer_constraint_v1 *con);
 static void floatout(Client *c);
@@ -617,6 +643,142 @@ static int
 clientlayer(Client *c)
 {
 	return c->fullscreen ? LyrFullscreen : c->ontop ? LyrOnTop : LyrClients;
+}
+
+/* workspaces */
+
+static Workspace *
+curws(void)
+{
+	/* the workspace shown on the screen with the pointer */
+	Monitor *m = selmon();
+
+	if (!m && !wl_list_empty(&mons))
+		m = wl_container_of(mons.next, m, link);
+	return m ? m->ws : NULL;
+}
+
+static int
+shown(Client *c)
+{
+	return c->ws && c->ws->m && c->ws == c->ws->m->ws && !c->minimized;
+}
+
+static struct wlr_scene_tree *
+clienttree(Client *c)
+{
+	/* a mapped window lives in its workspace's tree for its layer */
+	int l = clientlayer(c);
+
+	return c->ws ? c->ws->tree[l == LyrClients ? 0 : l == LyrOnTop ? 1 : 2] : layers[l];
+}
+
+static void
+modeget(Mode *md)
+{
+	md->tiling = settings.tiling;
+	memcpy(md->layout, settings.layout, sizeof(md->layout));
+	md->mfact = settings.mfact;
+	md->nmaster = settings.nmaster;
+}
+
+static void
+modeset(const Mode *md)
+{
+	settings.tiling = md->tiling;
+	memcpy(settings.layout, md->layout, sizeof(settings.layout));
+	settings.mfact = md->mfact;
+	settings.nmaster = md->nmaster;
+}
+
+static Workspace *
+wsnew(Monitor *m)
+{
+	static const int lyr[] = { LyrClients, LyrOnTop, LyrFullscreen };
+	const Settings *own = config_own();
+	Workspace *w = calloc(1, sizeof(*w));
+
+	if (!w)
+		die("out of memory");
+	w->m = m;
+	for (int i = 0; i < 3; i++) {
+		w->tree[i] = wlr_scene_tree_create(layers[lyr[i]]);
+		wlr_scene_node_set_enabled(&w->tree[i]->node, false);
+	}
+	/* a new workspace starts as the config says */
+	w->mode = (Mode){ .tiling = own->tiling, .mfact = own->mfact, .nmaster = own->nmaster };
+	memcpy(w->mode.layout, own->layout, sizeof(w->mode.layout));
+	wl_list_insert(m->spaces.prev, &w->link);
+	return w;
+}
+
+static void
+wsshow(Workspace *w, int on, int y)
+{
+	for (int i = 0; i < 3; i++) {
+		wlr_scene_node_set_enabled(&w->tree[i]->node, on);
+		wlr_scene_node_set_position(&w->tree[i]->node, 0, y);
+	}
+}
+
+static int
+wsempty(Workspace *w)
+{
+	Client *c;
+
+	wl_list_for_each(c, &clients, link)
+		if (c->ws == w)
+			return 0;
+	return 1;
+}
+
+static void
+prune(Monitor *m)
+{
+	/* empty workspaces vanish once left, and one empty one always waits at the end */
+	Workspace *w, *tmp;
+
+	wl_list_for_each_safe(w, tmp, &m->spaces, link) {
+		if (w == m->ws || w == m->slidefrom || w->link.next == &m->spaces || !wsempty(w))
+			continue;
+		for (int i = 0; i < 3; i++)
+			wlr_scene_node_destroy(&w->tree[i]->node);
+		wl_list_remove(&w->link);
+		free(w);
+	}
+	if (!wsempty(wl_container_of(m->spaces.prev, w, link)))
+		wsnew(m);
+}
+
+static Workspace *
+wsat(Monitor *m, int n, int dir)
+{
+	/* the n-th workspace (the last if there are fewer), or the one dir steps away */
+	struct wl_list *l;
+	Workspace *w;
+
+	if (!m)
+		return NULL;
+	if (dir) {
+		l = dir > 0 ? m->ws->link.next : m->ws->link.prev;
+		return l == &m->spaces ? NULL : wl_container_of(l, w, link);
+	}
+	for (l = m->spaces.next; --n > 0 && l->next != &m->spaces; l = l->next);
+	return wl_container_of(l, w, link);
+}
+
+static int
+wsindex(Workspace *w)
+{
+	Workspace *t;
+	int i = 0;
+
+	wl_list_for_each(t, &w->m->spaces, link) {
+		if (t == w)
+			break;
+		i++;
+	}
+	return i;
 }
 
 static void
@@ -893,10 +1055,10 @@ ghost(Client *c)
 	struct wlr_scene_rect *rects[LENGTH(c->ring) + LENGTH(c->arm)], *r;
 	Ghost *g;
 
-	if (!settings.anim_close || !c->scene->node.enabled || c->minimized || !(g = calloc(1, sizeof(*g))))
+	if (!settings.anim_close || !c->scene->node.enabled || !shown(c) || !(g = calloc(1, sizeof(*g))))
 		return;
-	g->tree = wlr_scene_tree_create(c->scene->node.parent);
-	wlr_scene_node_place_above(&g->tree->node, &c->scene->node);
+	/* outside the workspace's tree, which may go before the fade ends */
+	g->tree = wlr_scene_tree_create(layers[clientlayer(c)]);
 	wlr_scene_node_set_position(&g->tree->node, c->scene->node.x, c->scene->node.y);
 	if (c->shadow->node.enabled) {
 		memcpy(g->shadowcolor, c->shadow->color, sizeof(g->shadowcolor));
@@ -937,6 +1099,7 @@ animate(void)
 	int busy = 0, upd;
 	double e;
 	Client *c;
+	Monitor *m;
 
 	wl_list_for_each(c, &clients, link) {
 		upd = 0;
@@ -967,6 +1130,19 @@ animate(void)
 	if (morph.a.dur) {
 		busy |= step(&morph.a, now, &e);
 		showmorph(e);
+	}
+	wl_list_for_each(m, &mons, link) {
+		if (!m->slide.dur)
+			continue;
+		busy |= step(&m->slide, now, &e);
+		wsshow(m->ws, 1, m->slidedir * m->area.height * (1 - e));
+		if (m->slide.dur) {
+			wsshow(m->slidefrom, 1, -m->slidedir * m->area.height * e);
+		} else {
+			wsshow(m->slidefrom, 0, 0);
+			m->slidefrom = NULL;
+			prune(m);
+		}
 	}
 	wl_list_for_each_safe(g, tmp, &ghosts, link) {
 		if (!step(&g->a, now, &e)) {
@@ -1076,7 +1252,7 @@ focustop(void)
 	wlr_seat_keyboard_notify_clear_focus(seat);
 	/* shortcut: the cleared window isn't restyled; it's unmapping anyway */
 	wl_list_for_each(c, &clients, link) {
-		if (!c->minimized) {
+		if (shown(c)) {
 			focusclient(c, 0);
 			return;
 		}
@@ -1150,7 +1326,7 @@ tiledat(double x, double y, Client *except)
 
 	wl_list_for_each(t, &tiles, tlink) {
 		b = outset(t, clientbox(t));
-		if (t != except && istiled(t) && wlr_box_contains_point(&b, x, y))
+		if (t != except && shown(t) && istiled(t) && wlr_box_contains_point(&b, x, y))
 			return t;
 	}
 	return NULL;
@@ -1180,11 +1356,10 @@ neighbor(Client *c, int dx, int dy)
 	/* the nearest tiled window in that direction, favoring ones in line */
 	struct wlr_box a = clientbox(c), b;
 	double ax = a.x + a.width / 2.0, ay = a.y + a.height / 2.0, along, across, best = INFINITY;
-	Monitor *m = monof(c);
 	Client *t, *found = NULL;
 
 	wl_list_for_each(t, &tiles, tlink) {
-		if (t == c || !istiled(t) || monof(t) != m)
+		if (t == c || !istiled(t) || t->ws != c->ws)
 			continue;
 		b = clientbox(t);
 		along = dx ? (b.x + b.width / 2.0 - ax) * (dx > 0 ? 1 : -1)
@@ -1215,7 +1390,7 @@ focusstack(int dir)
 			continue;
 		if (l == &c->link)
 			return;
-		if (!(n = wl_container_of(l, n, link))->minimized)
+		if (shown(n = wl_container_of(l, n, link)))
 			break;
 	}
 	cycling = 1;
@@ -1242,7 +1417,7 @@ moveresize(int dx, int dy, int dw, int dh)
 			wl_list_for_each(t, &tiles, tlink) {
 				if (t == c)
 					break;
-				n += istiled(t) && monof(t) == m;
+				n += istiled(t) && t->ws == c->ws;
 			}
 			d = bstack ? (double)dh / m->usable.height : (double)dw / m->usable.width;
 			settings.mfact = MIN(MAX(settings.mfact + (n < settings.nmaster ? d : -d), 0.05), 0.95);
@@ -1295,7 +1470,7 @@ setfullscreen(Client *c, int on)
 			c->prev = clientbox(c);
 		/* above bars, below overlays like lock screens */
 		c->fullscreen = on;
-		wlr_scene_node_reparent(&c->scene->node, layers[clientlayer(c)]);
+		wlr_scene_node_reparent(&c->scene->node, clienttree(c));
 		resizeclient(c, on ? m->area : c->maximized ? inset(c, m->usable) : c->prev);
 		restyle(c);
 		arrange();
@@ -1311,7 +1486,7 @@ toggleontop(void)
 	if (!c)
 		return;
 	c->ontop = !c->ontop;
-	wlr_scene_node_reparent(&c->scene->node, layers[clientlayer(c)]);
+	wlr_scene_node_reparent(&c->scene->node, clienttree(c));
 	restyle(c);
 }
 
@@ -1348,6 +1523,7 @@ menuread(int fd, uint32_t mask, void *data)
 		wl_list_for_each(c, &clients, link)
 			if (c->id == id && c->minimized) {
 				c->minimized = 0;
+				movetows(c, curws());
 				wlr_scene_node_set_enabled(&c->scene->node, true);
 				focusclient(c, 1);
 				arrange();
@@ -1570,7 +1746,7 @@ snap(Client *c, int *x, int *y, int dx, int dy)
 		TRYY(o.y + o.height - me.y - me.height, 1);
 	}
 	wl_list_for_each(t, &clients, link) {
-		if (t == c || t->minimized)
+		if (t == c || !shown(t))
 			continue;
 		o = outset(t, clientbox(t));
 		if (me.y < o.y + o.height && o.y < me.y + me.height) { /* side by side */
@@ -2028,7 +2204,7 @@ wantstearing(Monitor *m)
 	if (!settings.tearing)
 		return 0;
 	wl_list_for_each(c, &clients, link)
-		if (c->fullscreen && cmapped(c) && monof(c) == m)
+		if (c->fullscreen && cmapped(c) && shown(c) && c->ws->m == m)
 			return wlr_tearing_control_manager_v1_surface_hint_from_surface(tearingmgr,
 				csurface(c)) == WP_TEARING_CONTROL_V1_PRESENTATION_HINT_ASYNC;
 	return 0;
@@ -2072,15 +2248,37 @@ requestmonstate(struct wl_listener *listener, void *data)
 static void
 destroymon(struct wl_listener *listener, void *data)
 {
-	Monitor *m = wl_container_of(listener, m, destroy);
+	Monitor *m = wl_container_of(listener, m, destroy), *o;
 	LayerSurface *l, *tmp;
+	Workspace *w, *wtmp;
+	Client *c;
 
+	wl_list_remove(&m->link);
+	if (selws && selws->m == m)
+		selws = NULL;
+	if (!wl_list_empty(&mons)) {
+		/* shortcut: windows keep their coordinates, so they may sit off the
+		 * other screen; move them over by geometry once multi-monitor matters */
+		o = wl_container_of(mons.next, o, link);
+		wl_list_for_each(c, &clients, link)
+			if (c->ws && c->ws->m == m)
+				movetows(c, o->ws);
+		wl_list_for_each_safe(w, wtmp, &m->spaces, link) {
+			for (int i = 0; i < 3; i++)
+				wlr_scene_node_destroy(&w->tree[i]->node);
+			wl_list_remove(&w->link);
+			free(w);
+		}
+	} else { /* the last screen: its workspaces wait for the next one */
+		wl_list_for_each(w, &m->spaces, link)
+			w->m = NULL;
+		wl_list_insert_list(&orphans, &m->spaces);
+	}
 	if (m->wall)
 		wlr_scene_node_destroy(&m->wall->node);
 	for (size_t i = 0; i < LENGTH(m->layers); i++)
 		wl_list_for_each_safe(l, tmp, &m->layers[i], link)
 			wlr_layer_surface_v1_destroy(l->wlr);
-	wl_list_remove(&m->link);
 	unlisten(&m->frame, &m->request_state, &m->destroy, NULL);
 	free(m);
 }
@@ -2184,7 +2382,8 @@ layout(const char *name, struct wlr_box a, int n, struct wlr_box *out)
 static int
 istiled(Client *c)
 {
-	return settings.tiling && !c->floating && !c->minimized && !c->fullscreen && !c->maximized;
+	return c->ws && c->ws->mode.tiling && !c->floating && !c->minimized && !c->fullscreen
+		&& !c->maximized;
 }
 
 static void
@@ -2194,11 +2393,14 @@ tile(Monitor *m)
 	struct wlr_box a, *out;
 	Client *c;
 	int n = 0, i = 0, smart;
+	Mode keep;
 
 	wl_list_for_each(c, &tiles, tlink)
-		n += istiled(c) && monof(c) == m;
+		n += istiled(c) && c->ws == m->ws;
 	if (!n || !(out = calloc(n, sizeof(*out))))
 		return;
+	modeget(&keep);
+	modeset(&m->ws->mode); /* layout() and Lua layouts read settings */
 	smart = s->smart_gaps && n == 1;
 	a = m->usable;
 	if (!smart)
@@ -2207,7 +2409,7 @@ tile(Monitor *m)
 	if (!config_layout(s->layout, a, n, out))
 		layout(s->layout, a, n, out);
 	wl_list_for_each(c, &tiles, tlink) {
-		if (!istiled(c) || monof(c) != m)
+		if (!istiled(c) || c->ws != m->ws)
 			continue;
 		if (!c->tiled || c->smart != smart) { /* borders, shadow and corners change */
 			if (!c->tiled)
@@ -2219,17 +2421,28 @@ tile(Monitor *m)
 		resizeclient(c, inset(c, out[i++]));
 	}
 	free(out);
+	modeset(&keep);
 }
 
 void
 arrange(void)
 {
+	Workspace *w = curws();
 	Monitor *m;
 	Client *c;
 
+	/* runtime changes (dfwc.tiling(), mfact keys, a reload) belong to the shown workspace */
+	if (selws)
+		modeget(&selws->mode);
+	if (w && w != selws) {
+		selws = w;
+		modeset(&w->mode);
+	}
+	wl_list_for_each(m, &mons, link)
+		prune(m);
 	/* tiling turned off: everything back where it floated */
 	wl_list_for_each(c, &tiles, tlink) {
-		if (c->tiled && !settings.tiling) {
+		if (c->tiled && !(c->ws && c->ws->mode.tiling)) {
 			c->tiled = c->smart = 0;
 			resizeclient(c, c->floatbox);
 			restyle(c);
@@ -2237,6 +2450,66 @@ arrange(void)
 	}
 	wl_list_for_each(m, &mons, link)
 		tile(m);
+}
+
+static void
+movetows(Client *c, Workspace *w)
+{
+	if (!w || c->ws == w)
+		return;
+	c->ws = w;
+	wlr_scene_node_reparent(&c->scene->node, clienttree(c));
+}
+
+static void
+view(Workspace *w)
+{
+	Monitor *m = w ? w->m : NULL;
+	Workspace *old;
+
+	if (!m || w == m->ws)
+		return;
+	old = m->ws;
+	if (m->slidefrom) /* a slide still running ends where it was going */
+		wsshow(m->slidefrom, 0, 0);
+	m->ws = w;
+	m->slidefrom = NULL;
+	if (settings.anim_move) {
+		/* the old one slides out and the new one in, up or down by their order */
+		m->slidefrom = old;
+		m->slidedir = wsindex(w) > wsindex(old) ? 1 : -1;
+		wsshow(w, 1, m->slidedir * m->area.height);
+		startanim(&m->slide, settings.anim_move);
+	} else {
+		wsshow(old, 0, 0);
+		wsshow(w, 1, 0);
+	}
+	focustop();
+	arrange();
+}
+
+void
+viewws(int n, int dir)
+{
+	Workspace *w = curws();
+
+	view(wsat(w ? w->m : NULL, n, dir));
+}
+
+void
+sendws(int n, int dir, int follow)
+{
+	Client *c = selclient();
+	Workspace *w;
+
+	if (!c || !c->ws || !(w = wsat(c->ws->m, n, dir)) || w == c->ws)
+		return;
+	movetows(c, w);
+	if (follow)
+		view(w); /* it was focused last, so it keeps the focus there */
+	else
+		focustop();
+	arrange();
 }
 
 void
@@ -2316,6 +2589,7 @@ createmon(struct wl_listener *listener, void *data)
 	struct wlr_output *wlr = data;
 	struct wlr_output_state state;
 	struct wlr_output_mode *mode;
+	Workspace *w;
 	Monitor *m;
 
 	if (!wlr_output_init_render(wlr, alloc, drw) || !(m = calloc(1, sizeof(*m)))) {
@@ -2338,6 +2612,19 @@ createmon(struct wl_listener *listener, void *data)
 	LISTEN(&wlr->events.frame, &m->frame, rendermon);
 	LISTEN(&wlr->events.request_state, &m->request_state, requestmonstate);
 	LISTEN(&wlr->events.destroy, &m->destroy, destroymon);
+	wl_list_init(&m->spaces);
+	if (wl_list_empty(&orphans)) {
+		m->ws = wsnew(m);
+	} else { /* the last screen came back: its workspaces come with it */
+		wl_list_insert_list(&m->spaces, &orphans);
+		wl_list_init(&orphans);
+		wl_list_for_each(w, &m->spaces, link) {
+			w->m = m;
+			wsshow(w, 0, 0);
+		}
+		m->ws = wl_container_of(m->spaces.next, w, link);
+	}
+	wsshow(m->ws, 1, 0);
 	/* a new screen extends the desktop to the right; windows stay put */
 	wlr_scene_output_layout_add_output(scene_layout,
 		wlr_output_layout_add_auto(output_layout, wlr), wlr_scene_output_create(scene, wlr));
@@ -2395,10 +2682,9 @@ mapnotify(struct wl_listener *listener, void *data)
 			cconfigure(c, box.x, box.y, w, h);
 		cmove(c, box.x, box.y);
 	}
-	if (c->rule.ontop) {
-		c->ontop = 1;
-		wlr_scene_node_reparent(&c->scene->node, layers[clientlayer(c)]);
-	}
+	c->ontop = c->rule.ontop;
+	c->ws = curws();
+	wlr_scene_node_reparent(&c->scene->node, clienttree(c));
 	c->fade = settings.anim_open ? 0 : 1;
 	if (settings.anim_open)
 		startanim(&c->open, settings.anim_open);
@@ -2431,7 +2717,8 @@ unmapnotify(struct wl_listener *listener, void *data)
 	wl_list_remove(&c->tlink);
 	if (c == grabc)
 		tileddrag = 0; /* its tile is gone: nothing to swap or snap back to */
-	wlr_scene_node_reparent(&c->scene->node, layers[clientlayer(c)]);
+	c->ws = NULL; /* out of its workspace, which may go */
+	wlr_scene_node_reparent(&c->scene->node, clienttree(c));
 	wlr_scene_node_set_enabled(&c->scene->node, false);
 	if (c == grabc)
 		ungrab();
@@ -2598,13 +2885,22 @@ createdeco(struct wl_listener *listener, void *data)
 }
 
 static void
+present(Client *c)
+{
+	/* an app asking for attention (a link opened in the browser) takes you to it */
+	if (c->ws && c->ws->m && c->ws != c->ws->m->ws)
+		view(c->ws);
+	focusclient(c, 1);
+}
+
+static void
 activate(struct wl_listener *listener, void *data)
 {
 	struct wlr_xdg_activation_v1_request_activate_event *event = data;
 	Client *c = clientfrom(event->surface);
 
 	if (c && cmapped(c))
-		focusclient(c, 1);
+		present(c);
 }
 
 static void
@@ -2752,7 +3048,7 @@ xactivate(struct wl_listener *listener, void *data)
 	Client *c = wl_container_of(listener, c, request_activate);
 
 	if (cmapped(c) && !c->unmanaged)
-		focusclient(c, 1);
+		present(c);
 }
 
 static void
@@ -3497,6 +3793,7 @@ setup(void)
 	wl_list_init(&clients);
 	wl_list_init(&tiles);
 	wl_list_init(&ghosts);
+	wl_list_init(&orphans);
 	xdg_shell = wlr_xdg_shell_create(dpy, 6);
 	wl_signal_add(&xdg_shell->events.new_toplevel, &new_toplevel);
 	wl_signal_add(&xdg_shell->events.new_popup, &new_popup);
@@ -3569,6 +3866,7 @@ cleanup(void)
 		&new_layer, &new_deco, &request_activate, &new_constraint, &new_lock, &new_inhibitor };
 	Monitor *m;
 	Ghost *g, *gtmp;
+	Workspace *w, *wtmp;
 
 	wl_display_destroy_clients(dpy);
 	if (xwayland) {
@@ -3596,9 +3894,18 @@ cleanup(void)
 		wl_list_remove(&listeners[i]->link);
 	wl_list_for_each_safe(g, gtmp, &ghosts, link) /* their trees go with the scene */
 		free(g);
-	/* the scene takes the wallpapers with it; destroymon must not free them again */
-	wl_list_for_each(m, &mons, link)
+	/* the scene takes the wallpapers and workspace trees with it; destroymon
+	 * must not free them again */
+	wl_list_for_each(m, &mons, link) {
 		m->wall = NULL;
+		wl_list_for_each_safe(w, wtmp, &m->spaces, link)
+			free(w);
+		wl_list_init(&m->spaces);
+	}
+	wl_list_for_each_safe(w, wtmp, &orphans, link)
+		free(w);
+	wl_list_init(&orphans);
+	selws = NULL;
 	wlr_scene_node_destroy(&scene->tree.node);
 	wlr_xcursor_manager_destroy(cursor_mgr);
 	wlr_cursor_destroy(cursor);

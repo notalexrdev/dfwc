@@ -98,6 +98,8 @@ the bind while the key is held.
 | `dfwc.minimize()` | hide the focused window |
 | `dfwc.restore()` | pick a hidden window from a menu to bring back |
 | `dfwc.tiling()` | switch between floating and tiling (`true`/`false` to set) |
+| `dfwc.workspace(n)` | show the n-th workspace, or `"next"` / `"prev"` |
+| `dfwc.send(n, follow)` | move the focused window to workspace n (or `"next"`/`"prev"`); `true` goes along |
 | `dfwc.layout(name)` | pick a tiling layout |
 | `dfwc.float()` | let the focused window float while the rest tile |
 | `dfwc.zoom()` | make the focused window the master |
@@ -165,6 +167,16 @@ the file, line and message until the config loads fine again.
 
 `tiling`, `layout`, `mfact` and `nmaster` are also changed by keys while dfwc runs;
 saving the config keeps those changes unless you edited that setting's line.
+
+### Workspaces
+
+Dynamic, like GNOME or niri: there is always one empty workspace after the last used one,
+and an empty one vanishes once you leave it. Mod+Ctrl+Up/Down switches (with Shift the
+focused window comes along), Mod+1..9 jumps, Mod+Shift+1..9 sends the window. Each
+workspace keeps its own `tiling`, `layout`, `mfact` and `nmaster`; a new one starts with
+the config's values, and changing them in the config applies to the workspace you're on.
+Switching slides, timed by `anim_move`. An app asking for attention takes you to its
+workspace.
 
 ### Tiling
 

@@ -27,6 +27,17 @@ key("XF86AudioLowerVolume",  "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-", true)
 key("XF86AudioMute",         "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle")
 key("XF86AudioMicMute",      "wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle")
 
+-- workspaces: there's always an empty one at the end. Ctrl+Up/Down switches,
+-- with Shift the window comes along; numbers jump, Shift+number sends the window
+dfwc.bind("Mod+Control+Up",         function() dfwc.workspace("prev") end)
+dfwc.bind("Mod+Control+Down",       function() dfwc.workspace("next") end)
+dfwc.bind("Mod+Control+Shift+Up",   function() dfwc.send("prev", true) end)
+dfwc.bind("Mod+Control+Shift+Down", function() dfwc.send("next", true) end)
+for i = 1, 9 do
+	dfwc.bind("Mod+" .. i,       function() dfwc.workspace(i) end)
+	dfwc.bind("Mod+Shift+" .. i, function() dfwc.send(i) end)
+end
+
 -- arrows move a window, Shift+arrows resize it;
 -- tiled windows swap with their neighbour or move the split instead
 for key, d in pairs{ Left = { -20, 0 }, Right = { 20, 0 }, Up = { 0, -20 }, Down = { 0, 20 } } do

@@ -631,6 +631,12 @@ pushwin(lua_State *L, const WinInfo *w)
 	lua_setfield(L, -2, "ontop");
 }
 
+const Settings *
+config_own(void)
+{
+	return cur.L ? &cur.own : &settings;
+}
+
 bool
 config_hasstyle(void)
 {
@@ -760,6 +766,37 @@ config_rule(const WinInfo *w, Rule *r)
 }
 
 static int
+wstarget(lua_State *L, int *dir)
+{
+	/* a number, or "next" / "prev" */
+	static const char *const dirs[] = { "next", "prev", NULL };
+
+	*dir = 0;
+	if (lua_type(L, 1) == LUA_TNUMBER)
+		return luaL_checkinteger(L, 1);
+	*dir = luaL_checkoption(L, 1, NULL, dirs) ? -1 : 1;
+	return 0;
+}
+
+static int
+l_workspace(lua_State *L)
+{
+	int dir, n = wstarget(L, &dir);
+
+	viewws(n, dir);
+	return 0;
+}
+
+static int
+l_send(lua_State *L)
+{
+	int dir, n = wstarget(L, &dir);
+
+	sendws(n, dir, lua_toboolean(L, 2));
+	return 0;
+}
+
+static int
 l_focus(lua_State *L)
 {
 	static const char *const dirs[] = { "next", "prev", NULL };
@@ -824,10 +861,12 @@ static const luaL_Reg api[] = {
 	{ "resize", l_resize },
 	{ "restore", l_restore },
 	{ "rule", l_rule },
+	{ "send", l_send },
 	{ "set", l_set },
 	{ "spawn", l_spawn },
 	{ "style", l_style },
 	{ "tiling", l_tiling },
+	{ "workspace", l_workspace },
 	{ "zoom", l_zoom },
 	{ NULL, NULL },
 };

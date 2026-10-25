@@ -156,6 +156,17 @@ the base fits them.
     presets like ink and paper).
   - **Saving:** to `~/.config/dfwc/rice.lua`, loaded after `init.lua`. dfwc rewrites only that
     file and never touches the hand-written config.
+- **Workspaces (decided 2026-10-25):** dynamic, like GNOME/niri.
+  - There is always one empty workspace after the last used one; empty ones in the middle vanish
+    when you leave them.
+  - Mod+Ctrl+Up/Down switches; with Shift the focused window comes along. Mod+1..9 jumps to the
+    n-th workspace, Mod+Shift+1..9 sends the window there. Arrows alone keep moving windows.
+  - Each workspace has its own mode and layout: floating/tiling (later canvas), layout, mfact,
+    nmaster, gaps. Colors and effects stay global. A new one starts from the config's values.
+  - Switching slides the old workspace out and the new one in, vertically, timed by anim_move
+    (0: instant).
+  - Each monitor has its own list; Mod+Ctrl+Up/Down acts on the focused monitor.
+  - Done 2026-10-25. Gaps stay global until something can change them per workspace.
 - **Order this implies:** workspaces → canvas mode (pan, then zoom) → monitors as views. The
   rice menu needs none of these and can come any time; it doesn't need dfwcctl since dfwc
   draws it.
@@ -173,4 +184,4 @@ the base fits them.
    - Gaming: pointer lock, relative pointer, opt-in tearing.
    - Effects: shadows, blur, gradients (scenefx patch if needed), animations. The default rice arrives here.
    - Window rules: done 2026-10-24 (`dfwc.rule`).
-3. **Later, maybe:** workspaces, external monitors with per-monitor scale, IPC/dfwcctl. Done early: media keys (default config), lock screen + idle (ext-session-lock, ext-idle-notify, idle-inhibit; 2026-10-25), notifications (mako).
+3. **Later, maybe:** external monitors with per-monitor scale, IPC/dfwcctl. Done early: media keys (default config), lock screen + idle (ext-session-lock, ext-idle-notify, idle-inhibit; 2026-10-25), notifications (mako).

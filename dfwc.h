@@ -90,6 +90,8 @@ void restoremenu(void);
 void togglefullscreen(void);
 void togglemaximize(void);
 void toggleontop(void);
+void viewws(int n, int dir);              /* the n-th workspace, or dir steps from the shown one */
+void sendws(int n, int dir, int follow);  /* the focused window there, maybe following it */
 
 /* lua.c */
 extern Settings settings;
@@ -97,6 +99,7 @@ void config_init(struct wl_event_loop *loop);
 int config_key(uint32_t mods, xkb_keysym_t sym);
 void config_reload(void);
 void config_finish(void);
+const Settings *config_own(void); /* what the config file itself set */
 bool config_hasstyle(void);
 bool config_haslayout(const char *name);
 bool config_layout(const char *name, struct wlr_box area, int n, struct wlr_box *out);
