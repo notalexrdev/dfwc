@@ -535,6 +535,28 @@ l_canvas(lua_State *L)
 }
 
 static int
+mondir(lua_State *L)
+{
+	static const char *const dirs[] = { "left", "right", "up", "down", NULL };
+
+	return luaL_checkoption(L, 1, NULL, dirs);
+}
+
+static int
+l_monitor(lua_State *L)
+{
+	focusmon(mondir(L));
+	return 0;
+}
+
+static int
+l_sendmonitor(lua_State *L)
+{
+	sendmon(mondir(L));
+	return 0;
+}
+
+static int
 l_magnify(lua_State *L)
 {
 	magnify(luaL_checknumber(L, 1));
@@ -895,6 +917,7 @@ static const luaL_Reg api[] = {
 	{ "mfact", l_mfact },
 	{ "menu", l_menu },
 	{ "minimize", l_minimize },
+	{ "monitor", l_monitor },
 	{ "move", l_move },
 	{ "nmaster", l_nmaster },
 	{ "ontop", l_ontop },
@@ -907,6 +930,7 @@ static const luaL_Reg api[] = {
 	{ "pan", l_pan },
 	{ "rule", l_rule },
 	{ "send", l_send },
+	{ "sendmonitor", l_sendmonitor },
 	{ "set", l_set },
 	{ "spawn", l_spawn },
 	{ "style", l_style },

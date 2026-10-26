@@ -93,6 +93,8 @@ void togglemaximize(void);
 void toggleontop(void);
 void viewws(int n, int dir);              /* the n-th workspace, or dir steps from the shown one */
 void sendws(int n, int dir, int follow);  /* the focused window there, maybe following it */
+void focusmon(int dir);                   /* the screen that way: 0 left, 1 right, 2 up, 3 down */
+void sendmon(int dir);                    /* the focused window to the screen that way */
 void panby(int dx, int dy);               /* move a canvas workspace's view */
 void magnify(double f);                   /* zoom a canvas by f around the pointer */
 void overview(void);                      /* a canvas zoomed out to fit every window, or back */

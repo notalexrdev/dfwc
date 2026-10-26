@@ -51,6 +51,7 @@
 #include <wlr/types/wlr_linux_drm_syncobj_v1.h>
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_output_layout.h>
+#include <wlr/types/wlr_output_management_v1.h>
 #include <wlr/types/wlr_pointer.h>
 #include <wlr/types/wlr_pointer_constraints_v1.h>
 #include <wlr/types/wlr_presentation_time.h>
@@ -181,6 +182,9 @@ typedef struct {
 	Workspace *slidefrom;          /* sliding out while ws slides in */
 	Anim slide;
 	int slidedir;                  /* 1: the new one comes from below */
+	float scale;                   /* its own scale; a zoomed canvas multiplies it */
+	int ownscale;                  /* set by wlr-randr/kanshi, so the scale setting leaves it */
+	int placed;                    /* in the layout, paired with its scene output */
 	struct wl_listener frame, request_state, destroy;
 } Monitor;
 
@@ -259,6 +263,7 @@ static struct wlr_scene_tree *walltree; /* above the background color, below lay
 static struct wlr_scene_optimized_blur *optblur; /* the wallpaper, blurred once and cached */
 static pixman_image_t *wallimg; /* decoded wallpaper PNG */
 static struct wlr_output_layout *output_layout;
+static struct wlr_output_manager_v1 *outmgr; /* wlr-randr, kanshi, wdisplays */
 static struct wlr_scene_output_layout *scene_layout;
 static struct wlr_xdg_shell *xdg_shell;
 static struct wlr_layer_shell_v1 *layer_shell;
@@ -476,6 +481,9 @@ selmon(void)
 
 	if (o)
 		return o->data;
+	wl_list_for_each(m, &mons, link)
+		if (m->wlr->enabled)
+			return m;
 	return wl_list_empty(&mons) ? NULL : wl_container_of(mons.next, m, link);
 }
 
@@ -806,9 +814,9 @@ applyscale(Monitor *m)
 	/* a canvas's zoom is the screen's scale: windows stay live and sharp, and
 	 * input maps through it for free */
 	struct wlr_output_state state;
-	float s = settings.scale * (m->ws && m->ws->mode.canvas ? m->ws->zoom : 1);
+	float s = m->scale * (m->ws && m->ws->mode.canvas ? m->ws->zoom : 1);
 
-	if (m->wlr->scale == s)
+	if (!m->wlr->enabled || m->wlr->scale == s)
 		return;
 	wlr_output_state_init(&state);
 	wlr_output_state_set_scale(&state, s);
@@ -1555,6 +1563,12 @@ focustop(void)
 	/* clear first so focusclient() doesn't deactivate a dying surface */
 	wlr_seat_keyboard_notify_clear_focus(seat);
 	/* shortcut: the cleared window isn't restyled; it's unmapping anyway */
+	wl_list_for_each(c, &clients, link) { /* the screen with the pointer first */
+		if (shown(c) && c->ws == curws()) {
+			focusclient(c, 0);
+			return;
+		}
+	}
 	wl_list_for_each(c, &clients, link) {
 		if (shown(c)) {
 			focusclient(c, 0);
@@ -1640,11 +1654,18 @@ static void
 ungrab(void)
 {
 	Client *c = grabc, *t = NULL;
+	struct wlr_output *o;
 
 	if (cursor_mode == CurResize)
 		cresizing(grabc, 0);
 	if (cursor_mode == CurPan)
 		wlr_cursor_set_xcursor(cursor, cursor_mgr, "default");
+	/* dropped on another screen: it belongs to the workspace shown there now */
+	if (cursor_mode == CurMove && c && !tileddrag && c->ws
+	&& (o = wlr_output_layout_output_at(output_layout, cursor->x, cursor->y)) && o->data != c->ws->m) {
+		movetows(c, ((Monitor *)o->data)->ws);
+		arrange();
+	}
 	cursor_mode = CurNormal;
 	grabc = NULL;
 	if (!tileddrag)
@@ -2607,30 +2628,99 @@ requestmonstate(struct wl_listener *listener, void *data)
 }
 
 static void
-destroymon(struct wl_listener *listener, void *data)
+follow(Monitor *m, int dx, int dy)
 {
-	Monitor *m = wl_container_of(listener, m, destroy), *o;
-	LayerSurface *l, *tmp;
-	Workspace *w, *wtmp;
+	/* a screen that moved in the layout takes its windows along */
 	Client *c;
 
-	wl_list_remove(&m->link);
-	if (selws && selws->m == m)
-		selws = NULL;
-	if (!wl_list_empty(&mons)) {
-		/* shortcut: windows keep their coordinates, so they may sit off the
-		 * other screen; move them over by geometry once multi-monitor matters */
-		o = wl_container_of(mons.next, o, link);
-		wl_list_for_each(c, &clients, link)
-			if (c->ws && c->ws->m == m)
-				movetows(c, o->ws);
-		wl_list_for_each_safe(w, wtmp, &m->spaces, link) {
+	wl_list_for_each(c, &clients, link) {
+		if (!c->ws || c->ws->m != m)
+			continue;
+		c->prev.x += dx;
+		c->prev.y += dy;
+		c->floatbox.x += dx;
+		c->floatbox.y += dy;
+		cmove(c, c->scene->node.x + dx, c->scene->node.y + dy);
+	}
+}
+
+static void
+monplace(Monitor *m, int automatic, int x, int y)
+{
+	/* into the layout (or moved in it), paired with a scene output to draw it;
+	 * leaving the layout unpairs them, so coming back pairs them again */
+	struct wlr_output_layout_output *lo = automatic ? wlr_output_layout_add_auto(output_layout, m->wlr)
+		: wlr_output_layout_add(output_layout, m->wlr, x, y);
+	struct wlr_scene_output *so = wlr_scene_get_scene_output(scene, m->wlr);
+
+	if (!lo || m->placed)
+		return;
+	if (so || (so = wlr_scene_output_create(scene, m->wlr)))
+		wlr_scene_output_layout_add_output(scene_layout, lo, so);
+	m->placed = 1;
+}
+
+static int
+evacuate(Monitor *m)
+{
+	/* a screen going away (unplugged, or turned off) hands its windows to
+	 * another one, at the same place relative to the screen: what it showed
+	 * joins what the other shows, its other workspaces join the other's,
+	 * before its empty one. 0 if there is no other */
+	struct wlr_box from = m->area, to, b;
+	Monitor *o = NULL, *t;
+	Workspace *w, *tmp;
+	Client *c;
+
+	wl_list_for_each(t, &mons, link)
+		if (t != m && t->wlr->enabled && t->ws)
+			o = o ? o : t;
+	if (!o)
+		return 0;
+	if (zsnap.tree && zsnap.ws->m == m)
+		zend();
+	to = o->area;
+	wl_list_for_each(c, &clients, link) { /* and at least partly on it */
+		if (!c->ws || c->ws->m != m)
+			continue;
+		b = clientbox(c);
+		cmove(c, MIN(MAX(b.x - from.x + to.x, to.x - b.width + 64), to.x + to.width - 64),
+			MIN(MAX(b.y - from.y + to.y, to.y), to.y + to.height - 64));
+		if (c->ws == m->ws)
+			movetows(c, o->ws);
+	}
+	wl_list_for_each_safe(w, tmp, &m->spaces, link) {
+		wl_list_remove(&w->link);
+		if (selws == w)
+			selws = NULL;
+		if (wsempty(w)) {
 			for (int i = 0; i < 3; i++)
 				wlr_scene_node_destroy(&w->tree[i]->node);
-			wl_list_remove(&w->link);
 			free(w);
+			continue;
 		}
-	} else { /* the last screen: its workspaces wait for the next one */
+		w->m = o;
+		wsshow(w, 0, 0);
+		wl_list_insert(o->spaces.prev->prev, &w->link);
+	}
+	wl_list_init(&m->spaces);
+	m->ws = m->slidefrom = NULL;
+	m->slide.dur = 0;
+	prune(o);
+	return 1;
+}
+
+static void
+destroymon(struct wl_listener *listener, void *data)
+{
+	Monitor *m = wl_container_of(listener, m, destroy);
+	LayerSurface *l, *tmp;
+	Workspace *w;
+
+	wl_list_remove(&m->link);
+	if (!evacuate(m)) { /* the last screen: its workspaces wait for the next one */
+		if (selws && selws->m == m)
+			selws = NULL;
 		wl_list_for_each(w, &m->spaces, link)
 			w->m = NULL;
 		wl_list_insert_list(&orphans, &m->spaces);
@@ -2970,7 +3060,7 @@ overview(void)
 	w->ovx = w->cx;
 	w->ovy = w->cy;
 	wlr_output_transformed_resolution(w->m->wlr, &pw, &ph);
-	w->zoom = MIN(MAX(0.9 * MIN(pw / (settings.scale * (x1 - x0)), ph / (settings.scale * (y1 - y0))),
+	w->zoom = MIN(MAX(0.9 * MIN(pw / (w->m->scale * (x1 - x0)), ph / (w->m->scale * (y1 - y0))),
 		0.05), w->ovzoom);
 	applyscale(w->m);
 	lookat(w, (x0 + x1) / 2.0, (y0 + y1) / 2.0);
@@ -3052,7 +3142,9 @@ arrangelayers(Monitor *m)
 static void
 updatemons(struct wl_listener *listener, void *data)
 {
-	struct wlr_box box;
+	struct wlr_output_configuration_v1 *cfg;
+	struct wlr_output_configuration_head_v1 *h;
+	struct wlr_box box, old;
 	Monitor *m;
 
 	wlr_output_layout_get_box(output_layout, NULL, &box);
@@ -3063,7 +3155,11 @@ updatemons(struct wl_listener *listener, void *data)
 	wlr_scene_node_set_position(&optblur->node, box.x, box.y);
 	wlr_scene_optimized_blur_set_size(optblur, box.width, box.height);
 	wl_list_for_each(m, &mons, link) {
+		old = m->area;
 		wlr_output_layout_get_box(output_layout, m->wlr, &m->area);
+		if (!wlr_box_empty(&old) && !wlr_box_empty(&m->area)
+		&& (old.x != m->area.x || old.y != m->area.y))
+			follow(m, m->area.x - old.x, m->area.y - old.y);
 		arrangelayers(m);
 		if (wlr_box_equal(&m->area, &m->wallbox))
 			continue;
@@ -3081,6 +3177,122 @@ updatemons(struct wl_listener *listener, void *data)
 	placeerror();
 	if (rice.node)
 		ricedraw();
+	/* wlr-randr and kanshi see each screen's own scale, not a canvas zoom */
+	if ((cfg = wlr_output_configuration_v1_create())) {
+		wl_list_for_each(m, &mons, link) {
+			if (!(h = wlr_output_configuration_head_v1_create(cfg, m->wlr)))
+				continue;
+			h->state.scale = m->scale;
+			h->state.x = m->area.x;
+			h->state.y = m->area.y;
+		}
+		wlr_output_manager_v1_set_configuration(outmgr, cfg);
+	}
+}
+
+static void
+outputconfig(struct wlr_output_configuration_v1 *cfg, int test)
+{
+	/* wlr-randr, kanshi or wdisplays: mode, position, scale, rotation, on/off */
+	struct wlr_output_configuration_head_v1 *h;
+	struct wlr_output_state state;
+	Monitor *m;
+	int ok = 1;
+
+	wl_list_for_each(h, &cfg->heads, link) {
+		if (!(m = h->state.output->data))
+			continue;
+		wlr_output_state_init(&state);
+		wlr_output_head_v1_state_apply(&h->state, &state);
+		if (h->state.enabled) /* the scale asked for is the screen's; a canvas zoom stays on top */
+			wlr_output_state_set_scale(&state, h->state.scale
+				* (m->ws && m->ws->mode.canvas ? m->ws->zoom : 1));
+		if (test) {
+			ok &= wlr_output_test_state(m->wlr, &state);
+			wlr_output_state_finish(&state);
+			continue;
+		}
+		if (!h->state.enabled && m->wlr->enabled && evacuate(m))
+			m->ws = wsnew(m); /* an empty one, for when it comes back */
+		ok &= wlr_output_commit_state(m->wlr, &state);
+		wlr_output_state_finish(&state);
+		if (h->state.enabled) {
+			m->scale = h->state.scale;
+			m->ownscale = 1;
+			monplace(m, 0, h->state.x, h->state.y);
+			wsshow(m->ws, 1, 0);
+		} else {
+			wlr_output_layout_remove(output_layout, m->wlr);
+			m->placed = 0;
+		}
+	}
+	if (ok)
+		wlr_output_configuration_v1_send_succeeded(cfg);
+	else
+		wlr_output_configuration_v1_send_failed(cfg);
+	wlr_output_configuration_v1_destroy(cfg);
+	if (!test)
+		arrange();
+}
+
+static void
+outputapply(struct wl_listener *listener, void *data)
+{
+	outputconfig(data, 0);
+}
+
+static void
+outputtest(struct wl_listener *listener, void *data)
+{
+	outputconfig(data, 1);
+}
+
+static Monitor *
+monat(Monitor *m, int dir)
+{
+	/* the screen next to m, that way: 0 left, 1 right, 2 up, 3 down */
+	static const enum wlr_direction dirs[] = { WLR_DIRECTION_LEFT, WLR_DIRECTION_RIGHT,
+		WLR_DIRECTION_UP, WLR_DIRECTION_DOWN };
+	struct wlr_output *o;
+
+	if (!m || dir < 0 || dir > 3)
+		return NULL;
+	o = wlr_output_layout_adjacent_output(output_layout, dirs[dir], m->wlr,
+		m->area.x + m->area.width / 2.0, m->area.y + m->area.height / 2.0);
+	return o ? o->data : NULL;
+}
+
+void
+focusmon(int dir)
+{
+	/* the pointer jumps to the middle of that screen, its last window gets focus */
+	Monitor *m = monat(selmon(), dir);
+
+	if (!m)
+		return;
+	wlr_cursor_warp(cursor, NULL, m->area.x + m->area.width / 2.0, m->area.y + m->area.height / 2.0);
+	focustop();
+}
+
+void
+sendmon(int dir)
+{
+	/* the focused window to that screen's workspace, same place relative to the
+	 * screen; focus and the pointer go along */
+	Client *c = selclient();
+	struct wlr_box from, b;
+	Monitor *m;
+
+	if (!c || !c->ws || !c->ws->m || !(m = monat(c->ws->m, dir)))
+		return;
+	from = c->ws->m->area;
+	movetows(c, m->ws);
+	b = clientbox(c);
+	cmove(c, b.x - from.x + m->area.x, b.y - from.y + m->area.y);
+	b = oncanvas(c, clientbox(c), -1);
+	wlr_cursor_warp(cursor, NULL, b.x + b.width / 2.0, b.y + b.height / 2.0);
+	focusclient(c, 1);
+	arrange();
 }
 
 static void
@@ -3105,7 +3317,8 @@ createmon(struct wl_listener *listener, void *data)
 	wlr_output_state_set_enabled(&state, true);
 	if ((mode = wlr_output_preferred_mode(wlr)))
 		wlr_output_state_set_mode(&state, mode);
-	wlr_output_state_set_scale(&state, settings.scale);
+	m->scale = settings.scale;
+	wlr_output_state_set_scale(&state, m->scale);
 	wlr_output_commit_state(wlr, &state);
 	wlr_output_state_finish(&state);
 
@@ -3125,9 +3338,8 @@ createmon(struct wl_listener *listener, void *data)
 		m->ws = wl_container_of(m->spaces.next, w, link);
 	}
 	wsshow(m->ws, 1, 0);
-	/* a new screen extends the desktop to the right; windows stay put */
-	wlr_scene_output_layout_add_output(scene_layout,
-		wlr_output_layout_add_auto(output_layout, wlr), wlr_scene_output_create(scene, wlr));
+	/* a new screen extends the desktop to the right; wlr-randr or kanshi move it */
+	monplace(m, 1, 0, 0);
 }
 
 /* windows */
@@ -3844,6 +4056,8 @@ applysettings(void)
 		wlr_scene_optimized_blur_mark_dirty(optblur);
 
 	wl_list_for_each(m, &mons, link) {
+		if (!m->ownscale)
+			m->scale = s->scale;
 		applyscale(m);
 		arrangelayers(m); /* border sizes change what maximized windows get */
 	}
@@ -4361,7 +4575,7 @@ ricedraw(void)
 		return;
 	/* the same size on the glass however a canvas is zoomed, smaller only if the
 	 * screen is too short for it; on the right, centered */
-	rice.z = MAX(m->wlr->scale / settings.scale, (double)h / MAX(m->area.height - 48, 1));
+	rice.z = MAX(m->wlr->scale / m->scale, (double)h / MAX(m->area.height - 48, 1));
 	rice.box = (struct wlr_box){ 0, 0, W / rice.z, h / rice.z };
 	rice.box.x = m->area.x + m->area.width - rice.box.width - 24 / rice.z;
 	rice.box.y = m->area.y + (m->area.height - rice.box.height) / 2;
@@ -4481,6 +4695,8 @@ static struct wl_listener request_sel = { .notify = setsel };
 static struct wl_listener request_psel = { .notify = setpsel };
 static struct wl_listener request_shape = { .notify = setcursorshape };
 static struct wl_listener layout_change = { .notify = updatemons };
+static struct wl_listener output_apply = { .notify = outputapply };
+static struct wl_listener output_test = { .notify = outputtest };
 static struct wl_listener new_layer = { .notify = createlayer };
 static struct wl_listener new_deco = { .notify = createdeco };
 static struct wl_listener request_activate = { .notify = activate };
@@ -4671,6 +4887,9 @@ setup(void)
 	wl_signal_add(&output_layout->events.change, &layout_change);
 	wl_signal_add(&backend->events.new_output, &new_output);
 	wlr_xdg_output_manager_v1_create(dpy, output_layout);
+	outmgr = wlr_output_manager_v1_create(dpy);
+	wl_signal_add(&outmgr->events.apply, &output_apply);
+	wl_signal_add(&outmgr->events.test, &output_test);
 	scene_layout = wlr_scene_attach_output_layout(scene, output_layout);
 	wl_list_init(&mons);
 
@@ -4750,7 +4969,7 @@ cleanup(void)
 	struct wl_listener *listeners[] = { &new_output, &new_input, &new_toplevel, &new_popup,
 		&cursor_motion, &cursor_motion_absolute, &cursor_button, &cursor_axis, &cursor_frame, &cursor_swipe,
 		&cursor_pinchstart, &cursor_pinch,
-		&request_cursor, &request_sel, &request_psel, &request_shape, &layout_change,
+		&request_cursor, &request_sel, &request_psel, &request_shape, &layout_change, &output_apply, &output_test,
 		&new_layer, &new_deco, &request_activate, &new_constraint, &new_lock, &new_inhibitor };
 	Monitor *m;
 	Ghost *g, *gtmp;

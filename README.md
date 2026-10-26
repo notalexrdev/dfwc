@@ -9,7 +9,8 @@ Small, fast, and riceable from one Lua file that reloads every time you save it.
   master, grid, monocle), or your own in Lua, per workspace.
 - **Canvas.** Turn a workspace into an endless plane: pan, zoom, and get an overview
   of everything, while every window stays live.
-- **Dynamic workspaces** that slide, with one empty workspace always waiting at the end.
+- **Dynamic workspaces** that slide, with one empty workspace always waiting at the end,
+  per screen; arrange screens with wlr-randr, kanshi or wdisplays.
 - **Looks.** Borders with gradients that can spin, rounding, shadows, blur, fades and
   glides, all from Lua or from the **rice menu** (Mod+comma), live.
 - **Everything else a desktop needs:** XWayland, games (pointer lock, raw input, tearing),
@@ -59,6 +60,7 @@ Mod is Super. These are the defaults; every one of them can be changed in Lua.
 | Mod+Tab / Mod+Shift+Tab | next / previous layout |
 | Mod+h / Mod+l, Mod+i / Mod+d | master smaller / bigger, more / fewer masters |
 | Mod+Ctrl+Up / Down | previous / next workspace (with Shift the window comes along) |
+| Mod+Ctrl+Left / Right | the screen that way (with Shift the window comes along) |
 | Mod+1…9 / Mod+Shift+1…9 | jump to a workspace / send the window there |
 | Mod+c | canvas on or off for this workspace |
 | Mod+Alt+arrows, Mod+right-drag, three fingers | pan a canvas |
@@ -123,6 +125,7 @@ while the key is held.
 | `dfwc.minimize()`, `dfwc.restore()` | hide the window; pick a hidden one to bring back |
 | `dfwc.workspace(n)` | show the n-th workspace, or `"next"` / `"prev"` |
 | `dfwc.send(n, follow)` | the focused window to workspace n (or `"next"`/`"prev"`); `true` goes along |
+| `dfwc.monitor(dir)`, `dfwc.sendmonitor(dir)` | focus the screen `"left"`/`"right"`/`"up"`/`"down"`; move the window there |
 | `dfwc.tiling()` | floating ↔ tiling for this workspace (`true`/`false` sets it) |
 | `dfwc.layout(name)` | a tiling layout, or `"next"` / `"prev"` |
 | `dfwc.float()`, `dfwc.zoom()` | let the window float while the rest tile; make it the master |
@@ -187,6 +190,15 @@ Dynamic, like GNOME or niri: one empty workspace always waits after the last use
 an empty one vanishes once you leave it. Each keeps its own tiling, canvas, layout, mfact
 and nmaster; a new one starts as the config says. Switching slides. An app asking for
 attention (a link opening in your browser) takes you to its workspace.
+
+### Screens
+
+Each screen has its own workspaces, and a canvas belongs to its screen. Position, scale,
+resolution, rotation and on/off come from wlr-randr, kanshi (profiles per setup) or wdisplays;
+`scale` in the config is for screens they haven't set. A window dropped on another screen
+joins the workspace shown there. A screen that's unplugged or turned off hands its windows to
+another: what it showed joins what that one shows, its other workspaces come along as
+workspaces there.
 
 ### Tiling
 

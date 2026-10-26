@@ -47,11 +47,16 @@ bind("Mod+l",            function() dfwc.mfact(0.05) end, true)
 bind("Mod+i",            function() dfwc.nmaster(1) end)
 bind("Mod+d",            function() dfwc.nmaster(-1) end)
 
--- workspaces: an empty one always waits at the end
-bind("Mod+Control+Up",         function() dfwc.workspace("prev") end)
-bind("Mod+Control+Down",       function() dfwc.workspace("next") end)
-bind("Mod+Control+Shift+Up",   function() dfwc.send("prev", true) end)
-bind("Mod+Control+Shift+Down", function() dfwc.send("next", true) end)
+-- workspaces (an empty one always waits at the end) up and down, screens left and
+-- right; with Shift the focused window comes along
+bind("Mod+Control+Up",          function() dfwc.workspace("prev") end)
+bind("Mod+Control+Down",        function() dfwc.workspace("next") end)
+bind("Mod+Control+Shift+Up",    function() dfwc.send("prev", true) end)
+bind("Mod+Control+Shift+Down",  function() dfwc.send("next", true) end)
+bind("Mod+Control+Left",        function() dfwc.monitor("left") end)
+bind("Mod+Control+Right",       function() dfwc.monitor("right") end)
+bind("Mod+Control+Shift+Left",  function() dfwc.sendmonitor("left") end)
+bind("Mod+Control+Shift+Right", function() dfwc.sendmonitor("right") end)
 for i = 1, 9 do
 	bind("Mod+" .. i,       function() dfwc.workspace(i) end)
 	bind("Mod+Shift+" .. i, function() dfwc.send(i) end)

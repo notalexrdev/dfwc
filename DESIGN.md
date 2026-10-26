@@ -176,6 +176,11 @@ the base fits them.
     (0: instant).
   - Each monitor has its own list; Mod+Ctrl+Up/Down acts on the focused monitor.
   - Done 2026-10-25. Gaps stay global until something can change them per workspace.
+- **Monitors (decided 2026-10-26):** each monitor has its own workspaces, and a canvas belongs
+  to its monitor (not one plane shared by all). Mod+Ctrl+Left/Right focuses the monitor that
+  way; with Shift the focused window moves along. A window dropped on another monitor joins the
+  workspace shown there. Arranging (position, scale, mode, rotation, on/off) is done with the
+  standard output-management protocol: wlr-randr, kanshi, wdisplays.
 - **Order this implies:** workspaces → canvas mode (pan, then zoom) → monitors as views. The
   rice menu needs none of these and can come any time; it doesn't need dfwcctl since dfwc
   draws it.
@@ -193,4 +198,4 @@ the base fits them.
    - Gaming: pointer lock, relative pointer, opt-in tearing.
    - Effects: shadows, blur, gradients (scenefx patch if needed), animations. The default rice arrives here.
    - Window rules: done 2026-10-24 (`dfwc.rule`).
-3. **Later, maybe:** external monitors with per-monitor scale, IPC/dfwcctl. Done early: media keys (default config), lock screen + idle (ext-session-lock, ext-idle-notify, idle-inhibit; 2026-10-25), notifications (mako).
+3. **Later, maybe:** IPC/dfwcctl. External monitors done 2026-10-26 (output management, per-monitor scale, windows follow and move between screens). Done early: media keys (default config), lock screen + idle (ext-session-lock, ext-idle-notify, idle-inhibit; 2026-10-25), notifications (mako).
