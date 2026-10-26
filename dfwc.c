@@ -839,11 +839,13 @@ zoomat(Workspace *w, double z, double x, double y)
 static void
 zcopy(struct wlr_scene_node *n, int x, int y)
 {
-	/* copy what's shown under n: buffers, border rects, shadows; blur is skipped */
+	/* copy what's shown under n: buffers, border rects, shadows, and the blur
+	 * that makes see-through windows readable */
 	struct wlr_scene_node *child;
 	struct wlr_scene_buffer *b, *cb;
 	struct wlr_scene_rect *rc, *cr;
 	struct wlr_scene_shadow *sh, *cs;
+	struct wlr_scene_blur *bl, *cbl;
 	ZNode z = { 0 }, *grown;
 
 	if (!n->enabled)
@@ -890,6 +892,15 @@ zcopy(struct wlr_scene_node *n, int x, int y)
 		z.sigma = sh->blur_sigma;
 		z.clip = sh->clipped_region.area;
 		z.clipradii = sh->clipped_region.corners;
+	} else if (n->type == WLR_SCENE_NODE_BLUR && (bl = wlr_scene_blur_from_node(n))
+	&& (cbl = wlr_scene_blur_create(zsnap.tree, bl->width, bl->height))) {
+		z.n = &cbl->node;
+		z.w = bl->width;
+		z.h = bl->height;
+		z.radii = bl->corners;
+		wlr_scene_blur_set_should_only_blur_bottom_layer(cbl, bl->should_only_blur_bottom_layer);
+		wlr_scene_blur_set_alpha(cbl, bl->alpha);
+		wlr_scene_blur_set_strength(cbl, bl->strength);
 	} else {
 		return;
 	}
@@ -931,6 +942,10 @@ zshow(double zoom)
 			wlr_scene_shadow_set_blur_sigma(wlr_scene_shadow_from_node(z->n), z->sigma * k);
 			wlr_scene_shadow_set_clipped_region(wlr_scene_shadow_from_node(z->n),
 				(struct clipped_region){ clip, zradii(z->clipradii, k) });
+			break;
+		case WLR_SCENE_NODE_BLUR:
+			wlr_scene_blur_set_size(wlr_scene_blur_from_node(z->n), MAX(z->w * k, 1), MAX(z->h * k, 1));
+			wlr_scene_blur_set_corner_radii(wlr_scene_blur_from_node(z->n), zradii(z->radii, k));
 			break;
 		default:
 			break;
