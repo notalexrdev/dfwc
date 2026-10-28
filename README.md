@@ -14,7 +14,8 @@ Small, fast, and riceable from one Lua file that reloads every time you save it.
 - **Looks.** Borders with gradients that can spin, rounding, shadows, blur, fades and
   glides, all from Lua or from the **rice menu** (Mod+comma), live.
 - **Everything else a desktop needs:** XWayland, games (pointer lock, raw input, tearing),
-  lock screen and idle, screen sharing, window rules, and a broken config never locks you out.
+  lock screen and idle, screen sharing, bars and their menus, input methods, window rules,
+  `dfwcctl` for scripts and bars, and a broken config never locks you out.
 
 It ships with one theme, **ink**: black, greys and one bright line for the focused window,
 across dfwc, wmenu, foot and mako.
@@ -255,6 +256,24 @@ may return `float`, `size = { w, h }`, `pos = { x, y }`, `ontop`, `maximized` an
 While locked only the locker gets input and your binds are off; a playing video keeps the
 screen awake. If the locker crashes the screen stays black and locked: start it again from
 a TTY (`WAYLAND_DISPLAY=wayland-0 swaylock`) to unlock.
+
+## dfwcctl
+
+`dfwcctl` runs Lua in the running dfwc, like a Lua prompt: an expression prints its value.
+
+    dfwcctl 'dfwc.workspace(2)'
+    dfwcctl 'dfwc.windows()'        # a line per window: app_id, title, workspace, focused...
+    dfwcctl 'dfwc.workspaces()'     # a line per workspace on the screen with the pointer
+    dfwcctl watch                   # a line whenever the workspace, mode or focus changes
+
+`watch` prints tab-separated lines: `workspace <n> <count>`, `mode <floating|tiling|canvas>
+<layout>` and `focus <app_id> <title>`, which is all a bar's workspace module needs. The socket
+is `$DFWC_SOCK`, readable only by you; errors go to stderr with exit status 1.
+
+## Typing other scripts
+
+Input methods like fcitx5 and ibus work: their candidate list opens under the text cursor, and
+dfwc's own keys still come first while one is active.
 
 ## X11 apps and games
 
