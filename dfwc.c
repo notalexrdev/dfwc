@@ -70,6 +70,8 @@
 #include <wlr/types/wlr_xdg_decoration_v1.h>
 #include <wlr/types/wlr_xdg_output_v1.h>
 #include <wlr/types/wlr_xdg_shell.h>
+#include <wlr/types/wlr_xdg_system_bell_v1.h>
+#include <wlr/types/wlr_xdg_toplevel_icon_v1.h>
 #include <wlr/util/log.h>
 #include <wlr/util/region.h>
 #include <wlr/xwayland.h>
@@ -205,12 +207,14 @@ typedef struct {
 	Monitor *mon;
 	struct wlr_layer_surface_v1 *wlr;
 	struct wlr_scene_layer_surface_v1 *scene;
-	struct wl_listener map, unmap, commit, destroy;
+	struct wlr_scene_tree *popups; /* its menus (a bar's dropdowns, tray menus), above windows */
+	struct wl_listener map, unmap, commit, destroy, new_popup;
 } LayerSurface;
 
 typedef struct {
 	struct wlr_xdg_popup *wlr;
 	struct wlr_scene_shadow *shadow;
+	LayerSurface *layer; /* the bar it belongs to, if it's a bar's menu */
 	struct wl_listener commit, destroy;
 } Popup;
 
@@ -3130,8 +3134,11 @@ arrangelayers(Monitor *m)
 	for (int excl = 1; excl >= 0; excl--)
 		for (int i = LENGTH(m->layers) - 1; i >= 0; i--)
 			wl_list_for_each(l, &m->layers[i], link)
-				if (l->wlr->initialized && (l->wlr->current.exclusive_zone > 0) == excl)
+				if (l->wlr->initialized && (l->wlr->current.exclusive_zone > 0) == excl) {
 					wlr_scene_layer_surface_v1_configure(l->scene, &m->area, &usable);
+					wlr_scene_node_set_position(&l->popups->node, l->scene->tree->node.x,
+						l->scene->tree->node.y);
+				}
 	m->usable = usable;
 	wl_list_for_each(c, &clients, link)
 		if (monof(c) == m && (c->maximized || c->fullscreen))
@@ -3686,6 +3693,11 @@ commitpopup(struct wl_listener *listener, void *data)
 			box.x -= sx - c->toplevel->base->geometry.x;
 			box.y -= sy - c->toplevel->base->geometry.y;
 			wlr_xdg_popup_unconstrain_from_box(p->wlr, &box);
+		} else if (p->layer) { /* a bar's menu: on its screen; the box is relative to the bar */
+			box = p->layer->mon->area;
+			box.x -= p->layer->scene->tree->node.x;
+			box.y -= p->layer->scene->tree->node.y;
+			wlr_xdg_popup_unconstrain_from_box(p->wlr, &box);
 		}
 		wlr_xdg_surface_schedule_configure(p->wlr->base);
 	}
@@ -3714,25 +3726,42 @@ destroypopup(struct wl_listener *listener, void *data)
 }
 
 static void
-createpopup(struct wl_listener *listener, void *data)
+addpopup(struct wlr_xdg_popup *popup, struct wlr_scene_tree *parent, LayerSurface *layer)
 {
-	struct wlr_xdg_popup *popup = data;
-	struct wlr_xdg_surface *parent = wlr_xdg_surface_try_from_wlr_surface(popup->parent);
 	Popup *p;
 
-	if (!parent || !parent->data)
-		return;
 	if (!(p = calloc(1, sizeof(*p)))) {
 		wl_resource_post_no_memory(popup->resource);
 		return;
 	}
 	p->wlr = popup;
-	popup->base->data = wlr_scene_xdg_surface_create(parent->data, popup->base);
+	p->layer = layer;
+	popup->base->data = wlr_scene_xdg_surface_create(parent, popup->base);
 	/* a child of the popup's tree, so wlroots places and frees it with the popup */
 	p->shadow = wlr_scene_shadow_create(popup->base->data, 0, 0, 0, 0, (float[4]){ 0 });
 	wlr_scene_node_lower_to_bottom(&p->shadow->node);
 	LISTEN(&popup->base->surface->events.commit, &p->commit, commitpopup);
 	LISTEN(&popup->events.destroy, &p->destroy, destroypopup);
+}
+
+static void
+createpopup(struct wl_listener *listener, void *data)
+{
+	/* a menu of a window, or of another menu (a bar's submenus land here too) */
+	struct wlr_xdg_popup *popup = data;
+	struct wlr_xdg_surface *parent;
+
+	/* a bar's menu has no parent yet here; layerpopup() takes it once it does */
+	if (popup->parent && (parent = wlr_xdg_surface_try_from_wlr_surface(popup->parent)) && parent->data)
+		addpopup(popup, parent->data, NULL);
+}
+
+static void
+layerpopup(struct wl_listener *listener, void *data)
+{
+	LayerSurface *l = wl_container_of(listener, l, new_popup);
+
+	addpopup(data, l->popups, l);
 }
 
 /* X11 apps through XWayland */
@@ -3976,7 +4005,8 @@ destroylayer(struct wl_listener *listener, void *data)
 	LayerSurface *l = wl_container_of(listener, l, destroy);
 
 	wl_list_remove(&l->link);
-	unlisten(&l->map, &l->unmap, &l->commit, &l->destroy, NULL);
+	unlisten(&l->map, &l->unmap, &l->commit, &l->destroy, &l->new_popup, NULL);
+	wlr_scene_node_destroy(&l->popups->node);
 	free(l);
 }
 
@@ -3996,13 +4026,14 @@ createlayer(struct wl_listener *listener, void *data)
 	l->wlr = ls;
 	l->mon = m;
 	ls->data = l;
-	/* shortcut: popups of layer surfaces (waybar menus) aren't shown yet */
 	l->scene = wlr_scene_layer_surface_v1_create(layers[layermap[ls->pending.layer]], ls);
+	l->popups = wlr_scene_tree_create(layers[LyrTop]);
 	wl_list_insert(&m->layers[ls->pending.layer], &l->link);
 	LISTEN(&ls->surface->events.map, &l->map, maplayer);
 	LISTEN(&ls->surface->events.unmap, &l->unmap, unmaplayer);
 	LISTEN(&ls->surface->events.commit, &l->commit, commitlayer);
 	LISTEN(&ls->events.destroy, &l->destroy, destroylayer);
+	LISTEN(&ls->events.new_popup, &l->new_popup, layerpopup);
 }
 
 void
@@ -4704,6 +4735,22 @@ static struct wl_listener new_xsurface = { .notify = createx11 };
 static struct wl_listener new_constraint = { .notify = createconstraint };
 static struct wl_listener xwayland_ready = { .notify = xready };
 
+static void
+bell(struct wl_listener *listener, void *data)
+{
+	/* the window that rang (else the focused one) flashes its border white */
+	struct wlr_xdg_system_bell_v1_ring_event *event = data;
+	Client *c = event->surface ? clientfrom(wlr_surface_get_root_surface(event->surface)) : NULL;
+
+	if (!(c = c ? c : selclient()) || !c->styled)
+		return;
+	for (int i = 0; i < 4; i++)
+		c->shown[0][i] = c->shown[2][i] = 1;
+	restyle(c); /* fades back over anim_focus */
+}
+
+static struct wl_listener ring = { .notify = bell };
+
 static int
 quitsignal(int sig, void *data)
 {
@@ -4875,6 +4922,8 @@ setup(void)
 	constraints = wlr_pointer_constraints_v1_create(dpy);
 	wl_signal_add(&constraints->events.new_constraint, &new_constraint);
 	tearingmgr = wlr_tearing_control_manager_v1_create(dpy, 1);
+	wl_signal_add(&wlr_xdg_system_bell_v1_create(dpy, 1)->events.ring, &ring);
+	wlr_xdg_toplevel_icon_manager_v1_create(dpy, 1); /* taken, not shown: there are no title bars */
 	idlenotifier = wlr_idle_notifier_v1_create(dpy);
 	wl_signal_add(&wlr_idle_inhibit_v1_create(dpy)->events.new_inhibitor, &new_inhibitor);
 	wl_signal_add(&wlr_session_lock_manager_v1_create(dpy)->events.new_lock, &new_lock);
@@ -4970,7 +5019,7 @@ cleanup(void)
 		&cursor_motion, &cursor_motion_absolute, &cursor_button, &cursor_axis, &cursor_frame, &cursor_swipe,
 		&cursor_pinchstart, &cursor_pinch,
 		&request_cursor, &request_sel, &request_psel, &request_shape, &layout_change, &output_apply, &output_test,
-		&new_layer, &new_deco, &request_activate, &new_constraint, &new_lock, &new_inhibitor };
+		&new_layer, &new_deco, &request_activate, &new_constraint, &new_lock, &new_inhibitor, &ring };
 	Monitor *m;
 	Ghost *g, *gtmp;
 	Workspace *w, *wtmp;
