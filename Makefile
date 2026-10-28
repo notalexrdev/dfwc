@@ -6,7 +6,7 @@ include config.mk
 SRC = dfwc.c lua.c
 OBJ = $(SRC:.c=.o)
 
-all: dfwc
+all: dfwc dfwcctl
 
 $(OBJ): dfwc.h config.mk
 dfwc.o: wlr-layer-shell-unstable-v1-protocol.h
@@ -18,8 +18,11 @@ wlr-layer-shell-unstable-v1-protocol.h: protocols/wlr-layer-shell-unstable-v1.xm
 dfwc: $(OBJ)
 	$(CC) -o $@ $(OBJ) $(LDFLAGS) $(LDLIBS)
 
+dfwcctl: dfwcctl.c
+	$(CC) -std=c23 -Wall -Wextra -O2 -o $@ dfwcctl.c
+
 clean:
-	rm -f dfwc $(OBJ) *-protocol.h
+	rm -f dfwc dfwcctl $(OBJ) *-protocol.h
 
 # Smoke test: serve a client headless for 3s without crashing (timeout exits 124).
 check: dfwc
@@ -29,7 +32,7 @@ install: all
 	mkdir -p $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/share/dfwc \
 		$(DESTDIR)$(PREFIX)/share/xdg-desktop-portal $(DESTDIR)$(SESSIONDIR) \
 		$(DESTDIR)$(SYSCONFDIR)/xdg/xdg-desktop-portal-wlr
-	cp -f dfwc dfwc-session $(DESTDIR)$(PREFIX)/bin
+	cp -f dfwc dfwcctl dfwc-session $(DESTDIR)$(PREFIX)/bin
 	cp -f init.lua $(DESTDIR)$(PREFIX)/share/dfwc/init.lua
 	cp -f theme/mako $(DESTDIR)$(PREFIX)/share/dfwc
 	mkdir -p $(DESTDIR)$(PREFIX)/share/dfwc/xdg/foot
@@ -41,7 +44,7 @@ install: all
 	cp -f xdpw.conf $(DESTDIR)$(SYSCONFDIR)/xdg/xdg-desktop-portal-wlr/dfwc
 
 uninstall:
-	rm -f $(DESTDIR)$(PREFIX)/bin/dfwc $(DESTDIR)$(PREFIX)/bin/dfwc-session \
+	rm -f $(DESTDIR)$(PREFIX)/bin/dfwc $(DESTDIR)$(PREFIX)/bin/dfwcctl $(DESTDIR)$(PREFIX)/bin/dfwc-session \
 		$(DESTDIR)$(PREFIX)/share/dfwc/init.lua $(DESTDIR)$(PREFIX)/share/dfwc/wallpapers/*.png \
 		$(DESTDIR)$(PREFIX)/share/dfwc/xdg/foot/foot.ini $(DESTDIR)$(PREFIX)/share/dfwc/mako \
 		$(DESTDIR)$(PREFIX)/share/xdg-desktop-portal/dfwc-portals.conf \

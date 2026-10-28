@@ -19,6 +19,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <uchar.h>
@@ -304,6 +306,18 @@ static struct wl_list orphans; /* workspaces waiting for a screen after the last
 static Workspace *selws;       /* the workspace whose Mode settings holds */
 static Workspace *panws;       /* the canvas being dragged */
 typedef struct {
+	struct wl_list link;
+	int fd, watching;
+	struct wl_event_source *src;
+	char *buf;                     /* the request so far */
+	size_t len;
+} Ipc; /* a dfwcctl connection */
+static struct wl_list ipcs;
+static int ipcfd = -1;
+static struct wl_event_source *ipcsrc;
+static char ipcpath[108];
+static char ipclast[3][512];   /* the watch lines sent last: workspace, mode, focus */
+typedef struct {
 	struct wlr_scene_node *n;      /* a copy of a window's buffer, border or shadow */
 	double x, y, w, h;             /* where the original was, layout coords */
 	struct wlr_box clip;           /* rects and shadows: the cut-out, relative */
@@ -467,6 +481,7 @@ static int ricerow(void);
 static void ricechange(int i, int dir);
 static const struct wlr_buffer_impl textbufimpl;
 static void constrain(struct wlr_pointer_constraint_v1 *con);
+static void ipcnotify(void);
 static void floatout(Client *c);
 static int istiled(Client *c);
 
@@ -1532,6 +1547,7 @@ kbfocus(struct wlr_surface *surface)
 		restyle(old);
 	if ((c = clientfrom(surface)))
 		restyle(c);
+	ipcnotify();
 }
 
 static void
@@ -2918,6 +2934,7 @@ arrange(void)
 		tile(m);
 	if (rice.node) /* the menu shows this workspace's values */
 		ricedraw();
+	ipcnotify();
 }
 
 static void
@@ -3560,6 +3577,7 @@ retitle(struct wl_listener *listener, void *data)
 
 	if (cmapped(c) && config_hasstyle())
 		restyle(c);
+	ipcnotify();
 }
 
 static void
@@ -4946,6 +4964,7 @@ setup(void)
 	wl_list_init(&tiles);
 	wl_list_init(&ghosts);
 	wl_list_init(&orphans);
+	wl_list_init(&ipcs);
 	xdg_shell = wlr_xdg_shell_create(dpy, 6);
 	wl_signal_add(&xdg_shell->events.new_toplevel, &new_toplevel);
 	wl_signal_add(&xdg_shell->events.new_popup, &new_popup);
@@ -4989,6 +5008,193 @@ setup(void)
 	}
 }
 
+/* dfwcctl: a socket in XDG_RUNTIME_DIR; a request is Lua, the answer its output */
+
+static const char *
+wsmode(Workspace *w)
+{
+	return w->mode.canvas ? "canvas" : w->mode.tiling ? "tiling" : "floating";
+}
+
+size_t
+winstates(WinState *out, size_t max)
+{
+	Client *c, *f = selclient();
+	size_t n = 0;
+
+	wl_list_for_each(c, &clients, link) {
+		if (n == max)
+			break;
+		out[n++] = (WinState){ cappid(c), ctitle(c), c->ws && c->ws->m ? c->ws->m->wlr->name : NULL,
+			c->ws && c->ws->m ? wsindex(c->ws) + 1 : 0, c == f, !istiled(c), c->minimized };
+	}
+	return n;
+}
+
+size_t
+wsstates(WsState *out, size_t max)
+{
+	Workspace *cw = curws(), *w;
+	size_t n = 0;
+	Client *c;
+	int k;
+
+	if (!cw)
+		return 0;
+	wl_list_for_each(w, &cw->m->spaces, link) {
+		if (n == max)
+			break;
+		k = 0;
+		wl_list_for_each(c, &clients, link)
+			k += c->ws == w;
+		out[n++] = (WsState){ k, w == cw, wsmode(w) };
+	}
+	return n;
+}
+
+static void
+ipcclose(Ipc *c)
+{
+	wl_event_source_remove(c->src);
+	close(c->fd);
+	wl_list_remove(&c->link);
+	free(c->buf);
+	free(c);
+}
+
+static void
+oneline(char *dst, size_t n, const char *s)
+{
+	/* an app id or title as one field of one line */
+	snprintf(dst, n, "%s", s ? s : "");
+	for (char *p = dst; *p; p++)
+		if (*p == '\n' || *p == '\t')
+			*p = ' ';
+}
+
+static void
+ipclines(char line[3][512])
+{
+	/* what watchers see: tab-separated, one line per kind */
+	Workspace *w = curws();
+	Client *c = selclient();
+	char id[128], title[256];
+
+	snprintf(line[0], 512, "workspace\t%d\t%d\n", w ? wsindex(w) + 1 : 0,
+		w ? wl_list_length(&w->m->spaces) : 0);
+	snprintf(line[1], 512, "mode\t%s\t%s\n", w ? wsmode(w) : "floating", w ? w->mode.layout : "");
+	oneline(id, sizeof(id), c ? cappid(c) : NULL);
+	oneline(title, sizeof(title), c ? ctitle(c) : NULL);
+	snprintf(line[2], 512, "focus\t%s\t%s\n", id, title);
+}
+
+static void
+ipcnotify(void)
+{
+	/* watchers get the lines that changed */
+	char line[3][512];
+	Ipc *c, *tmp;
+
+	if (wl_list_empty(&ipcs))
+		return;
+	ipclines(line);
+	for (int i = 0; i < 3; i++) {
+		if (!strcmp(line[i], ipclast[i]))
+			continue;
+		memcpy(ipclast[i], line[i], sizeof(line[i]));
+		wl_list_for_each_safe(c, tmp, &ipcs, link)
+			if (c->watching && send(c->fd, line[i], strlen(line[i]), MSG_NOSIGNAL | MSG_DONTWAIT) < 0
+			&& errno != EAGAIN)
+				ipcclose(c); /* it went away */
+	}
+}
+
+static int
+ipcread(int fd, uint32_t mask, void *data)
+{
+	Ipc *c = data;
+	char tmp[4096], line[3][512], *grown, *res;
+	ssize_t n = 0;
+	int failed;
+
+	if (c->watching || (mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR) && !(mask & WL_EVENT_READABLE))) {
+		ipcclose(c); /* a watcher hanging up */
+		return 0;
+	}
+	if ((n = read(fd, tmp, sizeof(tmp))) > 0) {
+		if (c->len + n > 1 << 20 || !(grown = realloc(c->buf, c->len + n + 1))) {
+			ipcclose(c);
+			return 0;
+		}
+		c->buf = grown;
+		memcpy(c->buf + c->len, tmp, n);
+		c->len += n;
+		return 0;
+	}
+	if (n < 0 && errno == EAGAIN)
+		return 0;
+	/* the client stopped writing: the request is whole */
+	if (c->len == 5 && !memcmp(c->buf, "watch", 5)) {
+		c->watching = 1;
+		wl_event_source_fd_update(c->src, 0); /* only its hang-up from now on */
+		ipclines(line);
+		for (int i = 0; i < 3; i++)
+			send(c->fd, line[i], strlen(line[i]), MSG_NOSIGNAL | MSG_DONTWAIT);
+		memcpy(ipclast, line, sizeof(ipclast)); /* the next change is news to everyone */
+		return 0;
+	}
+	/* shortcut: one send, so answers bigger than the socket buffer (~200 KB) are cut */
+	res = config_eval(c->buf ? c->buf : "", c->len, &failed);
+	send(c->fd, failed ? "1" : "0", 1, MSG_NOSIGNAL | MSG_DONTWAIT);
+	if (res)
+		send(c->fd, res, strlen(res), MSG_NOSIGNAL | MSG_DONTWAIT);
+	free(res);
+	ipcclose(c);
+	return 0;
+}
+
+static int
+ipcaccept(int fd, uint32_t mask, void *data)
+{
+	int cfd = accept4(fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+	Ipc *c;
+
+	if (cfd < 0)
+		return 0;
+	if (!(c = calloc(1, sizeof(*c)))) {
+		close(cfd);
+		return 0;
+	}
+	c->fd = cfd;
+	c->src = wl_event_loop_add_fd(wl_display_get_event_loop(dpy), cfd, WL_EVENT_READABLE, ipcread, c);
+	wl_list_insert(&ipcs, &c->link);
+	return 0;
+}
+
+static void
+ipcstart(const char *display)
+{
+	/* only this user can reach it: XDG_RUNTIME_DIR is theirs, the socket 0600 */
+	struct sockaddr_un sa = { .sun_family = AF_UNIX };
+	const char *dir = getenv("XDG_RUNTIME_DIR");
+
+	if (!dir || snprintf(ipcpath, sizeof(ipcpath), "%s/dfwc-%s.sock", dir, display) >= (int)sizeof(ipcpath))
+		return;
+	memcpy(sa.sun_path, ipcpath, sizeof(ipcpath));
+	unlink(ipcpath); /* left over from a crash */
+	if ((ipcfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)) < 0
+	|| bind(ipcfd, (struct sockaddr *)&sa, sizeof(sa)) < 0 || chmod(ipcpath, 0600) < 0
+	|| listen(ipcfd, 8) < 0) {
+		wlr_log_errno(WLR_ERROR, "dfwcctl socket %s", ipcpath);
+		if (ipcfd >= 0)
+			close(ipcfd);
+		ipcfd = -1;
+		return;
+	}
+	setenv("DFWC_SOCK", ipcpath, 1);
+	ipcsrc = wl_event_loop_add_fd(wl_display_get_event_loop(dpy), ipcfd, WL_EVENT_READABLE, ipcaccept, NULL);
+}
+
 static void
 run(const char *startup)
 {
@@ -4998,6 +5204,7 @@ run(const char *startup)
 	if (!socket)
 		die("couldn't create socket");
 	setenv("WAYLAND_DISPLAY", socket, 1);
+	ipcstart(socket);
 	/* every foot started here finds the ink theme, unless the user has a foot.ini */
 	snprintf(buf, sizeof(buf), PREFIX "/share/dfwc/xdg:%s", dirs && *dirs ? dirs : "/etc/xdg");
 	setenv("XDG_CONFIG_DIRS", buf, 1);
@@ -5039,6 +5246,13 @@ cleanup(void)
 	if (menu.fd >= 0) {
 		wl_event_source_remove(menu.src);
 		close(menu.fd);
+	}
+	while (!wl_list_empty(&ipcs))
+		ipcclose(wl_container_of(ipcs.next, (Ipc *)NULL, link));
+	if (ipcfd >= 0) {
+		wl_event_source_remove(ipcsrc);
+		close(ipcfd);
+		unlink(ipcpath);
 	}
 	if (errbox)
 		wlr_scene_node_destroy(&errbox->node);

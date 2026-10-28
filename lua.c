@@ -557,6 +557,54 @@ l_sendmonitor(lua_State *L)
 }
 
 static int
+l_windows(lua_State *L)
+{
+	WinState w[256];
+	size_t n = winstates(w, LENGTH(w));
+
+	lua_createtable(L, n, 0);
+	for (size_t i = 0; i < n; i++) {
+		lua_createtable(L, 0, 7);
+		lua_pushstring(L, w[i].app_id ? w[i].app_id : "");
+		lua_setfield(L, -2, "app_id");
+		lua_pushstring(L, w[i].title ? w[i].title : "");
+		lua_setfield(L, -2, "title");
+		lua_pushstring(L, w[i].screen ? w[i].screen : "");
+		lua_setfield(L, -2, "screen");
+		lua_pushinteger(L, w[i].workspace);
+		lua_setfield(L, -2, "workspace");
+		lua_pushboolean(L, w[i].focused);
+		lua_setfield(L, -2, "focused");
+		lua_pushboolean(L, w[i].floating);
+		lua_setfield(L, -2, "floating");
+		lua_pushboolean(L, w[i].minimized);
+		lua_setfield(L, -2, "minimized");
+		lua_rawseti(L, -2, i + 1);
+	}
+	return 1;
+}
+
+static int
+l_workspaces(lua_State *L)
+{
+	WsState w[64];
+	size_t n = wsstates(w, LENGTH(w));
+
+	lua_createtable(L, n, 0);
+	for (size_t i = 0; i < n; i++) {
+		lua_createtable(L, 0, 3);
+		lua_pushinteger(L, w[i].windows);
+		lua_setfield(L, -2, "windows");
+		lua_pushboolean(L, w[i].shown);
+		lua_setfield(L, -2, "shown");
+		lua_pushstring(L, w[i].mode);
+		lua_setfield(L, -2, "mode");
+		lua_rawseti(L, -2, i + 1);
+	}
+	return 1;
+}
+
+static int
 l_magnify(lua_State *L)
 {
 	magnify(luaL_checknumber(L, 1));
@@ -935,7 +983,9 @@ static const luaL_Reg api[] = {
 	{ "spawn", l_spawn },
 	{ "style", l_style },
 	{ "tiling", l_tiling },
+	{ "windows", l_windows },
 	{ "workspace", l_workspace },
+	{ "workspaces", l_workspaces },
 	{ "zoom", l_zoom },
 	{ NULL, NULL },
 };
@@ -1247,4 +1297,137 @@ config_save(void)
 	fputs("}\n", f);
 	if (fclose(f) || rename(tmp, rice))
 		wlr_log_errno(WLR_ERROR, "menu: can't save %s", rice);
+}
+
+/* dfwcctl: Lua sent over dfwc's socket runs in the running config */
+
+static struct {
+	char *s;
+	size_t len, cap;
+} out; /* what the request printed */
+
+static void
+outadd(const char *s, size_t n)
+{
+	char *grown;
+
+	if (out.len + n + 1 > out.cap) {
+		if (!(grown = realloc(out.s, out.len + n + 4096)))
+			return;
+		out.s = grown;
+		out.cap = out.len + n + 4096;
+	}
+	memcpy(out.s + out.len, s, n);
+	out.len += n;
+	out.s[out.len] = '\0';
+}
+
+static void
+outvalue(lua_State *L, int i)
+{
+	/* a list of tables (dfwc.windows()) is a line per table: key=value ... */
+	size_t n;
+	const char *s;
+
+	i = lua_absindex(L, i);
+	if (lua_istable(L, i) && lua_rawlen(L, i)) {
+		n = lua_rawgeti(L, i, 1) == LUA_TTABLE;
+		lua_pop(L, 1);
+	} else {
+		n = 0;
+	}
+	if (n) {
+		for (lua_Integer k = 1; lua_rawgeti(L, i, k) == LUA_TTABLE; k++) {
+			lua_pushnil(L);
+			for (int first = 1; lua_next(L, -2); first = 0) {
+				if (!first)
+					outadd(" ", 1);
+				s = luaL_tolstring(L, -2, &n);
+				outadd(s, n);
+				outadd("=", 1);
+				s = luaL_tolstring(L, -2, &n);
+				outadd(s, n);
+				lua_pop(L, 3);
+			}
+			outadd("\n", 1);
+			lua_pop(L, 1);
+		}
+		lua_pop(L, 1);
+		return;
+	}
+	s = luaL_tolstring(L, i, &n);
+	outadd(s, n);
+	outadd("\n", 1);
+	lua_pop(L, 1);
+}
+
+static int
+l_ipcprint(lua_State *L)
+{
+	size_t n;
+	const char *s;
+	int top = lua_gettop(L);
+
+	for (int i = 1; i <= top; i++) {
+		if (lua_istable(L, i) && top == 1) {
+			outvalue(L, i);
+			return 0;
+		}
+		s = luaL_tolstring(L, i, &n);
+		if (i > 1)
+			outadd("\t", 1);
+		outadd(s, n);
+		lua_pop(L, 1);
+	}
+	outadd("\n", 1);
+	return 0;
+}
+
+char *
+config_eval(const char *code, size_t len, int *failed)
+{
+	/* an expression prints its value, like the lua prompt; print() goes back
+	 * to dfwcctl too */
+	lua_State *L = cur.L;
+	char *ret;
+	int top, status, saved;
+
+	out.len = 0;
+	outadd("", 0);
+	*failed = 1;
+	if (!L)
+		return strdup("dfwc has no working config\n");
+	top = lua_gettop(L);
+	lua_getglobal(L, "print");
+	saved = luaL_ref(L, LUA_REGISTRYINDEX);
+	lua_pushcfunction(L, l_ipcprint);
+	lua_setglobal(L, "print");
+	if ((ret = malloc(len + 8))) {
+		memcpy(ret, "return ", 7);
+		memcpy(ret + 7, code, len);
+	}
+	if (!ret || luaL_loadbuffer(L, ret, len + 7, "=dfwcctl") != LUA_OK) {
+		if (ret)
+			lua_pop(L, 1);
+		status = luaL_loadbuffer(L, code, len, "=dfwcctl");
+	} else {
+		status = LUA_OK;
+	}
+	free(ret);
+	if (status == LUA_OK)
+		status = lua_pcall(L, 0, LUA_MULTRET, 0);
+	if (status != LUA_OK) {
+		outadd(lua_tostring(L, -1), strlen(lua_tostring(L, -1)));
+		outadd("\n", 1);
+	} else {
+		*failed = 0;
+		for (int i = top + 1; i <= lua_gettop(L); i++)
+			if (!lua_isnil(L, i) || lua_gettop(L) > top + 1)
+				outvalue(L, i);
+	}
+	lua_rawgeti(L, LUA_REGISTRYINDEX, saved);
+	lua_setglobal(L, "print");
+	luaL_unref(L, LUA_REGISTRYINDEX, saved);
+	lua_settop(L, top);
+	return strdup(out.s ? out.s : "");
 }

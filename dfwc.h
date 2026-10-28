@@ -60,6 +60,18 @@ typedef struct {
 	bool focused, maximized, fullscreen, ontop;
 } WinInfo;
 
+/* what dfwc.windows() and dfwc.workspaces() report (dfwcctl) */
+typedef struct {
+	const char *app_id, *title, *screen;
+	int workspace; /* its place on its screen, from 1 */
+	bool focused, floating, minimized;
+} WinState;
+typedef struct {
+	int windows;
+	bool shown;
+	const char *mode; /* "floating", "tiling" or "canvas" */
+} WsState;
+
 typedef struct {
 	float border[2][4], inner_border[4];
 	double opacity;
@@ -99,6 +111,8 @@ void panby(int dx, int dy);               /* move a canvas workspace's view */
 void magnify(double f);                   /* zoom a canvas by f around the pointer */
 void overview(void);                      /* a canvas zoomed out to fit every window, or back */
 void togglemenu(void);                    /* the rice menu */
+size_t winstates(WinState *out, size_t max); /* every mapped window */
+size_t wsstates(WsState *out, size_t max);   /* the pointer's screen's workspaces, in order */
 
 /* lua.c */
 extern Settings settings;
@@ -109,6 +123,7 @@ void config_finish(void);
 const Settings *config_own(void); /* what the config file itself set */
 int config_menu(const char *code);  /* Lua the menu runs; what it sets goes to rice.lua */
 void config_save(void);             /* write rice.lua if the menu changed anything */
+char *config_eval(const char *code, size_t len, int *failed); /* dfwcctl's Lua; caller frees */
 bool config_hasstyle(void);
 bool config_haslayout(const char *name);
 bool config_layout(const char *name, struct wlr_box area, int n, struct wlr_box *out);
