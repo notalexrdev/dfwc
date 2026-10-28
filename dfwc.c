@@ -271,7 +271,7 @@ static struct {
 static struct fcft_font *font;
 static struct wlr_scene_tree *walltree; /* above the background color, below layer-shell wallpapers */
 static struct wlr_scene_optimized_blur *optblur; /* the wallpaper, blurred once and cached */
-static pixman_image_t *wallimg; /* decoded wallpaper PNG */
+static pixman_image_t *wallimg; /* decoded wallpaper PNG, only while drawing it */
 static struct wlr_output_layout *output_layout;
 static struct wlr_output_manager_v1 *outmgr; /* wlr-randr, kanshi, wdisplays */
 static struct wlr_scene_output_layout *scene_layout;
@@ -4232,9 +4232,8 @@ drawtext(pixman_image_t *dst, struct fcft_font *f, const char *str, int x, int y
 static pixman_image_t *
 wallimage(void)
 {
-	/* the wallpaper's PNG, decoded once and kept until the setting changes */
-	static char loaded[sizeof(settings.wallpaper) + 64];
-	char path[sizeof(loaded)];
+	/* the wallpaper's PNG, decoded; drawwallpaper() lets it go once drawn */
+	char path[sizeof(settings.wallpaper) + 64];
 	png_image png = { .version = PNG_IMAGE_VERSION };
 	uint32_t *px;
 	int alpha;
@@ -4243,12 +4242,9 @@ wallimage(void)
 		snprintf(path, sizeof(path), "%s", settings.wallpaper);
 	else
 		snprintf(path, sizeof(path), PREFIX "/share/dfwc/wallpapers/%s.png", settings.wallpaper);
-	if (wallimg && !strcmp(path, loaded))
-		return wallimg;
 	if (wallimg)
 		pixman_image_unref(wallimg);
 	wallimg = NULL;
-	snprintf(loaded, sizeof(loaded), "%s", path);
 	if (!png_image_begin_read_from_file(&png, path)) {
 		wlr_log(WLR_ERROR, "wallpaper %s: %s", path, png.message);
 		return NULL;
@@ -4301,6 +4297,8 @@ drawwallpaper(Monitor *m)
 	pixman_image_composite32(PIXMAN_OP_SRC, src, NULL, t->img,
 		(pixman_image_get_width(src) * sc - w) / 2, (pixman_image_get_height(src) * sc - h) / 2,
 		0, 0, 0, 0, w, h);
+	pixman_image_unref(wallimg); /* a screen's own copy is all it needs: decode again on resize */
+	wallimg = NULL;
 	wlr_buffer_init(&t->base, &textbufimpl, w, h);
 	if ((m->wall = wlr_scene_buffer_create(walltree, &t->base))) {
 		wlr_scene_buffer_set_dest_size(m->wall, m->area.width, m->area.height);
